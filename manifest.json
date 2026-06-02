@@ -18,7 +18,8 @@
     "downloads",
     "storage",
     "tabs",
-    "scripting"
+    "scripting",
+    "clipboardWrite"
   ],
   "host_permissions": [
     "https://places.googleapis.com/*",

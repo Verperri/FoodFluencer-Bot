@@ -9,7 +9,7 @@
 <body>
   <div class="container">
 
-    <!-- API usage warning (shown when nearing limit) -->
+    <!-- API usage warning -->
     <div id="usageWarning" class="banner banner--warn hidden">
       <span id="usageWarningText"></span>
       <button id="downloadLogBtn" class="btn-link">Download log</button>
@@ -24,7 +24,7 @@
       </div>
     </header>
 
-    <!-- API key setup (shown on first run) -->
+    <!-- API key setup (first run only) -->
     <section id="keySetup" class="key-setup hidden">
       <p>Paste your <strong>Google Places API key</strong> to get started:</p>
       <div class="input-row">
@@ -35,7 +35,7 @@
         Get a free key at <strong>console.cloud.google.com → Places API</strong>.</p>
     </section>
 
-    <!-- Search -->
+    <!-- ① Search -->
     <section class="search-section">
       <div class="input-row">
         <input id="query" type="text"
@@ -46,8 +46,9 @@
       </div>
     </section>
 
-    <!-- Results -->
+    <!-- ② Restaurant result + photos -->
     <section id="results" class="results-section hidden">
+
       <div class="restaurant-card">
         <div class="restaurant-info">
           <h2 id="restaurantName"></h2>
@@ -59,9 +60,31 @@
 
       <div id="photoGrid" class="photo-grid"></div>
 
-      <!-- Social media platform toggles -->
-      <div class="social-section">
-        <p class="section-label">Post to social media</p>
+      <div class="divider"></div>
+
+      <!-- ③ Song search -->
+      <div class="card-section">
+        <p class="section-label">🎵 Add a song to your post</p>
+        <div class="input-row">
+          <input id="songQuery" type="text" placeholder="Search artist or track…" autocomplete="off" />
+          <button id="songSearchBtn" class="btn btn--ghost-accent">Search</button>
+        </div>
+        <div id="songResults" class="song-results hidden"></div>
+        <div id="selectedSong" class="selected-song hidden">
+          <img id="selectedSongArt" src="" alt="" />
+          <div class="selected-song-info">
+            <span id="selectedSongName" class="song-name"></span>
+            <span id="selectedSongArtist" class="song-artist"></span>
+          </div>
+          <button id="removeSongBtn" class="btn-icon" title="Remove song">✕</button>
+        </div>
+      </div>
+
+      <div class="divider"></div>
+
+      <!-- ④ Social media platforms -->
+      <div class="card-section">
+        <p class="section-label">📲 Post to social media</p>
         <div class="social-icons">
 
           <button class="social-btn" data-platform="instagram" title="Instagram">
@@ -90,33 +113,19 @@
         </div>
       </div>
 
-      <!-- Export + caption -->
+      <div class="divider"></div>
+
+      <!-- ⑤ Caption + Export -->
       <div class="export-section">
-        <textarea id="caption" class="caption-input" placeholder="Caption for your post… (auto-filled with restaurant info)" rows="2"></textarea>
+        <textarea id="caption" class="caption-input"
+          placeholder="Caption for your post…" rows="2"></textarea>
         <button id="exportBtn" class="btn btn--export">⬇ Export &amp; Post</button>
       </div>
+
     </section>
 
     <!-- Status bar -->
     <div id="status" class="status hidden"></div>
-
-    <!-- Song search (always visible after key is set) -->
-    <section id="songSection" class="song-section hidden">
-      <p class="section-label">🎵 Add a song to your post</p>
-      <div class="input-row">
-        <input id="songQuery" type="text" placeholder="Search artist or track…" autocomplete="off" />
-        <button id="songSearchBtn" class="btn btn--ghost-accent">Search</button>
-      </div>
-      <div id="songResults" class="song-results hidden"></div>
-      <div id="selectedSong" class="selected-song hidden">
-        <img id="selectedSongArt" src="" alt="" />
-        <div class="selected-song-info">
-          <span id="selectedSongName" class="song-name"></span>
-          <span id="selectedSongArtist" class="song-artist"></span>
-        </div>
-        <button id="removeSongBtn" class="btn-icon" title="Remove song">✕</button>
-      </div>
-    </section>
 
     <!-- Settings footer -->
     <footer class="settings-footer hidden" id="settingsFooter">
