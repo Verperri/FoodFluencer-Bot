@@ -183,8 +183,6 @@ function renderResults(place) {
   link.href = currentRestaurant.mapsUrl || "#";
   link.style.display = currentRestaurant.mapsUrl ? "inline" : "none";
 
-  updateCaption();
-
   // Photo grid
   const grid = $("photoGrid");
   grid.innerHTML = "";
@@ -201,11 +199,12 @@ function renderResults(place) {
   $("results").classList.remove("hidden");
 }
 
-function updateCaption() {
-  if (!currentRestaurant) return;
+// Build caption string (used internally — not shown in UI)
+function buildCaption() {
+  if (!currentRestaurant) return "";
   let text = `📍 ${currentRestaurant.name}\n${currentRestaurant.address}`;
   if (selectedSong) text += `\n🎵 ${selectedSong.name} – ${selectedSong.artist}`;
-  $("caption").value = text;
+  return text;
 }
 
 // ── Search ────────────────────────────────────────────────────────────────────
@@ -296,28 +295,40 @@ function selectSong(song) {
   selectedSong = song;
   $("songResults").classList.add("hidden");
   $("songQuery").value = "";
-  $("selectedSongArt").src          = song.artwork;
+  $("selectedSongArt").src            = song.artwork;
   $("selectedSongName").textContent   = song.name;
   $("selectedSongArtist").textContent = song.artist;
   $("selectedSong").classList.remove("hidden");
-  updateCaption();
 }
 
 $("removeSongBtn").addEventListener("click", () => {
   selectedSong = null;
   $("selectedSong").classList.add("hidden");
-  updateCaption();
 });
 
 // ── Export & Post ─────────────────────────────────────────────────────────────
 
 $("exportBtn").addEventListener("click", exportAndPost);
 
+// Resize + convert a photo URI to a compact JPEG data URL for injection
+async function photoToDataUrl(uri, maxWidth = 900) {
+  const res    = await fetch(uri);
+  const blob   = await res.blob();
+  const bitmap = await createImageBitmap(blob);
+  const scale  = Math.min(1, maxWidth / bitmap.width);
+  const canvas = document.createElement("canvas");
+  canvas.width  = Math.round(bitmap.width  * scale);
+  canvas.height = Math.round(bitmap.height * scale);
+  canvas.getContext("2d").drawImage(bitmap, 0, 0, canvas.width, canvas.height);
+  return canvas.toDataURL("image/jpeg", 0.82);
+}
+
 async function exportAndPost() {
   if (!currentRestaurant) return;
 
   const { name, address, photos } = currentRestaurant;
-  const caption   = $("caption").value.trim();
+  const caption   = buildCaption();
+  const songName  = selectedSong?.name || "";
   const timestamp = new Date().toISOString().replace(/[:.]/g, "-").slice(0, 19);
   const safeName  = name.replace(/[/\\?%*:|"<>]/g, "_");
   const folder    = `FoodFluencer/${safeName}_${timestamp}`;
@@ -325,17 +336,15 @@ async function exportAndPost() {
   $("exportBtn").disabled = true;
   setStatus("Resolving photos…");
 
-  // 1. Resolve all photo URIs
+  // 1. Resolve all photo URIs at full resolution
   const photoUris = [];
-  for (let i = 0; i < photos.length; i++) {
-    try {
-      const uri = await resolvePhotoUri(photos[i].name, 1200);
-      photoUris.push(uri);
-    } catch (e) { console.warn("Photo resolve failed:", e); }
+  for (const photo of photos) {
+    try { photoUris.push(await resolvePhotoUri(photo.name, 1200)); }
+    catch (e) { console.warn("Photo resolve failed:", e); }
   }
 
   // 2. Download all photos to disk
-  setStatus("Downloading photos…");
+  setStatus("Saving photos…");
   photoUris.forEach((uri, i) => {
     chrome.runtime.sendMessage({
       type: "DOWNLOAD", url: uri,
@@ -343,16 +352,12 @@ async function exportAndPost() {
     });
   });
 
-  // 3. Write info note
+  // 3. Save info note
   const noteLines = [
-    `Restaurant : ${name}`,
-    `Address    : ${address}`,
-    `Exported   : ${new Date().toLocaleString()}`,
-    `Photos     : ${photos.length}`,
+    `Restaurant : ${name}`, `Address    : ${address}`,
+    `Exported   : ${new Date().toLocaleString()}`, `Photos     : ${photos.length}`,
     selectedSong ? `Song       : ${selectedSong.name} – ${selectedSong.artist}` : null,
-    ``,
-    `Caption:`,
-    caption,
+    ``, `Caption:`, caption,
   ].filter(l => l !== null);
   chrome.runtime.sendMessage({
     type: "DOWNLOAD",
@@ -362,158 +367,35 @@ async function exportAndPost() {
 
   // 4. Persist export log
   chrome.storage.local.get({ exportLog: [] }, ({ exportLog }) => {
-    exportLog.push({
-      timestamp, name, address, photos: photos.length, folder,
+    exportLog.push({ timestamp, name, address, photos: photos.length, folder,
       song: selectedSong ? `${selectedSong.name} – ${selectedSong.artist}` : null,
-      platforms: [...activePlatforms],
-    });
+      platforms: [...activePlatforms] });
     chrome.storage.local.set({ exportLog });
   });
 
-  // 5. Social media posting
+  // 5. Open social platforms with photo pre-loaded
   const platforms = [...activePlatforms];
   if (platforms.length > 0 && photoUris.length > 0) {
-    setStatus("Copying image to clipboard…");
-    await copyImageToClipboard(photoUris[0]);
-    setStatus("Opening social media…");
-    await openSocialMediaTabs(platforms, caption);
-    setStatus(
-      `✅ Photo copied to clipboard! Paste (Ctrl+V) in the opened tab(s) to post.`,
-      "success"
-    );
+    setStatus("Preparing photo for social media…");
+    let photoDataUrl;
+    try { photoDataUrl = await photoToDataUrl(photoUris[0]); }
+    catch (e) { console.warn("Photo resize failed:", e); }
+
+    if (photoDataUrl) {
+      for (const platform of platforms) {
+        setStatus(`Opening ${platform}…`);
+        chrome.runtime.sendMessage({ type: "OPEN_SOCIAL", platform, photoDataUrl, caption, songName });
+        await new Promise(r => setTimeout(r, 800)); // stagger tab opens
+      }
+      setStatus(`✅ Opened ${platforms.join(", ")} — photo &amp; caption injected!`, "success");
+    } else {
+      setStatus("⚠️ Could not prepare photo for social media.", "error");
+    }
   } else {
     setStatus(`✅ Exported ${photoUris.length} photos → Downloads/${folder}`, "success");
   }
 
   $("exportBtn").disabled = false;
-}
-
-// ── Clipboard helper ──────────────────────────────────────────────────────────
-
-async function copyImageToClipboard(photoUri) {
-  try {
-    const res  = await fetch(photoUri);
-    const blob = await res.blob();
-
-    // Convert to PNG so ClipboardItem always accepts it
-    const bitmap  = await createImageBitmap(blob);
-    const canvas  = document.createElement("canvas");
-    canvas.width  = bitmap.width;
-    canvas.height = bitmap.height;
-    canvas.getContext("2d").drawImage(bitmap, 0, 0);
-
-    const pngBlob = await new Promise(resolve => canvas.toBlob(resolve, "image/png"));
-    await navigator.clipboard.write([new ClipboardItem({ "image/png": pngBlob })]);
-    return true;
-  } catch (err) {
-    console.warn("Clipboard write failed:", err);
-    return false;
-  }
-}
-
-// ── Social media tab opener ───────────────────────────────────────────────────
-
-const PLATFORM_CONFIG = {
-  instagram: {
-    url:   "https://www.instagram.com/",
-    label: "Instagram",
-    hint:  "Tap the <strong>+</strong> button → <em>Post</em> → select your photo from <strong>Downloads/FoodFluencer</strong>.",
-  },
-  facebook: {
-    url:   "https://www.facebook.com/",
-    label: "Facebook",
-    hint:  "Click <strong>Photo/video</strong> in the post composer → select from <strong>Downloads/FoodFluencer</strong>, then <strong>paste (Ctrl+V)</strong> the caption.",
-  },
-  tiktok: {
-    url:   "https://www.tiktok.com/upload",
-    label: "TikTok",
-    hint:  "Drag &amp; drop your photo from <strong>Downloads/FoodFluencer</strong> onto the upload area.",
-  },
-};
-
-async function openSocialMediaTabs(platforms, caption) {
-  for (const platform of platforms) {
-    const cfg = PLATFORM_CONFIG[platform];
-    try {
-      const tab = await chrome.tabs.create({ url: cfg.url, active: true });
-      // Inject helper banner + caption pre-fill after page loads
-      chrome.tabs.onUpdated.addListener(function listener(tabId, info) {
-        if (tabId !== tab.id || info.status !== "complete") return;
-        chrome.tabs.onUpdated.removeListener(listener);
-        chrome.scripting.executeScript({
-          target: { tabId: tab.id },
-          func: injectPostingHelper,
-          args: [cfg.label, cfg.hint, caption],
-        }).catch(err => console.warn(`Inject failed on ${platform}:`, err));
-      });
-    } catch (err) {
-      console.warn(`Could not open ${platform}:`, err);
-    }
-  }
-}
-
-// Runs INSIDE the social media tab
-function injectPostingHelper(platformLabel, hint, caption) {
-  // Avoid double-inject
-  if (document.getElementById("ffbot-banner")) return;
-
-  // ── Floating banner ────────────────────────────────────────────────────
-  const banner = document.createElement("div");
-  banner.id = "ffbot-banner";
-  banner.style.cssText = `
-    position:fixed;top:0;left:0;right:0;z-index:2147483647;
-    background:#e8490f;color:#fff;font-family:-apple-system,sans-serif;
-    font-size:13px;padding:10px 16px;display:flex;align-items:center;
-    gap:12px;box-shadow:0 3px 12px rgba(0,0,0,.3);
-  `;
-
-  const icon   = `<strong style="font-size:16px">🍽️</strong>`;
-  const title  = `<strong>FoodFluencer Bot</strong>`;
-  const hintEl = `<span style="font-weight:400">${hint}</span>`;
-  const close  = `<button id="ffbot-close" style="margin-left:auto;background:rgba(255,255,255,.25);border:none;color:#fff;border-radius:6px;padding:3px 10px;cursor:pointer;font-size:12px;">✕ Close</button>`;
-
-  banner.innerHTML = `${icon}${title}${hintEl}${close}`;
-  document.body.prepend(banner);
-  document.getElementById("ffbot-close").addEventListener("click", () => banner.remove());
-
-  // ── Auto-fill caption on Facebook ─────────────────────────────────────
-  if (platformLabel === "Facebook") {
-    const tryFillCaption = () => {
-      const selectors = [
-        '[aria-label="What\'s on your mind?"]',
-        '[data-testid="status-attachment-mentions-input"]',
-        '[role="textbox"][contenteditable="true"]',
-      ];
-      for (const sel of selectors) {
-        const box = document.querySelector(sel);
-        if (box) {
-          box.focus();
-          // Use execCommand for contenteditable divs
-          document.execCommand("selectAll", false, null);
-          document.execCommand("insertText", false, caption);
-          return true;
-        }
-      }
-      return false;
-    };
-    // Try immediately, then retry after a short delay (FB loads async)
-    if (!tryFillCaption()) {
-      setTimeout(tryFillCaption, 2000);
-      setTimeout(tryFillCaption, 4000);
-    }
-  }
-
-  // ── Navigate Instagram to the create page ─────────────────────────────
-  if (platformLabel === "Instagram") {
-    setTimeout(() => {
-      // Click the "New post" / "+" button if visible
-      const createBtn =
-        document.querySelector('a[href="/create/select/"]') ||
-        document.querySelector('[aria-label="New post"]')   ||
-        document.querySelector('svg[aria-label="New post"]')?.closest("a");
-      if (createBtn) createBtn.click();
-    }, 2000);
-  }
 }
 
 // Boot

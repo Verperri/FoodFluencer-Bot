@@ -195,13 +195,6 @@ h1 { font-size: 0.95rem; font-weight: 700; line-height: 1.2; }
 
 /* ── Caption + export ────────────────────────────────────────────────────── */
 .export-section { display: flex; flex-direction: column; gap: 7px; }
-.caption-input {
-  width: 100%; background: var(--surface); border: 1.5px solid var(--border);
-  border-radius: var(--radius); padding: 7px 10px; font-size: 0.8rem;
-  font-family: inherit; color: var(--text); resize: none; outline: none;
-  transition: border-color .15s;
-}
-.caption-input:focus { border-color: var(--accent); }
 .btn--export {
   width: 100%; background: var(--accent); color: #fff; padding: 10px;
   font-size: 0.85rem; border-radius: var(--radius); box-shadow: var(--shadow);
