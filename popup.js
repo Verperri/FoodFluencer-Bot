@@ -1,3 +1,8 @@
+// ── Constants ─────────────────────────────────────────────────────────────────
+
+const PLACES_SEARCH = "https://places.googleapis.com/v1/places:searchText";
+const PLACES_PHOTO  = "https://places.googleapis.com/v1";
+
 const BELGIAN_RESTAURANTS = [
   "Comme Chez Soi Brussels",
   "In De Wulf Dranouter",
@@ -5,10 +10,9 @@ const BELGIAN_RESTAURANTS = [
   "Hof van Cleve Kruishoutem",
   "Bon Bon Brussels",
   "Zilte Antwerp",
-  "De Librije Bruges",
+  "De Karmeliet Bruges",
   "La Paix Brussels",
   "Bozar Restaurant Brussels",
-  "De Karmeliet Bruges",
   "Humphrey Brussels",
   "Vrijmoed Ghent",
   "OAK Ghent",
@@ -26,7 +30,7 @@ const BELGIAN_RESTAURANTS = [
   "De Troubadour Bruges",
 ];
 
-const BASE = "https://maps.googleapis.com/maps/api/place";
+// ── State ─────────────────────────────────────────────────────────────────────
 
 let currentRestaurant = null;
 let API_KEY = "";
@@ -38,7 +42,7 @@ const $ = id => document.getElementById(id);
 function showKeySetup(show) {
   $("keySetup").classList.toggle("hidden", !show);
   $("query").closest(".search-section").classList.toggle("hidden", show);
-  $("results").classList.toggle("hidden", show || !currentRestaurant);
+  if (show) $("results").classList.add("hidden");
 }
 
 chrome.storage.local.get({ googleApiKey: "" }, ({ googleApiKey }) => {
@@ -60,6 +64,109 @@ $("changeKeyBtn").addEventListener("click", () => {
   showKeySetup(true);
 });
 
+// ── Places API (New) helpers ──────────────────────────────────────────────────
+
+async function searchRestaurant(query) {
+  const searchQuery = /belgium/i.test(query) ? query : `${query} Belgium`;
+
+  const res = await fetch(PLACES_SEARCH, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      "X-Goog-Api-Key": API_KEY,
+      "X-Goog-FieldMask": [
+        "places.id",
+        "places.displayName",
+        "places.formattedAddress",
+        "places.rating",
+        "places.userRatingCount",
+        "places.googleMapsUri",
+        "places.photos",
+      ].join(","),
+    },
+    body: JSON.stringify({
+      textQuery: searchQuery,
+      maxResultCount: 1,
+      locationRestriction: {
+        rectangle: {
+          low:  { latitude: 49.5, longitude: 2.5 },
+          high: { latitude: 51.5, longitude: 6.4 },
+        },
+      },
+    }),
+  });
+
+  if (!res.ok) {
+    const err = await res.json().catch(() => ({}));
+    throw new Error(err?.error?.message || `API error ${res.status}`);
+  }
+
+  const data = await res.json();
+  if (!data.places?.length)
+    throw new Error(`No restaurant found for "${query}" in Belgium.`);
+
+  return data.places[0];
+}
+
+function photoUrl(photoName, maxWidth = 400) {
+  return `${PLACES_PHOTO}/${photoName}/media?maxWidthPx=${maxWidth}&key=${API_KEY}&skipHttpRedirect=true`;
+}
+
+// ── Render ────────────────────────────────────────────────────────────────────
+
+function renderResults(place) {
+  const photos = (place.photos || []).slice(0, CONFIG.MAX_PHOTOS);
+
+  currentRestaurant = {
+    name:         place.displayName?.text || "",
+    address:      place.formattedAddress || "",
+    rating:       place.rating,
+    totalRatings: place.userRatingCount,
+    mapsUrl:      place.googleMapsUri || "",
+    photos:       photos.map(p => ({ name: p.name })),
+  };
+
+  $("restaurantName").textContent    = currentRestaurant.name;
+  $("restaurantAddress").textContent = currentRestaurant.address;
+  $("restaurantMeta").textContent    = place.rating
+    ? `⭐ ${place.rating} · ${place.userRatingCount?.toLocaleString() ?? 0} ratings`
+    : "";
+
+  const link = $("restaurantMapsLink");
+  link.href         = currentRestaurant.mapsUrl || "#";
+  link.style.display = currentRestaurant.mapsUrl ? "inline" : "none";
+
+  const grid = $("photoGrid");
+  grid.innerHTML = "";
+  photos.forEach((photo, i) => {
+    const div = document.createElement("div");
+    div.className = "photo-item";
+
+    // Resolve the media redirect first so the img src gets the real image URL
+    fetch(photoUrl(photo.name, 400))
+      .then(r => r.json())
+      .then(({ photoUri }) => {
+        const img = document.createElement("img");
+        img.src = photoUri;
+        img.alt = `Photo ${i + 1}`;
+        const label = document.createElement("span");
+        label.className = "photo-label";
+        label.textContent = i + 1;
+        div.appendChild(img);
+        div.appendChild(label);
+      })
+      .catch(() => {
+        div.innerHTML = `<div class="photo-error">Photo ${i + 1} unavailable</div>`;
+      });
+
+    grid.appendChild(div);
+  });
+
+  $("results").classList.remove("hidden");
+}
+
+// ── Search flow ───────────────────────────────────────────────────────────────
+
 function setStatus(msg, type = "loading") {
   const el = $("status");
   el.textContent = msg;
@@ -68,91 +175,16 @@ function setStatus(msg, type = "loading") {
   if (type !== "loading") setTimeout(() => el.classList.add("hidden"), 5000);
 }
 
-function setLoading(btn, on) {
-  btn.disabled = on;
-  if (!btn._orig) btn._orig = btn.textContent;
-  btn.textContent = on ? "…" : btn._orig;
-}
-
-async function placesGet(path, params) {
-  const url = new URL(`${BASE}/${path}/json`);
-  Object.entries({ ...params, key: API_KEY }).forEach(([k, v]) =>
-    url.searchParams.set(k, v)
-  );
-  const res = await fetch(url);
-  if (!res.ok) throw new Error(`HTTP ${res.status}`);
-  return res.json();
-}
-
-async function searchRestaurant(query) {
-  const data = await placesGet("textsearch", {
-    query: query.toLowerCase().includes("belgium") ? query : `${query} Belgium`,
-    region: CONFIG.REGION,
-    type: "restaurant",
-  });
-  if (data.status !== "OK" || !data.results?.length)
-    throw new Error(`No restaurant found for "${query}" in Belgium.`);
-  return data.results[0];
-}
-
-async function getDetails(placeId) {
-  const data = await placesGet("details", {
-    place_id: placeId,
-    fields: "name,formatted_address,photos,url,rating,user_ratings_total",
-  });
-  return data.result || {};
-}
-
-function photoUrl(ref, maxWidth = 400) {
-  return `${BASE}/photo?maxwidth=${maxWidth}&photo_reference=${ref}&key=${API_KEY}`;
-}
-
-function renderResults(data) {
-  currentRestaurant = data;
-  $("restaurantName").textContent = data.name;
-  $("restaurantAddress").textContent = data.address;
-  $("restaurantMeta").textContent = data.rating
-    ? `⭐ ${data.rating} · ${data.totalRatings?.toLocaleString() ?? 0} ratings`
-    : "";
-  const link = $("restaurantMapsLink");
-  link.href = data.mapsUrl || "#";
-  link.style.display = data.mapsUrl ? "inline" : "none";
-
-  const grid = $("photoGrid");
-  grid.innerHTML = "";
-  data.photos.forEach((photo, i) => {
-    const div = document.createElement("div");
-    div.className = "photo-item";
-    div.innerHTML = `<img src="${photoUrl(photo.reference)}" alt="Photo ${i + 1}" /><span class="photo-label">${i + 1}</span>`;
-    grid.appendChild(div);
-  });
-
-  $("results").classList.remove("hidden");
-}
-
 async function doSearch(query) {
   if (!query.trim()) return;
+  if (!API_KEY) { setStatus("Please save your API key first.", "error"); return; }
+
   setStatus("Searching…");
+  $("results").classList.add("hidden");
+
   try {
     const place = await searchRestaurant(query);
-    const details = await getDetails(place.place_id);
-    const photos = (details.photos || [])
-      .sort((a, b) => (b.width || 0) - (a.width || 0))
-      .slice(0, CONFIG.MAX_PHOTOS);
-
-    renderResults({
-      placeId: place.place_id,
-      name: details.name || place.name,
-      address: details.formatted_address || "",
-      rating: details.rating,
-      totalRatings: details.user_ratings_total,
-      mapsUrl: details.url || "",
-      photos: photos.map(p => ({
-        reference: p.photo_reference,
-        width: p.width,
-        height: p.height,
-      })),
-    });
+    renderResults(place);
     $("status").classList.add("hidden");
   } catch (err) {
     setStatus(err.message, "error");
@@ -166,63 +198,68 @@ async function exportPhotos() {
 
   const { name, address, photos } = currentRestaurant;
   const timestamp = new Date().toISOString().replace(/[:.]/g, "-").slice(0, 19);
-  const folder = `FoodFluencer/${name.replace(/[/\\?%*:|"<>]/g, "_")}_${timestamp}`;
+  const safeName  = name.replace(/[/\\?%*:|"<>]/g, "_");
+  const folder    = `FoodFluencer/${safeName}_${timestamp}`;
 
   setStatus(`Downloading ${photos.length} photos…`);
   $("exportBtn").disabled = true;
 
-  let saved = 0;
   for (let i = 0; i < photos.length; i++) {
-    const url = photoUrl(photos[i].reference, 1200);
-    chrome.runtime.sendMessage(
-      { type: "DOWNLOAD", url, filename: `${folder}/photo_${String(i + 1).padStart(2, "0")}.jpg` },
-      () => { saved++; }
-    );
+    try {
+      const res  = await fetch(photoUrl(photos[i].name, 1200));
+      const data = await res.json();
+      chrome.runtime.sendMessage({
+        type: "DOWNLOAD",
+        url: data.photoUri,
+        filename: `${folder}/photo_${String(i + 1).padStart(2, "0")}.jpg`,
+      });
+    } catch (e) {
+      console.warn("Photo download failed:", e);
+    }
   }
 
-  // Write info note as a data-URI text file
+  // Save info note
   const note = [
     `Restaurant: ${name}`,
     `Address:    ${address}`,
     `Exported:   ${new Date().toLocaleString()}`,
     `Photos:     ${photos.length}`,
   ].join("\n");
-  const noteUri = "data:text/plain;charset=utf-8," + encodeURIComponent(note);
-  chrome.runtime.sendMessage({ type: "DOWNLOAD", url: noteUri, filename: `${folder}/info.txt` });
+  chrome.runtime.sendMessage({
+    type: "DOWNLOAD",
+    url: "data:text/plain;charset=utf-8," + encodeURIComponent(note),
+    filename: `${folder}/info.txt`,
+  });
 
-  // Log to chrome.storage
+  // Persist to log
   chrome.storage.local.get({ exportLog: [] }, ({ exportLog }) => {
     exportLog.push({ timestamp, name, address, photos: photos.length, folder });
     chrome.storage.local.set({ exportLog });
   });
 
-  setStatus(`✅ Exported ${photos.length} photos to Downloads/${folder}`, "success");
+  setStatus(`✅ Saved ${photos.length} photos → Downloads/${folder}`, "success");
   $("exportBtn").disabled = false;
 
-  // Hook point for future social media posting
+  // Hook point for future social media auto-posting
   onExportComplete({ name, address, folder, photos });
 }
 
-// Called after every successful export — wire up social posting here later
 function onExportComplete({ name, address, folder, photos }) {
-  // TODO: if user is logged into Instagram/Facebook/TikTok,
-  // use their active session to post photos[0] with caption `${name} — ${address}`
+  // TODO: auto-post to Instagram / Facebook / TikTok using the user's active session
 }
 
 // ── Event listeners ───────────────────────────────────────────────────────────
 
-$("searchBtn").addEventListener("click", () => {
-  doSearch($("query").value);
-});
+$("searchBtn").addEventListener("click", () => doSearch($("query").value));
 
 $("query").addEventListener("keydown", e => {
   if (e.key === "Enter") doSearch($("query").value);
 });
 
-$("randomBtn").addEventListener("click", async () => {
+$("randomBtn").addEventListener("click", () => {
   const pick = BELGIAN_RESTAURANTS[Math.floor(Math.random() * BELGIAN_RESTAURANTS.length)];
-  $("query").value = pick.replace(" Belgium", "").replace(/ (Brussels|Antwerp|Ghent|Bruges|Liège|Namur|Kruishoutem|Dranouter)$/, "");
-  await doSearch(pick);
+  $("query").value = pick;
+  doSearch(pick);
 });
 
 $("exportBtn").addEventListener("click", exportPhotos);

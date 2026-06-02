@@ -19,7 +19,7 @@
     "storage"
   ],
   "host_permissions": [
-    "https://maps.googleapis.com/*"
+    "https://places.googleapis.com/*"
   ],
   "icons": {
     "16":  "icons/icon16.png",
