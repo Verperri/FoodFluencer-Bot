@@ -1,0 +1,71 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>FoodFluencer Bot</title>
+  <link rel="stylesheet" href="popup.css" />
+</head>
+<body>
+  <div class="container">
+    <header>
+      <img src="icons/icon48.png" class="logo" alt="" />
+      <div>
+        <h1>FoodFluencer Bot</h1>
+        <p class="subtitle">Belgium • Top restaurant photos</p>
+      </div>
+    </header>
+
+    <!-- Shown only when no API key is saved yet -->
+    <section id="keySetup" class="key-setup hidden">
+      <p>Paste your <strong>Google Places API key</strong> to get started:</p>
+      <div class="input-row">
+        <input id="apiKeyInput" type="password" placeholder="AIza…" autocomplete="off" />
+        <button id="saveKeyBtn" class="btn btn--primary">Save</button>
+      </div>
+      <p class="hint">Key is stored locally in your browser — never uploaded anywhere.<br>
+        Get a free key at <strong>console.cloud.google.com</strong> → Places API.</p>
+    </section>
+
+    <section class="search-section">
+      <div class="input-row">
+        <input id="query" type="text"
+          placeholder="e.g. Comme Chez Soi, Brussels"
+          autocomplete="off" />
+        <button id="searchBtn" class="btn btn--primary">Search</button>
+        <button id="randomBtn" class="btn btn--random">🎲</button>
+      </div>
+    </section>
+
+    <section id="results" class="results-section hidden">
+      <div class="restaurant-card">
+        <div class="restaurant-info">
+          <h2 id="restaurantName"></h2>
+          <p id="restaurantAddress" class="address"></p>
+          <p id="restaurantMeta" class="meta"></p>
+          <a id="restaurantMapsLink" href="#" target="_blank" class="maps-link">View on Google Maps ↗</a>
+        </div>
+      </div>
+
+      <div id="photoGrid" class="photo-grid"></div>
+
+      <div class="actions">
+        <button id="exportBtn" class="btn btn--export">⬇ Export All Photos</button>
+        <button id="changeKeyBtn" class="btn btn--ghost">⚙ Change API key</button>
+        <!-- Social media sharing — coming in next release -->
+        <div class="social-row">
+          <span class="social-label">Auto-post to:</span>
+          <button class="btn btn--social" disabled title="Coming soon">Instagram</button>
+          <button class="btn btn--social" disabled title="Coming soon">Facebook</button>
+          <button class="btn btn--social" disabled title="Coming soon">TikTok</button>
+        </div>
+      </div>
+    </section>
+
+    <div id="status" class="status hidden"></div>
+  </div>
+
+  <script src="config.js"></script>
+  <script src="popup.js"></script>
+</body>
+</html>

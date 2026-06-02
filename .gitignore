@@ -1,11 +1,9 @@
-# Environment
+# Environment / secrets
 .env
 
-# Exports & logs (user-generated content)
+# Flask artefacts (legacy)
 exports/
 logs/
-
-# Python
 __pycache__/
 *.pyc
 *.pyo

@@ -1,0 +1,29 @@
+{
+  "manifest_version": 3,
+  "name": "FoodFluencer Bot",
+  "version": "1.0.0",
+  "description": "Find and export top restaurant photos in Belgium. Future: auto-post to social media.",
+  "action": {
+    "default_popup": "popup.html",
+    "default_icon": {
+      "16":  "icons/icon16.png",
+      "48":  "icons/icon48.png",
+      "128": "icons/icon128.png"
+    }
+  },
+  "background": {
+    "service_worker": "background.js"
+  },
+  "permissions": [
+    "downloads",
+    "storage"
+  ],
+  "host_permissions": [
+    "https://maps.googleapis.com/*"
+  ],
+  "icons": {
+    "16":  "icons/icon16.png",
+    "48":  "icons/icon48.png",
+    "128": "icons/icon128.png"
+  }
+}
