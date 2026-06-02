@@ -1,0 +1,18 @@
+# Environment
+.env
+
+# Exports & logs (user-generated content)
+exports/
+logs/
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
+env/
+
+# OS
+.DS_Store
+Thumbs.db

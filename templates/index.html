@@ -1,0 +1,177 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>FoodFluencer Bot — Belgium</title>
+  <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}" />
+</head>
+<body>
+  <div class="container">
+    <header>
+      <h1>🍽️ FoodFluencer Bot</h1>
+      <p class="subtitle">Find top photos for any restaurant in Belgium</p>
+    </header>
+
+    {% if not api_configured %}
+    <div class="banner banner--warn">
+      <strong>API key not set.</strong>
+      Open <code>.env</code> and add your <code>GOOGLE_API_KEY</code>.
+      See <a href="#setup">setup instructions</a> below.
+    </div>
+    {% endif %}
+
+    <section class="search-section">
+      <div class="input-row">
+        <input
+          id="query"
+          type="text"
+          placeholder="e.g. De Wulf, Ghent  or  Comme Chez Soi, Brussels"
+          autocomplete="off"
+        />
+        <button id="searchBtn" class="btn btn--primary">Search</button>
+      </div>
+      <p class="hint">Results are restricted to Belgium.</p>
+    </section>
+
+    <section id="results" class="results-section hidden">
+      <div class="restaurant-card">
+        <div class="restaurant-info">
+          <h2 id="restaurantName"></h2>
+          <p id="restaurantAddress" class="address"></p>
+          <p id="restaurantMeta" class="meta"></p>
+          <a id="restaurantMapsLink" href="#" target="_blank" class="maps-link">View on Google Maps ↗</a>
+        </div>
+        <button id="exportBtn" class="btn btn--export">Export Photos</button>
+      </div>
+
+      <div id="photoGrid" class="photo-grid"></div>
+    </section>
+
+    <div id="toast" class="toast hidden"></div>
+
+    <section id="setup" class="setup-section">
+      <h2>Setup — Get your free Google API key</h2>
+      <ol>
+        <li>Go to <strong>console.cloud.google.com</strong> and create (or select) a project.</li>
+        <li>Enable these APIs: <strong>Places API</strong> and <strong>Maps JavaScript API</strong>.</li>
+        <li>Go to <strong>APIs &amp; Services → Credentials</strong> → Create API key.</li>
+        <li>Copy the key and paste it into your <code>.env</code> file:
+          <pre>GOOGLE_API_KEY=your_key_here</pre>
+        </li>
+        <li>Restart the server (<code>python app.py</code>) — done!</li>
+      </ol>
+      <p class="hint">Free tier: ~$200 credit/month → roughly 5,000–10,000 restaurant searches for free.</p>
+    </section>
+  </div>
+
+  <script>
+    const searchBtn  = document.getElementById('searchBtn');
+    const exportBtn  = document.getElementById('exportBtn');
+    const queryInput = document.getElementById('query');
+    const resultsEl  = document.getElementById('results');
+    const photoGrid  = document.getElementById('photoGrid');
+    const toast      = document.getElementById('toast');
+
+    let currentRestaurant = null;
+
+    function showToast(msg, type = 'info') {
+      toast.textContent = msg;
+      toast.className = `toast toast--${type}`;
+      setTimeout(() => toast.classList.add('hidden'), 4000);
+    }
+
+    function setLoading(btn, loading) {
+      btn.disabled = loading;
+      btn.dataset.original = btn.dataset.original || btn.textContent;
+      btn.textContent = loading ? '⏳ Working…' : btn.dataset.original;
+    }
+
+    queryInput.addEventListener('keydown', e => {
+      if (e.key === 'Enter') searchBtn.click();
+    });
+
+    searchBtn.addEventListener('click', async () => {
+      const query = queryInput.value.trim();
+      if (!query) return;
+
+      setLoading(searchBtn, true);
+      resultsEl.classList.add('hidden');
+      photoGrid.innerHTML = '';
+
+      try {
+        const res = await fetch('/search', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ query }),
+        });
+        const data = await res.json();
+
+        if (!res.ok) {
+          showToast(data.error || 'Search failed.', 'error');
+          return;
+        }
+
+        currentRestaurant = data;
+
+        document.getElementById('restaurantName').textContent    = data.name;
+        document.getElementById('restaurantAddress').textContent = data.address;
+        document.getElementById('restaurantMeta').textContent    =
+          data.rating ? `⭐ ${data.rating} · ${data.total_ratings?.toLocaleString() ?? 0} ratings` : '';
+        const mapsLink = document.getElementById('restaurantMapsLink');
+        mapsLink.href = data.maps_url || '#';
+        mapsLink.style.display = data.maps_url ? 'inline' : 'none';
+
+        // Render photo previews (via proxy endpoint)
+        data.photos.forEach((photo, i) => {
+          const div = document.createElement('div');
+          div.className = 'photo-item';
+          div.innerHTML = `
+            <img src="/photo?ref=${encodeURIComponent(photo.reference)}" alt="Photo ${i+1}" loading="lazy" />
+            <span class="photo-label">Photo ${i+1}</span>
+          `;
+          photoGrid.appendChild(div);
+        });
+
+        resultsEl.classList.remove('hidden');
+      } catch (err) {
+        showToast('Network error — is the server running?', 'error');
+      } finally {
+        setLoading(searchBtn, false);
+      }
+    });
+
+    exportBtn.addEventListener('click', async () => {
+      if (!currentRestaurant) return;
+      setLoading(exportBtn, true);
+
+      try {
+        const res = await fetch('/export', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            name:    currentRestaurant.name,
+            address: currentRestaurant.address,
+            photos:  currentRestaurant.photos,
+          }),
+        });
+        const data = await res.json();
+
+        if (!res.ok) {
+          showToast(data.error || 'Export failed.', 'error');
+          return;
+        }
+
+        showToast(
+          `✅ Exported ${data.photos_saved} photo${data.photos_saved !== 1 ? 's' : ''} → ${data.folder}`,
+          'success'
+        );
+      } catch (err) {
+        showToast('Export failed — network error.', 'error');
+      } finally {
+        setLoading(exportBtn, false);
+      }
+    });
+  </script>
+</body>
+</html>
