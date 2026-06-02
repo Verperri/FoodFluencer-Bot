@@ -1,4 +1,4 @@
-// Service worker — handles file downloads triggered from the popup
+// Service worker — handles downloads triggered from the popup
 chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
   if (msg.type === "DOWNLOAD") {
     chrome.downloads.download(
