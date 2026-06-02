@@ -28,10 +28,9 @@ const INJECTORS = {
   tiktok:    injectTikTok,
 };
 
-async function handleSocialPost({ platform, photoDataUrl, caption, songName }) {
+async function handleSocialPost({ platform, photoDataUrls, caption, songName }) {
   const tab = await chrome.tabs.create({ url: PLATFORM_URLS[platform], active: true });
 
-  // Wait for the page to fully load
   await new Promise(resolve => {
     function listener(tabId, info) {
       if (tabId !== tab.id || info.status !== "complete") return;
@@ -42,13 +41,13 @@ async function handleSocialPost({ platform, photoDataUrl, caption, songName }) {
   });
 
   // Extra buffer for SPA hydration
-  await new Promise(r => setTimeout(r, 1500));
+  await new Promise(r => setTimeout(r, 1800));
 
   try {
     await chrome.scripting.executeScript({
       target: { tabId: tab.id },
       func:   INJECTORS[platform],
-      args:   [photoDataUrl, caption, songName || ""],
+      args:   [photoDataUrls, caption, songName || ""],
       world:  "MAIN",
     });
   } catch (err) {
@@ -56,222 +55,243 @@ async function handleSocialPost({ platform, photoDataUrl, caption, songName }) {
   }
 }
 
-// ── Shared helpers (inlined into every injector because each runs isolated) ───
-// NOTE: These functions are serialised and injected — keep them self-contained.
+// ═══════════════════════════════════════════════════════════════════════════════
+// Shared utilities — inlined in every injector (each runs serialised/isolated)
+// ═══════════════════════════════════════════════════════════════════════════════
 
 // ─── Facebook ─────────────────────────────────────────────────────────────────
 
-function injectFacebook(photoDataUrl, caption, songName) {
-  const sleep   = ms => new Promise(r => setTimeout(r, ms));
+function injectFacebook(photoDataUrls, caption, songName) {
+  /* ── helpers ── */
+  const sleep = ms => new Promise(r => setTimeout(r, ms));
+
   const waitFor = (sel, ms = 8000) => new Promise(res => {
-    const el = document.querySelector(sel);
-    if (el) return res(el);
-    const t  = Date.now();
+    if (document.querySelector(sel)) return res(document.querySelector(sel));
+    const t = Date.now();
     const iv = setInterval(() => {
-      const e = document.querySelector(sel);
-      if (e)              { clearInterval(iv); res(e); }
-      else if (Date.now() - t > ms) { clearInterval(iv); res(null); }
+      const el = document.querySelector(sel);
+      if (el) { clearInterval(iv); return res(el); }
+      if (Date.now() - t > ms) { clearInterval(iv); return res(null); }
     }, 250);
   });
 
   function dataUrlToFile(url, name) {
     const [hdr, b64] = url.split(',');
     const mime = hdr.match(/:(.*?);/)[1];
-    const bin  = atob(b64); const arr = new Uint8Array(bin.length);
+    const bin = atob(b64); const arr = new Uint8Array(bin.length);
     for (let i = 0; i < bin.length; i++) arr[i] = bin.charCodeAt(i);
     return new File([arr], name, { type: mime });
   }
 
-  function setFileOnInput(input, file) {
+  function setFilesOnInput(input, files) {
     const dt = new DataTransfer();
-    dt.items.add(file);
+    files.forEach(f => dt.items.add(f));
     const setter = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'files')?.set;
     if (setter) setter.call(input, dt.files); else input.files = dt.files;
     input.dispatchEvent(new Event('change', { bubbles: true }));
     input.dispatchEvent(new Event('input',  { bubbles: true }));
   }
 
-  function banner(html, type = 'info') {
-    document.getElementById('ffbot-banner')?.remove();
+  function step(n, total, html, type = 'info') {
+    const existing = document.getElementById('ffbot-banner');
+    if (existing) existing.remove();
     const b = document.createElement('div');
     b.id = 'ffbot-banner';
-    const bg = { info:'#e8490f', success:'#16a34a', warn:'#d97706' }[type] || '#e8490f';
-    b.style.cssText = `position:fixed;top:0;left:0;right:0;z-index:2147483647;background:${bg};
-      color:#fff;font-family:-apple-system,sans-serif;font-size:13px;font-weight:500;
-      padding:10px 16px;display:flex;align-items:center;gap:10px;
-      box-shadow:0 3px 12px rgba(0,0,0,.25);`;
-    b.innerHTML = `🍽️ <strong>FoodFluencer</strong> &nbsp;·&nbsp; ${html}
-      <button onclick="this.parentNode.remove()" style="margin-left:auto;background:rgba(255,255,255,.25);
-      border:none;color:#fff;border-radius:5px;padding:3px 9px;cursor:pointer;">✕</button>`;
+    const bg = { info: '#e8490f', success: '#16a34a', warn: '#d97706' }[type] || '#e8490f';
+    b.style.cssText = `position:fixed;top:0;left:0;right:0;z-index:2147483647;
+      background:${bg};color:#fff;font-family:-apple-system,sans-serif;font-size:13px;
+      font-weight:500;padding:10px 16px;display:flex;align-items:center;gap:10px;
+      box-shadow:0 3px 14px rgba(0,0,0,.28);`;
+    b.innerHTML = `
+      <strong style="white-space:nowrap">🍽️ FoodFluencer</strong>
+      <span style="background:rgba(255,255,255,.22);border-radius:20px;padding:1px 8px;font-size:.75rem;white-space:nowrap">
+        ${n}/${total}
+      </span>
+      <span style="font-weight:400;flex:1">${html}</span>
+      <button onclick="document.getElementById('ffbot-banner').remove()"
+        style="background:rgba(255,255,255,.22);border:none;color:#fff;border-radius:5px;
+        padding:3px 9px;cursor:pointer;white-space:nowrap;flex-shrink:0">✕ Close</button>`;
     document.body.prepend(b);
   }
 
+  /* ── main flow ── */
   (async () => {
-    banner('Opening post composer…');
+    const total = songName ? 5 : 4;
 
-    // 1 ── Click "What's on your mind?" to open the composer
-    const triggerSelectors = [
+    // ①  Open composer
+    step(1, total, 'Opening post composer…');
+    const triggerSels = [
       '[aria-placeholder="What\'s on your mind?"]',
       '[placeholder="What\'s on your mind?"]',
-      '[role="button"][tabindex="0"] span',
     ];
     let trigger = null;
-    for (const sel of triggerSelectors) {
-      trigger = document.querySelector(sel); if (trigger) break;
-    }
-    // Fallback: find by text
-    if (!trigger) {
-      trigger = [...document.querySelectorAll('[role="button"]')]
-        .find(el => el.textContent.includes("What's on your mind"));
-    }
-    if (trigger) { trigger.click(); await sleep(1200); }
-    else { banner('Could not open post composer — click <strong>"What\'s on your mind?"</strong> manually.', 'warn'); return; }
+    for (const s of triggerSels) { trigger = document.querySelector(s); if (trigger) break; }
+    if (!trigger) trigger = [...document.querySelectorAll('[role="button"]')]
+      .find(el => el.textContent.includes("What's on your mind"));
 
-    // 2 ── Click the Photo/Video button inside the composer dialog
-    await sleep(600);
-    let photoBtn = document.querySelector('[aria-label="Photo/video"]');
-    if (!photoBtn) {
-      photoBtn = [...document.querySelectorAll('[role="button"]')]
-        .find(el => /photo.*video|video.*photo/i.test(el.getAttribute('aria-label') || el.textContent));
+    if (!trigger) {
+      step(1, total, 'Could not find post composer — click <strong>"What\'s on your mind?"</strong> manually.', 'warn');
+      return;
     }
+    trigger.click();
+    await sleep(1400);
+
+    // ②  Click Photo/Video button
+    step(2, total, 'Clicking <strong>Photo/Video</strong>…');
+    let photoBtn = document.querySelector('[aria-label="Photo/video"]');
+    if (!photoBtn) photoBtn = [...document.querySelectorAll('[role="button"]')]
+      .find(el => /photo.*video|video.*photo/i.test(el.getAttribute('aria-label') || '') ||
+                  el.textContent.trim() === 'Photo/video');
     if (photoBtn) { photoBtn.click(); await sleep(900); }
 
-    // 3 ── Inject the file into the file input that Facebook reveals
+    // ③  Inject ALL photos into the file input
     const fileInput = await waitFor('input[type="file"]', 6000);
-    if (!fileInput) { banner('Photo input not found — click <strong>Photo/Video</strong> and select from Downloads/FoodFluencer.', 'warn'); return; }
-    setFileOnInput(fileInput, dataUrlToFile(photoDataUrl, 'restaurant.jpg'));
-    banner('Photo uploaded — filling caption…');
-    await sleep(2000);
+    if (!fileInput) {
+      step(3, total, 'Photo input not found — click <strong>Photo/Video</strong> and select from Downloads/FoodFluencer.', 'warn');
+      return;
+    }
+    const files = photoDataUrls.map((url, i) => dataUrlToFile(url, `restaurant-${i + 1}.jpg`));
+    step(3, total, `Uploading <strong>${files.length} photo${files.length > 1 ? 's' : ''}</strong>…`);
+    setFilesOnInput(fileInput, files);
+    await sleep(2200);
 
-    // 4 ── Fill the caption / "What's on your mind?" text area inside the open dialog
-    const captionSelectors = [
+    // ④  Fill caption
+    step(4, total, 'Filling caption…');
+    const captionSels = [
       '[contenteditable="true"][aria-placeholder]',
       '[contenteditable="true"][role="textbox"]',
       '[data-testid="status-attachment-mentions-input"]',
     ];
     let captionBox = null;
-    for (const sel of captionSelectors) {
-      // Prefer the one inside the modal/dialog
-      const boxes = document.querySelectorAll(sel);
+    for (const s of captionSels) {
+      const boxes = document.querySelectorAll(s);
       for (const box of boxes) {
-        if (box.closest('[role="dialog"]') || box.closest('[aria-modal]')) {
-          captionBox = box; break;
-        }
+        if (box.closest('[role="dialog"]') || box.closest('[aria-modal]')) { captionBox = box; break; }
       }
-      if (!captionBox) captionBox = document.querySelector(sel);
+      if (!captionBox) captionBox = document.querySelector(s);
       if (captionBox) break;
     }
     if (captionBox) {
       captionBox.focus(); await sleep(200);
-      // Select all existing placeholder text and replace
       const range = document.createRange();
       range.selectNodeContents(captionBox);
       window.getSelection().removeAllRanges();
       window.getSelection().addRange(range);
       document.execCommand('insertText', false, caption);
     }
-
     await sleep(400);
-    const songHint = songName ? `&nbsp; 🎵 Add <em>"${songName}"</em> via <strong>Feeling/Activity → Music</strong>.` : '';
-    banner(`✅ Photo &amp; caption ready!${songHint} &nbsp; Click <strong>Post</strong> to publish.`, 'success');
+
+    // ⑤  Song hint (optional)
+    if (songName) {
+      step(5, total, `Add <em>"${songName}"</em> via <strong>Feeling/Activity → Music</strong>, then click <strong>Post</strong>.`, 'success');
+    } else {
+      step(4, total, `✅ ${files.length} photo${files.length > 1 ? 's' : ''} &amp; caption ready — click <strong>Post</strong> to publish.`, 'success');
+    }
   })();
 }
 
 // ─── Instagram ────────────────────────────────────────────────────────────────
 
-function injectInstagram(photoDataUrl, caption, songName) {
-  const sleep   = ms => new Promise(r => setTimeout(r, ms));
+function injectInstagram(photoDataUrls, caption, songName) {
+  const sleep = ms => new Promise(r => setTimeout(r, ms));
+
   const waitFor = (sel, ms = 8000) => new Promise(res => {
-    const el = document.querySelector(sel); if (el) return res(el);
-    const t  = Date.now();
-    const iv = setInterval(() => {
-      const e = document.querySelector(sel);
-      if (e)              { clearInterval(iv); res(e); }
-      else if (Date.now() - t > ms) { clearInterval(iv); res(null); }
+    if (document.querySelector(sel)) return res(document.querySelector(sel));
+    const t = Date.now(); const iv = setInterval(() => {
+      const el = document.querySelector(sel);
+      if (el) { clearInterval(iv); return res(el); }
+      if (Date.now() - t > ms) { clearInterval(iv); return res(null); }
     }, 250);
   });
 
   function dataUrlToFile(url, name) {
     const [hdr, b64] = url.split(',');
     const mime = hdr.match(/:(.*?);/)[1];
-    const bin  = atob(b64); const arr = new Uint8Array(bin.length);
+    const bin = atob(b64); const arr = new Uint8Array(bin.length);
     for (let i = 0; i < bin.length; i++) arr[i] = bin.charCodeAt(i);
     return new File([arr], name, { type: mime });
   }
 
-  function setFileOnInput(input, file) {
-    const dt = new DataTransfer(); dt.items.add(file);
+  function setFilesOnInput(input, files) {
+    const dt = new DataTransfer();
+    files.forEach(f => dt.items.add(f));
     const setter = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'files')?.set;
     if (setter) setter.call(input, dt.files); else input.files = dt.files;
     input.dispatchEvent(new Event('change', { bubbles: true }));
     input.dispatchEvent(new Event('input',  { bubbles: true }));
   }
 
-  function banner(html, type = 'info') {
-    document.getElementById('ffbot-banner')?.remove();
+  function step(n, total, html, type = 'info') {
+    const existing = document.getElementById('ffbot-banner');
+    if (existing) existing.remove();
     const b = document.createElement('div'); b.id = 'ffbot-banner';
-    const bg = { info:'#e8490f', success:'#16a34a', warn:'#d97706' }[type] || '#e8490f';
-    b.style.cssText = `position:fixed;top:0;left:0;right:0;z-index:2147483647;background:${bg};
-      color:#fff;font-family:-apple-system,sans-serif;font-size:13px;font-weight:500;
-      padding:10px 16px;display:flex;align-items:center;gap:10px;
-      box-shadow:0 3px 12px rgba(0,0,0,.25);`;
-    b.innerHTML = `🍽️ <strong>FoodFluencer</strong> &nbsp;·&nbsp; ${html}
-      <button onclick="this.parentNode.remove()" style="margin-left:auto;background:rgba(255,255,255,.25);
-      border:none;color:#fff;border-radius:5px;padding:3px 9px;cursor:pointer;">✕</button>`;
+    const bg = { info: '#e8490f', success: '#16a34a', warn: '#d97706' }[type] || '#e8490f';
+    b.style.cssText = `position:fixed;top:0;left:0;right:0;z-index:2147483647;
+      background:${bg};color:#fff;font-family:-apple-system,sans-serif;font-size:13px;
+      font-weight:500;padding:10px 16px;display:flex;align-items:center;gap:10px;
+      box-shadow:0 3px 14px rgba(0,0,0,.28);`;
+    b.innerHTML = `
+      <strong style="white-space:nowrap">🍽️ FoodFluencer</strong>
+      <span style="background:rgba(255,255,255,.22);border-radius:20px;padding:1px 8px;font-size:.75rem;white-space:nowrap">${n}/${total}</span>
+      <span style="font-weight:400;flex:1">${html}</span>
+      <button onclick="document.getElementById('ffbot-banner').remove()"
+        style="background:rgba(255,255,255,.22);border:none;color:#fff;border-radius:5px;
+        padding:3px 9px;cursor:pointer;white-space:nowrap;flex-shrink:0">✕ Close</button>`;
     document.body.prepend(b);
   }
 
   function clickNext() {
     const btn = [...document.querySelectorAll('[role="button"]')]
       .find(el => el.textContent.trim() === 'Next');
-    if (btn) { btn.click(); return true; }
-    return false;
+    if (btn) { btn.click(); return true; } return false;
   }
 
   (async () => {
-    banner('Opening Instagram post creator…');
-    await sleep(2000);
+    const total = songName ? 6 : 5;
 
-    // 1 ── Find the file input (Instagram's /create/select/ page exposes one)
+    // ①  Wait for create page
+    step(1, total, 'Loading create page…');
+    await sleep(1800);
+
+    // ②  Select photos via file input
+    step(2, total, `Selecting <strong>${photoDataUrls.length} photo${photoDataUrls.length > 1 ? 's' : ''}</strong>…`);
     let fileInput = document.querySelector('input[type="file"]');
     if (!fileInput) {
-      // Try clicking "Select from computer" button
       const selBtn = [...document.querySelectorAll('[role="button"]')]
         .find(el => /select.*computer|from computer/i.test(el.textContent));
       if (selBtn) { selBtn.click(); await sleep(600); }
       fileInput = document.querySelector('input[type="file"]');
     }
-
     if (!fileInput) {
-      banner('Select your photo from <strong>Downloads/FoodFluencer</strong> in the dialog.', 'warn');
+      step(2, total, 'Select your photos from <strong>Downloads/FoodFluencer</strong> in the dialog.', 'warn');
       return;
     }
+    const files = photoDataUrls.map((url, i) => dataUrlToFile(url, `restaurant-${i + 1}.jpg`));
+    setFilesOnInput(fileInput, files);
+    await sleep(2500);
 
-    setFileOnInput(fileInput, dataUrlToFile(photoDataUrl, 'restaurant.jpg'));
-    banner('Photo selected — advancing through editor…');
-    await sleep(2200);
+    // ③  Next through Crop
+    step(3, total, 'Advancing through crop step…');
+    clickNext(); await sleep(1600);
 
-    // 2 ── Click through Crop step → Next
-    clickNext(); await sleep(1400);
+    // ④  Next through Filters
+    step(4, total, 'Advancing through filters step…');
+    clickNext(); await sleep(1600);
 
-    // 3 ── Click through Filter/Edit step → Next
-    clickNext(); await sleep(1400);
-
-    // 4 ── We should now be on the Caption / Details screen
+    // ⑤  Fill caption on Details screen
+    step(5, total, 'Filling caption…');
     const captionArea = await waitFor(
       'textarea[aria-label="Write a caption..."], textarea[placeholder*="caption" i], textarea[placeholder*="Caption" i]',
       5000
     );
     if (captionArea) {
       captionArea.focus(); await sleep(200);
-      // Use native setter so React picks it up
       const setter = Object.getOwnPropertyDescriptor(HTMLTextAreaElement.prototype, 'value')?.set;
-      if (setter) setter.call(captionArea, caption);
-      else captionArea.value = caption;
+      if (setter) setter.call(captionArea, caption); else captionArea.value = caption;
       captionArea.dispatchEvent(new Event('input', { bubbles: true }));
     }
 
-    // 5 ── Try to open the music picker for Reels if a song was selected
+    // ⑥  Try to add music
     if (songName) {
       await sleep(600);
       const musicBtn = [...document.querySelectorAll('[role="button"]')]
@@ -280,136 +300,131 @@ function injectInstagram(photoDataUrl, caption, songName) {
         musicBtn.click(); await sleep(1000);
         const searchInput = document.querySelector('input[placeholder*="Search" i], input[type="search"]');
         if (searchInput) {
-          searchInput.focus();
-          searchInput.value = songName;
+          searchInput.focus(); searchInput.value = songName;
           searchInput.dispatchEvent(new Event('input', { bubbles: true }));
           await sleep(1500);
-          // Select the first result
           const firstTrack = document.querySelector('[class*="MusicItem"], [class*="music_item"], [class*="track"]');
           if (firstTrack) firstTrack.click();
         }
+        step(6, total, `🎵 <em>"${songName}"</em> searched — select it, then click <strong>Share</strong>.`, 'success');
+      } else {
+        step(6, total, `Caption filled — search for <em>"${songName}"</em> in Add Music, then click <strong>Share</strong>.`, 'success');
       }
+    } else {
+      step(5, total, `✅ ${files.length} photo${files.length > 1 ? 's' : ''} &amp; caption ready — click <strong>Share</strong> to publish.`, 'success');
     }
-
-    await sleep(400);
-    const songHint = songName
-      ? `&nbsp; 🎵 Search for <em>"${songName}"</em> in <strong>Add music</strong> if not auto-selected.`
-      : '';
-    banner(`✅ Caption filled!${songHint} &nbsp; Click <strong>Share</strong> to publish.`, 'success');
   })();
 }
 
 // ─── TikTok ───────────────────────────────────────────────────────────────────
 
-function injectTikTok(photoDataUrl, caption, songName) {
-  const sleep   = ms => new Promise(r => setTimeout(r, ms));
+function injectTikTok(photoDataUrls, caption, songName) {
+  const sleep = ms => new Promise(r => setTimeout(r, ms));
+
   const waitFor = (sel, ms = 10000) => new Promise(res => {
-    const el = document.querySelector(sel); if (el) return res(el);
-    const t  = Date.now();
-    const iv = setInterval(() => {
-      const e = document.querySelector(sel);
-      if (e)              { clearInterval(iv); res(e); }
-      else if (Date.now() - t > ms) { clearInterval(iv); res(null); }
+    if (document.querySelector(sel)) return res(document.querySelector(sel));
+    const t = Date.now(); const iv = setInterval(() => {
+      const el = document.querySelector(sel);
+      if (el) { clearInterval(iv); return res(el); }
+      if (Date.now() - t > ms) { clearInterval(iv); return res(null); }
     }, 300);
   });
 
   function dataUrlToFile(url, name) {
     const [hdr, b64] = url.split(',');
     const mime = hdr.match(/:(.*?);/)[1];
-    const bin  = atob(b64); const arr = new Uint8Array(bin.length);
+    const bin = atob(b64); const arr = new Uint8Array(bin.length);
     for (let i = 0; i < bin.length; i++) arr[i] = bin.charCodeAt(i);
     return new File([arr], name, { type: mime });
   }
 
-  function setFileOnInput(input, file) {
-    const dt = new DataTransfer(); dt.items.add(file);
+  function setFilesOnInput(input, files) {
+    const dt = new DataTransfer();
+    files.forEach(f => dt.items.add(f));
     const setter = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'files')?.set;
     if (setter) setter.call(input, dt.files); else input.files = dt.files;
     input.dispatchEvent(new Event('change', { bubbles: true }));
     input.dispatchEvent(new Event('input',  { bubbles: true }));
   }
 
-  function banner(html, type = 'info') {
-    document.getElementById('ffbot-banner')?.remove();
+  function step(n, total, html, type = 'info') {
+    const existing = document.getElementById('ffbot-banner');
+    if (existing) existing.remove();
     const b = document.createElement('div'); b.id = 'ffbot-banner';
-    const bg = { info:'#e8490f', success:'#16a34a', warn:'#d97706' }[type] || '#e8490f';
-    b.style.cssText = `position:fixed;top:0;left:0;right:0;z-index:2147483647;background:${bg};
-      color:#fff;font-family:-apple-system,sans-serif;font-size:13px;font-weight:500;
-      padding:10px 16px;display:flex;align-items:center;gap:10px;
-      box-shadow:0 3px 12px rgba(0,0,0,.25);`;
-    b.innerHTML = `🍽️ <strong>FoodFluencer</strong> &nbsp;·&nbsp; ${html}
-      <button onclick="this.parentNode.remove()" style="margin-left:auto;background:rgba(255,255,255,.25);
-      border:none;color:#fff;border-radius:5px;padding:3px 9px;cursor:pointer;">✕</button>`;
+    const bg = { info: '#e8490f', success: '#16a34a', warn: '#d97706' }[type] || '#e8490f';
+    b.style.cssText = `position:fixed;top:0;left:0;right:0;z-index:2147483647;
+      background:${bg};color:#fff;font-family:-apple-system,sans-serif;font-size:13px;
+      font-weight:500;padding:10px 16px;display:flex;align-items:center;gap:10px;
+      box-shadow:0 3px 14px rgba(0,0,0,.28);`;
+    b.innerHTML = `
+      <strong style="white-space:nowrap">🍽️ FoodFluencer</strong>
+      <span style="background:rgba(255,255,255,.22);border-radius:20px;padding:1px 8px;font-size:.75rem;white-space:nowrap">${n}/${total}</span>
+      <span style="font-weight:400;flex:1">${html}</span>
+      <button onclick="document.getElementById('ffbot-banner').remove()"
+        style="background:rgba(255,255,255,.22);border:none;color:#fff;border-radius:5px;
+        padding:3px 9px;cursor:pointer;white-space:nowrap;flex-shrink:0">✕ Close</button>`;
     document.body.prepend(b);
   }
 
   (async () => {
-    banner('Opening TikTok upload…');
+    const total = songName ? 4 : 3;
 
-    // 1 ── Wait for file input on the upload page
+    // ①  Find file input on upload page
+    step(1, total, 'Locating upload area…');
     const fileInput = await waitFor('input[type="file"]', 10000);
-    if (!fileInput) { banner('Upload area not found — refresh TikTok and try again.', 'warn'); return; }
+    if (!fileInput) {
+      step(1, total, 'Upload area not found — refresh TikTok and try again.', 'warn');
+      return;
+    }
 
-    setFileOnInput(fileInput, dataUrlToFile(photoDataUrl, 'restaurant.jpg'));
-    banner('Photo uploading…');
-    await sleep(3500);  // TikTok needs time to process the upload
+    // ②  Upload all photos (TikTok creates a photo slideshow)
+    const files = photoDataUrls.map((url, i) => dataUrlToFile(url, `restaurant-${i + 1}.jpg`));
+    step(2, total, `Uploading <strong>${files.length} photo${files.length > 1 ? 's' : ''}</strong> as slideshow…`);
+    setFilesOnInput(fileInput, files);
+    await sleep(3500);
 
-    // 2 ── Fill the description / caption
-    const descSelectors = [
+    // ③  Fill description
+    step(3, total, 'Filling description…');
+    const descSels = [
       '.public-DraftEditor-content',
       '[contenteditable="true"][data-text]',
       '[class*="editor"][contenteditable="true"]',
       'div[contenteditable="true"]',
     ];
     let descBox = null;
-    for (const sel of descSelectors) {
-      descBox = document.querySelector(sel);
-      if (descBox) break;
-    }
+    for (const s of descSels) { descBox = document.querySelector(s); if (descBox) break; }
     if (descBox) {
       descBox.focus(); await sleep(200);
       document.execCommand('selectAll', false, null);
       document.execCommand('insertText', false, caption);
     }
 
-    // 3 ── Add sound / music
+    // ④  Add sound
     if (songName) {
       await sleep(800);
-      const soundBtnSelectors = [
-        'button[class*="sound"]',
-        '[class*="add-sound"]',
-        'button[aria-label*="sound" i]',
-        'button[aria-label*="music" i]',
-      ];
       let soundBtn = null;
-      for (const sel of soundBtnSelectors) {
-        soundBtn = document.querySelector(sel); if (soundBtn) break;
-      }
-      // Text-based fallback
-      if (!soundBtn) {
-        soundBtn = [...document.querySelectorAll('button, [role="button"]')]
-          .find(el => /add sound|add music/i.test(el.textContent || el.getAttribute('aria-label')));
-      }
+      const soundSels = ['button[class*="sound"]', '[class*="add-sound"]',
+        'button[aria-label*="sound" i]', 'button[aria-label*="music" i]'];
+      for (const s of soundSels) { soundBtn = document.querySelector(s); if (soundBtn) break; }
+      if (!soundBtn) soundBtn = [...document.querySelectorAll('button,[role="button"]')]
+        .find(el => /add sound|add music/i.test(el.textContent || el.getAttribute('aria-label') || ''));
+
       if (soundBtn) {
         soundBtn.click(); await sleep(1200);
-        const musicSearch = document.querySelector('input[placeholder*="Search" i], input[type="search"]');
-        if (musicSearch) {
-          musicSearch.focus();
-          musicSearch.value = songName;
-          musicSearch.dispatchEvent(new Event('input', { bubbles: true }));
+        const musicInput = document.querySelector('input[placeholder*="Search" i], input[type="search"]');
+        if (musicInput) {
+          musicInput.focus(); musicInput.value = songName;
+          musicInput.dispatchEvent(new Event('input', { bubbles: true }));
           await sleep(1800);
-          // Click first search result
-          const firstResult = document.querySelector(
-            '[class*="music-item"]:first-child, [class*="sound-item"]:first-child, [class*="MusicItem"]:first-child'
-          );
-          if (firstResult) { firstResult.click(); await sleep(500); }
+          const first = document.querySelector('[class*="music-item"]:first-child, [class*="sound-item"]:first-child, [class*="MusicItem"]:first-child');
+          if (first) { first.click(); await sleep(500); }
         }
+        step(4, total, `🎵 <em>"${songName}"</em> searched — confirm selection, then click <strong>Post</strong>.`, 'success');
+      } else {
+        step(4, total, `Description filled — add <em>"${songName}"</em> via Add Sound, then click <strong>Post</strong>.`, 'success');
       }
+    } else {
+      step(3, total, `✅ ${files.length} photo${files.length > 1 ? 's' : ''} &amp; description ready — click <strong>Post</strong> to publish.`, 'success');
     }
-
-    const songHint = songName
-      ? `&nbsp; 🎵 <em>"${songName}"</em> searched in Add Sound.`
-      : '';
-    banner(`✅ Photo &amp; caption ready!${songHint} &nbsp; Click <strong>Post</strong> to publish.`, 'success');
   })();
 }

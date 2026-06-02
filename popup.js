@@ -28,6 +28,7 @@ const BELGIAN_RESTAURANTS = [
 
 let API_KEY           = "";
 let currentRestaurant = null;
+const uriCache        = new Map(); // photoName|maxWidth → photoUri
 let selectedSong      = null;
 let activePlatforms   = new Set();
 
@@ -155,23 +156,32 @@ async function searchRestaurant(query) {
 }
 
 async function resolvePhotoUri(photoName, maxWidth = 400) {
+  const key = `${photoName}|${maxWidth}`;
+  if (uriCache.has(key)) return uriCache.get(key);
   trackApiCall("photo", "");
   const res  = await fetch(`${PLACES_PHOTO}/${photoName}/media?maxWidthPx=${maxWidth}&key=${API_KEY}&skipHttpRedirect=true`);
   const data = await res.json();
-  return data.photoUri;
+  const uri  = data.photoUri;
+  uriCache.set(key, uri);
+  return uri;
 }
 
 // ── Render restaurant ─────────────────────────────────────────────────────────
 
 function renderResults(place) {
-  const photos = (place.photos || []).slice(0, CONFIG.MAX_PHOTOS);
+  // Store ALL photos from API (up to ~10); display first MAX_PHOTOS
+  const allPhotos = (place.photos || [])
+    .sort((a, b) => (b.width || 0) - (a.width || 0))
+    .map(p => ({ name: p.name }));
+
   currentRestaurant = {
     name:         place.displayName?.text || "",
     address:      place.formattedAddress  || "",
     rating:       place.rating,
     totalRatings: place.userRatingCount,
     mapsUrl:      place.googleMapsUri     || "",
-    photos:       photos.map(p => ({ name: p.name })),
+    allPhotos,
+    photos: allPhotos.slice(0, CONFIG.MAX_PHOTOS), // currently shown
   };
 
   $("restaurantName").textContent    = currentRestaurant.name;
@@ -183,20 +193,70 @@ function renderResults(place) {
   link.href = currentRestaurant.mapsUrl || "#";
   link.style.display = currentRestaurant.mapsUrl ? "inline" : "none";
 
-  // Photo grid
-  const grid = $("photoGrid");
+  renderPhotoGrid();
+  $("results").classList.remove("hidden");
+}
+
+function renderPhotoGrid() {
+  const grid   = $("photoGrid");
+  const photos = currentRestaurant.photos;
   grid.innerHTML = "";
+
   photos.forEach((photo, i) => {
     const div = document.createElement("div");
     div.className = "photo-item";
-    div.innerHTML = `<div class="loading-thumb">Loading…</div>`;
+    div.dataset.slot = i;
     grid.appendChild(div);
-    resolvePhotoUri(photo.name, 400)
-      .then(uri => { div.innerHTML = `<img src="${uri}" alt="Photo ${i+1}" /><span class="photo-label">${i+1}</span>`; })
-      .catch(() => { div.innerHTML = `<div class="loading-thumb">Unavailable</div>`; });
-  });
 
-  $("results").classList.remove("hidden");
+    const cached = uriCache.get(`${photo.name}|400`);
+    if (cached) {
+      fillPhotoSlot(div, cached, i);
+    } else {
+      div.innerHTML = `<div class="loading-thumb">Loading…</div>`;
+      resolvePhotoUri(photo.name, 400)
+        .then(uri => fillPhotoSlot(div, uri, i))
+        .catch(() => { div.innerHTML = `<div class="loading-thumb">Unavailable</div>`; });
+    }
+  });
+}
+
+function fillPhotoSlot(div, uri, index) {
+  div.innerHTML = `
+    <img src="${uri}" alt="Photo ${index + 1}" />
+    <span class="photo-label">${index + 1}</span>
+    <button class="dismiss-btn" title="Replace with another photo">✕</button>`;
+  div.querySelector(".dismiss-btn").addEventListener("click", e => {
+    e.stopPropagation();
+    dismissPhoto(index);
+  });
+}
+
+async function dismissPhoto(index) {
+  const { photos, allPhotos } = currentRestaurant;
+  const shownNames = new Set(photos.map(p => p.name));
+  const next = allPhotos.find(p => !shownNames.has(p.name));
+
+  const grid = $("photoGrid");
+  const slot = grid.querySelector(`[data-slot="${index}"]`);
+
+  if (next) {
+    // Replace in-place
+    photos[index] = next;
+    slot.classList.add("replacing");
+    slot.innerHTML = `<div class="loading-thumb">Loading…</div>`;
+    try {
+      const uri = await resolvePhotoUri(next.name, 400);
+      slot.classList.remove("replacing");
+      fillPhotoSlot(slot, uri, index);
+    } catch {
+      slot.classList.remove("replacing");
+      slot.innerHTML = `<div class="loading-thumb">Unavailable</div>`;
+    }
+  } else {
+    // No more replacements — remove slot and re-index
+    photos.splice(index, 1);
+    renderPhotoGrid();
+  }
 }
 
 // Build caption string (used internally — not shown in UI)
@@ -373,23 +433,25 @@ async function exportAndPost() {
     chrome.storage.local.set({ exportLog });
   });
 
-  // 5. Open social platforms with photo pre-loaded
+  // 5. Open social platforms with ALL photos pre-loaded
   const platforms = [...activePlatforms];
   if (platforms.length > 0 && photoUris.length > 0) {
-    setStatus("Preparing photo for social media…");
-    let photoDataUrl;
-    try { photoDataUrl = await photoToDataUrl(photoUris[0]); }
-    catch (e) { console.warn("Photo resize failed:", e); }
+    setStatus(`Resizing ${photoUris.length} photos for social media…`);
+    const photoDataUrls = [];
+    for (const uri of photoUris) {
+      try { photoDataUrls.push(await photoToDataUrl(uri)); }
+      catch (e) { console.warn("Photo resize failed:", e); }
+    }
 
-    if (photoDataUrl) {
+    if (photoDataUrls.length > 0) {
       for (const platform of platforms) {
         setStatus(`Opening ${platform}…`);
-        chrome.runtime.sendMessage({ type: "OPEN_SOCIAL", platform, photoDataUrl, caption, songName });
-        await new Promise(r => setTimeout(r, 800)); // stagger tab opens
+        chrome.runtime.sendMessage({ type: "OPEN_SOCIAL", platform, photoDataUrls, caption, songName });
+        await new Promise(r => setTimeout(r, 900));
       }
-      setStatus(`✅ Opened ${platforms.join(", ")} — photo &amp; caption injected!`, "success");
+      setStatus(`✅ Opened ${platforms.join(", ")} — ${photoDataUrls.length} photos &amp; caption injected!`, "success");
     } else {
-      setStatus("⚠️ Could not prepare photo for social media.", "error");
+      setStatus("⚠️ Could not prepare photos for social media.", "error");
     }
   } else {
     setStatus(`✅ Exported ${photoUris.length} photos → Downloads/${folder}`, "success");
