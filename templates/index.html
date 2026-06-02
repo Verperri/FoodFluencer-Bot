@@ -30,6 +30,7 @@
           autocomplete="off"
         />
         <button id="searchBtn" class="btn btn--primary">Search</button>
+        <button id="randomBtn" class="btn btn--random">🎲 Random</button>
       </div>
       <p class="hint">Results are restricted to Belgium.</p>
     </section>
@@ -67,6 +68,7 @@
 
   <script>
     const searchBtn  = document.getElementById('searchBtn');
+    const randomBtn  = document.getElementById('randomBtn');
     const exportBtn  = document.getElementById('exportBtn');
     const queryInput = document.getElementById('query');
     const resultsEl  = document.getElementById('results');
@@ -87,6 +89,28 @@
       btn.textContent = loading ? '⏳ Working…' : btn.dataset.original;
     }
 
+    function renderResults(data) {
+      currentRestaurant = data;
+      document.getElementById('restaurantName').textContent    = data.name;
+      document.getElementById('restaurantAddress').textContent = data.address;
+      document.getElementById('restaurantMeta').textContent    =
+        data.rating ? `⭐ ${data.rating} · ${data.total_ratings?.toLocaleString() ?? 0} ratings` : '';
+      const mapsLink = document.getElementById('restaurantMapsLink');
+      mapsLink.href = data.maps_url || '#';
+      mapsLink.style.display = data.maps_url ? 'inline' : 'none';
+      photoGrid.innerHTML = '';
+      data.photos.forEach((photo, i) => {
+        const div = document.createElement('div');
+        div.className = 'photo-item';
+        div.innerHTML = `
+          <img src="/photo?ref=${encodeURIComponent(photo.reference)}" alt="Photo ${i+1}" loading="lazy" />
+          <span class="photo-label">Photo ${i+1}</span>
+        `;
+        photoGrid.appendChild(div);
+      });
+      resultsEl.classList.remove('hidden');
+    }
+
     queryInput.addEventListener('keydown', e => {
       if (e.key === 'Enter') searchBtn.click();
     });
@@ -94,11 +118,9 @@
     searchBtn.addEventListener('click', async () => {
       const query = queryInput.value.trim();
       if (!query) return;
-
       setLoading(searchBtn, true);
       resultsEl.classList.add('hidden');
       photoGrid.innerHTML = '';
-
       try {
         const res = await fetch('/search', {
           method: 'POST',
@@ -106,38 +128,29 @@
           body: JSON.stringify({ query }),
         });
         const data = await res.json();
-
-        if (!res.ok) {
-          showToast(data.error || 'Search failed.', 'error');
-          return;
-        }
-
-        currentRestaurant = data;
-
-        document.getElementById('restaurantName').textContent    = data.name;
-        document.getElementById('restaurantAddress').textContent = data.address;
-        document.getElementById('restaurantMeta').textContent    =
-          data.rating ? `⭐ ${data.rating} · ${data.total_ratings?.toLocaleString() ?? 0} ratings` : '';
-        const mapsLink = document.getElementById('restaurantMapsLink');
-        mapsLink.href = data.maps_url || '#';
-        mapsLink.style.display = data.maps_url ? 'inline' : 'none';
-
-        // Render photo previews (via proxy endpoint)
-        data.photos.forEach((photo, i) => {
-          const div = document.createElement('div');
-          div.className = 'photo-item';
-          div.innerHTML = `
-            <img src="/photo?ref=${encodeURIComponent(photo.reference)}" alt="Photo ${i+1}" loading="lazy" />
-            <span class="photo-label">Photo ${i+1}</span>
-          `;
-          photoGrid.appendChild(div);
-        });
-
-        resultsEl.classList.remove('hidden');
+        if (!res.ok) { showToast(data.error || 'Search failed.', 'error'); return; }
+        renderResults(data);
       } catch (err) {
         showToast('Network error — is the server running?', 'error');
       } finally {
         setLoading(searchBtn, false);
+      }
+    });
+
+    randomBtn.addEventListener('click', async () => {
+      setLoading(randomBtn, true);
+      resultsEl.classList.add('hidden');
+      photoGrid.innerHTML = '';
+      try {
+        const res = await fetch('/random', { method: 'POST' });
+        const data = await res.json();
+        if (!res.ok) { showToast(data.error || 'Random pick failed.', 'error'); return; }
+        queryInput.value = data.name;
+        renderResults(data);
+      } catch (err) {
+        showToast('Network error — is the server running?', 'error');
+      } finally {
+        setLoading(randomBtn, false);
       }
     });
 

@@ -119,6 +119,16 @@ header h1 {
 }
 .btn--primary:not(:disabled):hover { background: var(--accent2); }
 
+.btn--random {
+  background: var(--surface2);
+  border: 1px solid var(--border);
+  color: var(--text);
+}
+.btn--random:not(:disabled):hover {
+  border-color: #a855f7;
+  color: #c084fc;
+}
+
 .btn--export {
   background: var(--surface2);
   border: 1px solid var(--border);

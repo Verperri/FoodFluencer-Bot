@@ -1,5 +1,6 @@
 import os
 import csv
+import random
 import requests
 import logging
 from datetime import datetime
@@ -12,6 +13,39 @@ load_dotenv()
 app = Flask(__name__)
 
 GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY", "")
+
+BELGIAN_RESTAURANTS = [
+    "Comme Chez Soi Brussels",
+    "In De Wulf Dranouter",
+    "The Jane Antwerp",
+    "Hof van Cleve Kruishoutem",
+    "Bon Bon Brussels",
+    "Numerus Clausus Namur",
+    "Zilte Antwerp",
+    "De Librije Bruges",
+    "La Paix Brussels",
+    "Bozar Restaurant Brussels",
+    "De Karmeliet Bruges",
+    "Bistro du Canal Brussels",
+    "Humphrey Brussels",
+    "Noma Ghent",
+    "Vrijmoed Ghent",
+    "OAK Ghent",
+    "Le Pigeon Noir Ghent",
+    "Gruut Stadsbrouwerij Ghent",
+    "Balls & Glory Ghent",
+    "Braserie Appelmans Antwerp",
+    "Fiskebar Antwerp",
+    "Dôme Antwerp",
+    "Lunch Garden Belgium",
+    "De Troubadour Bruges",
+    "Den Dyver Bruges",
+    "Le Chalet de la Foret Brussels",
+    "La Villa Lorraine Brussels",
+    "Le Tournant Liège",
+    "Tanneurs Liège",
+    "La Menuiserie Ghent",
+]
 EXPORTS_DIR = Path("exports")
 LOGS_DIR = Path("logs")
 LOG_FILE = LOGS_DIR / "export_log.csv"
@@ -204,6 +238,43 @@ def export():
         "folder": str(export_path),
         "photos_saved": len(downloaded),
         "files": downloaded,
+    })
+
+
+@app.route("/random", methods=["POST"])
+def random_restaurant():
+    """Pick a random Belgian restaurant and return its details + photos."""
+    if not GOOGLE_API_KEY:
+        return jsonify({"error": "Google API key not configured."}), 400
+
+    pick = random.choice(BELGIAN_RESTAURANTS)
+    logger.info("Random pick: %s", pick)
+
+    place = search_restaurant(pick)
+    if not place:
+        return jsonify({"error": f"Could not find '{pick}' — try again."}), 404
+
+    details = get_place_details(place["place_id"])
+    photos = details.get("photos", [])
+    photos_sorted = sorted(photos, key=lambda p: p.get("width", 0), reverse=True)[:5]
+
+    return jsonify({
+        "place_id": place["place_id"],
+        "name": details.get("name", place.get("name")),
+        "address": details.get("formatted_address", ""),
+        "rating": details.get("rating"),
+        "total_ratings": details.get("user_ratings_total"),
+        "maps_url": details.get("url", ""),
+        "photo_count": len(photos_sorted),
+        "photos": [
+            {
+                "reference": p["photo_reference"],
+                "width": p.get("width"),
+                "height": p.get("height"),
+                "attributions": p.get("html_attributions", []),
+            }
+            for p in photos_sorted
+        ],
     })
 
 
