@@ -31,7 +31,7 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
 // ── Social post handler ───────────────────────────────────────────────────────
 
 const PLATFORM_URLS = {
-  instagram: "https://www.instagram.com/create/select/",
+  instagram: "https://www.instagram.com/",
   facebook:  "https://www.facebook.com/",
   tiktok:    "https://www.tiktok.com/upload",
 };
@@ -246,13 +246,10 @@ function injectFacebook(photoDataUrls, caption, songName) {
 }
 
 // ─── Instagram ────────────────────────────────────────────────────────────────
-// Navigate directly to /create/select/ — this opens the upload dialog immediately,
-// bypassing the Create → Post sub-menu entirely.
 
 function injectInstagram(photoDataUrls, caption, songName, location) {
   const sleep = ms => new Promise(r => setTimeout(r, ms));
 
-  // Poll for any selector, returns the element or null after timeout
   const waitFor = (sel, ms = 12000) => new Promise(res => {
     const el = document.querySelector(sel); if (el) return res(el);
     const t = Date.now(); const iv = setInterval(() => {
@@ -262,7 +259,7 @@ function injectInstagram(photoDataUrls, caption, songName, location) {
     }, 300);
   });
 
-  // Poll for a button/link whose VISIBLE text or aria-label matches
+  // Wait for an interactive element whose innerText / aria-label matches
   const waitForBtn = (match, ms = 12000) => new Promise(res => {
     const find = () => [...document.querySelectorAll(
       '[role="button"], button, a, [tabindex="0"]'
@@ -297,100 +294,208 @@ function injectInstagram(photoDataUrls, caption, songName, location) {
     zone.dispatchEvent(new DragEvent('drop', { bubbles: true, cancelable: true, dataTransfer: dt }));
   }
 
-  function step(n, total, html, type = 'info') {
-    document.getElementById('ffbot-banner')?.remove();
-    const b = document.createElement('div'); b.id = 'ffbot-banner';
+  // ── Banner with inline debug log ─────────────────────────────────────────────
+  // The banner always stays visible; a small log area below the main message
+  // shows the last few actions so you can see exactly what the bot did.
+
+  function ensureBanner(n, total, html, type = 'info') {
+    let b = document.getElementById('ffbot-banner');
+    if (!b) {
+      b = document.createElement('div'); b.id = 'ffbot-banner';
+      const bg = { info: '#e8490f', success: '#16a34a', warn: '#d97706' }[type] || '#e8490f';
+      b.style.cssText = `position:fixed;top:0;left:0;right:0;z-index:2147483647;
+        background:${bg};color:#fff;font-family:-apple-system,sans-serif;
+        font-size:13px;font-weight:500;padding:10px 16px;
+        box-shadow:0 3px 14px rgba(0,0,0,.28);`;
+      b.innerHTML = `
+        <div style="display:flex;align-items:center;gap:8px;margin-bottom:4px">
+          <strong>🍽️ FoodFluencer</strong>
+          <span id="ffbot-step" style="background:rgba(255,255,255,.22);border-radius:20px;
+            padding:1px 8px;font-size:.72rem"></span>
+          <span id="ffbot-msg" style="font-weight:400;flex:1"></span>
+          <button onclick="document.getElementById('ffbot-banner').remove()"
+            style="background:rgba(255,255,255,.22);border:none;color:#fff;
+            border-radius:5px;padding:3px 9px;cursor:pointer;flex-shrink:0">✕</button>
+        </div>
+        <div id="ffbot-log" style="font-size:.7rem;opacity:.8;line-height:1.5;
+          max-height:60px;overflow:hidden"></div>`;
+      document.body.prepend(b);
+    }
     const bg = { info: '#e8490f', success: '#16a34a', warn: '#d97706' }[type] || '#e8490f';
-    b.style.cssText = `position:fixed;top:0;left:0;right:0;z-index:2147483647;
-      background:${bg};color:#fff;font-family:-apple-system,sans-serif;font-size:13px;
-      font-weight:500;padding:10px 16px;display:flex;align-items:center;gap:10px;
-      box-shadow:0 3px 14px rgba(0,0,0,.28);`;
-    b.innerHTML = `
-      <strong style="white-space:nowrap">🍽️ FoodFluencer</strong>
-      <span style="background:rgba(255,255,255,.22);border-radius:20px;padding:1px 8px;
-        font-size:.75rem;white-space:nowrap">${n}/${total}</span>
-      <span style="font-weight:400;flex:1">${html}</span>
-      <button onclick="document.getElementById('ffbot-banner').remove()"
-        style="background:rgba(255,255,255,.22);border:none;color:#fff;border-radius:5px;
-        padding:3px 9px;cursor:pointer;white-space:nowrap;flex-shrink:0">✕ Close</button>`;
-    document.body.prepend(b);
+    b.style.background = bg;
+    document.getElementById('ffbot-step').textContent = `${n}/${total}`;
+    document.getElementById('ffbot-msg').innerHTML = html;
+  }
+
+  function dbg(msg) {
+    ensureBanner.__last_n = ensureBanner.__last_n || 1;
+    ensureBanner.__last_total = ensureBanner.__last_total || 5;
+    const logEl = document.getElementById('ffbot-log');
+    if (!logEl) return;
+    const ts = new Date().toTimeString().slice(0, 8);
+    const row = document.createElement('div');
+    row.innerHTML = `<span style="opacity:.6">${ts}</span> ${msg}`;
+    logEl.prepend(row);
+    // Keep last 4 entries
+    while (logEl.children.length > 4) logEl.lastChild.remove();
+    console.log(`[FoodFluencer] ${msg}`); // also log to DevTools console
+  }
+
+  function step(n, total, html, type = 'info') {
+    ensureBanner.__last_n = n;
+    ensureBanner.__last_total = total;
+    ensureBanner(n, total, html, type);
+    dbg(`Step ${n}/${total}: ${html.replace(/<[^>]+>/g, '')}`);
   }
 
   (async () => {
-    // Steps: upload(1) crop-Next(2) edit-Next(3) caption(4) location(5) [+1 if song]
     const total = location ? (songName ? 6 : 5) : (songName ? 5 : 4);
+    step(1, total, 'Loading Instagram…');
+    await sleep(3000); // wait for full SPA hydration
 
-    // ①  Wait for the upload dialog that /create/select/ opens directly
-    step(1, total, 'Waiting for upload dialog…');
-    await sleep(2000); // let the SPA render
+    // ══ STEP 1a: Find and click the Create "+" button ══════════════════════════
+    step(1, total, 'Looking for Create (+) button…');
 
+    function findCreateBtn() {
+      // Check explicit aria-labels first
+      for (const sel of ['[aria-label="New post"]', '[aria-label="Create"]']) {
+        const el = document.querySelector(sel);
+        if (el) { dbg(`Found create btn via aria-label: ${sel}`); return el.closest('a,[role="button"],button') || el; }
+      }
+      // SVG with aria-label
+      const svg = [...document.querySelectorAll('svg[aria-label]')]
+        .find(s => /new post|create/i.test(s.getAttribute('aria-label')));
+      if (svg) { dbg(`Found create btn via SVG: ${svg.getAttribute('aria-label')}`); return svg.closest('a,[role="button"],button') || svg; }
+      // Nav anchor/button with text "Create"
+      const byText = [...document.querySelectorAll('a,[role="button"],button')]
+        .find(el => /^create$/i.test((el.innerText || '').trim()));
+      if (byText) { dbg('Found create btn by text "Create"'); return byText; }
+      dbg('Create button not found yet…');
+      return null;
+    }
+
+    let createBtn = null;
+    for (let i = 0; i < 8 && !createBtn; i++) {
+      createBtn = findCreateBtn();
+      if (!createBtn) await sleep(1000);
+    }
+
+    if (!createBtn) {
+      step(1, total, 'Could not find the <strong>+</strong> Create button. Please click it manually.', 'warn');
+      dbg('FAILED: create button not found after 8s');
+    } else {
+      dbg(`Clicking create button: ${createBtn.tagName} aria="${createBtn.getAttribute('aria-label')}"`);
+      createBtn.click();
+    }
+
+    // ══ STEP 1b: Snapshot pre-existing "Post" elements, then find the NEW one ═══
+    // Snapshot BEFORE the panel animates in
+    const prePostEls = new Set(
+      [...document.querySelectorAll('*')]
+        .filter(el => (el.innerText || el.textContent || '').trim() === 'Post')
+    );
+    dbg(`Snapshot: ${prePostEls.size} existing elements with text "Post"`);
+
+    step(1, total, 'Waiting for Post/Story/Reel menu to appear…');
+    await sleep(1200);
+
+    async function findAndClickPostOption() {
+      // Find elements with text "Post" that did NOT exist before we clicked Create
+      const newPostEls = [...document.querySelectorAll('*')]
+        .filter(el => (el.innerText || el.textContent || '').trim() === 'Post' && !prePostEls.has(el));
+
+      dbg(`Found ${newPostEls.length} new "Post" element(s) after clicking Create`);
+
+      if (newPostEls.length > 0) {
+        // Pick the first one and find its clickable ancestor
+        const target = newPostEls[0].closest('a,[role="button"],button,[tabindex]') || newPostEls[0];
+        dbg(`Clicking: ${target.tagName} class="${target.className.toString().slice(0,40)}"`);
+        target.click();
+        return true;
+      }
+      return false;
+    }
+
+    let postClicked = false;
+    for (let i = 0; i < 10 && !postClicked; i++) {
+      postClicked = await findAndClickPostOption();
+      if (!postClicked) { dbg(`Retry ${i + 1}/10 — post option not visible yet`); await sleep(600); }
+    }
+
+    if (!postClicked) {
+      step(1, total, 'Please click <strong>Post</strong> from the menu — bot will continue when the upload dialog appears.', 'warn');
+      dbg('FAILED: Post option not found — waiting for dialog manually');
+    } else {
+      step(1, total, '"Post" clicked — waiting for upload dialog…');
+    }
+
+    // Wait for the upload dialog to appear (has a file input or drag-drop area)
+    await waitFor('[role="dialog"]', 12000);
+    await sleep(1000);
+    dbg('Upload dialog appeared');
+
+    // ══ STEP 2: Inject photos ═════════════════════════════════════════════════
     const files = photoDataUrls.map((url, i) => dataUrlToFile(url, `restaurant-${i + 1}.jpg`));
+    step(2, total, `Uploading ${files.length} photo${files.length > 1 ? 's' : ''}…`);
 
-    // Find the file input with up to 10 retries, clicking "Select from computer" each time
     let fileInput = null;
     for (let attempt = 0; attempt < 10 && !fileInput; attempt++) {
       fileInput = document.querySelector('input[type="file"]');
-      if (fileInput) break;
+      if (fileInput) { dbg(`File input found on attempt ${attempt + 1}`); break; }
       const selBtn = [...document.querySelectorAll('[role="button"], button')]
-        .find(el => /select.*computer|from.*computer|select.*files/i.test(
-          el.innerText || el.textContent || ''));
-      if (selBtn) selBtn.click();
-      await sleep(800);
+        .find(el => /select.*computer|from.*computer/i.test(el.innerText || el.textContent || ''));
+      if (selBtn) { selBtn.click(); dbg('Clicked "Select from computer"'); }
+      await sleep(700);
     }
 
-    if (!fileInput) {
-      // Fallback: drag-and-drop on the dialog body
-      const dropZone = document.querySelector('[role="dialog"], [class*="drag" i]');
-      if (dropZone) {
-        step(1, total, 'Dragging photos into upload area…');
-        dropFilesOn(dropZone, files);
-        await sleep(4000);
-      } else {
-        step(1, total,
-          'Upload dialog not found. Click <strong>Select from computer</strong> and choose your photos, then the bot will continue.',
-          'warn');
-        // Wait up to 15s for the user to do it manually → then look for Next
-        await waitFor('[role="button"][aria-label="Next"], button', 15000);
-      }
-    } else {
-      step(1, total, `Uploading <strong>${files.length}</strong> photo${files.length > 1 ? 's' : ''}…`);
-      // Inject via native React-compatible setter
+    if (fileInput) {
       const dt = new DataTransfer();
       files.forEach(f => dt.items.add(f));
-      const nativeSetter = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'files')?.set;
-      if (nativeSetter) nativeSetter.call(fileInput, dt.files);
-      else fileInput.files = dt.files;
+      const setter = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'files')?.set;
+      if (setter) setter.call(fileInput, dt.files); else fileInput.files = dt.files;
       fileInput.dispatchEvent(new Event('change', { bubbles: true }));
       fileInput.dispatchEvent(new Event('input',  { bubbles: true }));
+      dbg('Files injected into input');
+    } else {
+      dbg('File input not found — trying drag-and-drop fallback');
+      const zone = document.querySelector('[role="dialog"] *') || document.querySelector('[role="dialog"]');
+      if (zone) dropFilesOn(zone, files);
     }
 
-    // Wait for the crop screen — identified by the "Next" button appearing at the top-right
-    step(1, total, `Photos sent — waiting for Instagram to load the editor…`);
-    const firstNext = await waitForBtn(
-      /^(next|volgende|suivant|weiter|prossimo|siguiente)$/i, 15000
+    // Wait for the crop/arrange screen — the "Next" button signals it's ready
+    step(2, total, 'Waiting for Instagram to process photos…');
+    const nextAfterUpload = await waitForBtn(
+      /^(next|volgende|suivant|weiter|siguiente)$/i, 18000
     );
-    if (!firstNext) {
-      step(1, total,
-        'Editor not loading automatically. Please click the <strong>Next</strong> button when it appears.',
-        'warn');
-      await waitForBtn(/^(next|volgende|suivant)$/i, 20000);
+    if (nextAfterUpload) { dbg('"Next" button appeared — photos loaded in editor'); }
+    else { dbg('WARNING: "Next" button did not appear within 18s'); step(2, total, 'Photos sent. Please wait for the editor to load, then click <strong>Next</strong>.', 'warn'); }
+
+    // ══ STEP 3: Crop → Next ═══════════════════════════════════════════════════
+    step(3, total, 'Advancing past crop step…');
+    const cropNext = await waitForBtn(/^(next|volgende|suivant|weiter|siguiente)$/i, 8000);
+    if (cropNext) {
+      dbg(`Clicking crop Next: "${cropNext.innerText || cropNext.textContent}"`);
+      cropNext.click(); await sleep(2500);
+    } else {
+      dbg('Crop Next button not found — waiting for manual click');
+      step(3, total, 'Please click <strong>Next</strong> to advance past the crop step.', 'warn');
+      await sleep(6000);
     }
 
-    // ②  Click "Next" → past Crop/Arrange step
-    step(2, total, 'Advancing past the crop step…');
-    const cropBtn = await waitForBtn(/^(next|volgende|suivant|weiter|prossimo|siguiente)$/i, 5000);
-    if (cropBtn) { cropBtn.click(); await sleep(2500); }
-    else { step(2, total, 'Please click <strong>Next</strong> to continue.', 'warn'); await sleep(5000); }
+    // ══ STEP 4: Edit/Filters → Next ═══════════════════════════════════════════
+    step(4, total, 'Advancing past edit step…');
+    const editNext = await waitForBtn(/^(next|volgende|suivant|weiter|siguiente)$/i, 8000);
+    if (editNext) {
+      dbg(`Clicking edit Next: "${editNext.innerText || editNext.textContent}"`);
+      editNext.click(); await sleep(2500);
+    } else {
+      dbg('Edit Next button not found — waiting for manual click');
+      step(4, total, 'Please click <strong>Next</strong> to advance past the edit step.', 'warn');
+      await sleep(6000);
+    }
 
-    // ③  Click "Next" → past Filters/Edit step
-    step(3, total, 'Advancing past the edit step…');
-    const editBtn = await waitForBtn(/^(next|volgende|suivant|weiter|prossimo|siguiente)$/i, 8000);
-    if (editBtn) { editBtn.click(); await sleep(2500); }
-    else { step(3, total, 'Please click <strong>Next</strong> to continue.', 'warn'); await sleep(5000); }
-
-    // ④  Fill caption — now on the Details / final screen (Share button visible)
-    step(4, total, 'Filling caption…');
-
+    // ══ STEP 5: Fill caption ══════════════════════════════════════════════════
+    step(5, total, 'Filling caption…');
     const captionSels = [
       'textarea[aria-label="Write a caption..."]',
       'div[aria-label="Write a caption..."]',
@@ -401,67 +506,60 @@ function injectInstagram(photoDataUrls, caption, songName, location) {
     ];
     let captionEl = null;
     for (let att = 0; att < 10 && !captionEl; att++) {
-      for (const s of captionSels) { captionEl = document.querySelector(s); if (captionEl) break; }
+      for (const s of captionSels) { captionEl = document.querySelector(s); if (captionEl) { dbg(`Caption found: ${s}`); break; } }
       if (!captionEl) await sleep(600);
     }
     if (captionEl) {
       captionEl.scrollIntoView({ behavior: 'smooth', block: 'center' });
       captionEl.click(); await sleep(400);
       if (captionEl.tagName === 'TEXTAREA') {
-        const setter = Object.getOwnPropertyDescriptor(HTMLTextAreaElement.prototype, 'value')?.set;
-        if (setter) setter.call(captionEl, caption); else captionEl.value = caption;
+        const s = Object.getOwnPropertyDescriptor(HTMLTextAreaElement.prototype, 'value')?.set;
+        if (s) s.call(captionEl, caption); else captionEl.value = caption;
         captionEl.dispatchEvent(new Event('input', { bubbles: true }));
       } else {
         captionEl.focus(); await sleep(200);
         document.execCommand('selectAll', false, null);
         document.execCommand('insertText', false, caption);
       }
-    }
+      dbg('Caption filled');
+    } else { dbg('WARNING: caption field not found'); }
 
-    // ⑤  Add location (type city name into Instagram's location search)
+    // ══ STEP 6 (if location): Add location ════════════════════════════════════
     if (location) {
       await sleep(600);
-      step(5, total, 'Adding location…');
-
-      // Extract city from "Street, NNNN City, Belgium" format
+      step(6, total, 'Adding location…');
       const cityMatch = location.match(/\d{4}\s+([A-Za-zÀ-ÿ\s-]+),\s*Belgium/i);
       const searchTerm = (cityMatch?.[1] || location.split(',')[0] || location).trim();
+      dbg(`Location search term: "${searchTerm}"`);
 
-      // Find "Add location" trigger (button or input placeholder)
-      let locTrigger = document.querySelector('[aria-label="Add location"], [placeholder*="location" i]');
+      let locTrigger = document.querySelector('[aria-label="Add location"],[placeholder*="location" i]');
       if (!locTrigger) {
-        locTrigger = [...document.querySelectorAll('[role="button"], button, a, input')]
-          .find(el => /add.*(a\s+)?location|location/i.test(
-            el.getAttribute('aria-label') || el.getAttribute('placeholder') ||
-            el.innerText || el.textContent || ''));
+        locTrigger = [...document.querySelectorAll('[role="button"],button,a,input')]
+          .find(el => /add.*(a\s+)?location/i.test(
+            el.getAttribute('aria-label') || el.getAttribute('placeholder') || el.innerText || el.textContent || ''));
       }
       if (locTrigger) {
+        dbg(`Location trigger found: ${locTrigger.tagName}`);
         locTrigger.click(); await sleep(700);
-        // Type into location search
-        const locInput = await waitFor(
-          'input[placeholder*="Search" i], input[aria-label*="location" i]', 4000
-        );
+        const locInput = await waitFor('input[placeholder*="Search" i],input[aria-label*="location" i]', 4000);
         if (locInput) {
           locInput.focus(); await sleep(200);
-          for (const ch of searchTerm) {
-            document.execCommand('insertText', false, ch);
-            await sleep(55);
-          }
+          for (const ch of searchTerm) { document.execCommand('insertText', false, ch); await sleep(55); }
+          dbg(`Typed "${searchTerm}" in location field`);
           await sleep(2000);
-          const firstResult = document.querySelector(
-            '[role="option"]:first-child, [role="listitem"]:first-child'
-          );
-          if (firstResult) { firstResult.click(); await sleep(500); }
+          const firstResult = document.querySelector('[role="option"]:first-child,[role="listitem"]:first-child');
+          if (firstResult) { firstResult.click(); dbg('Selected first location result'); await sleep(500); }
+          else dbg('No location results appeared');
         }
-      }
+      } else { dbg('Location trigger not found'); }
     }
 
-    // ⑥/final  Banner: stop here, let user review & click Share
-    const songHint = songName
-      ? ` &nbsp;🎵 Tap <strong>Add music</strong> to add "<em>${songName}</em>".` : '';
+    // ══ Final: stop here, user clicks Share ══════════════════════════════════
+    const songHint = songName ? ` &nbsp;🎵 Tap <strong>Add music</strong> → <em>"${songName}"</em>.` : '';
     step(total, total,
-      `✅ Almost there! Review photos &amp; caption${location ? ' &amp; location' : ''}.${songHint} Click <strong>Share</strong> when ready.`,
+      `✅ All ready! Review your post${location ? ', location' : ''}.${songHint} Click <strong>Share</strong> to publish.`,
       'success');
+    dbg('Bot stopped — waiting for user to click Share');
   })();
 }
 
