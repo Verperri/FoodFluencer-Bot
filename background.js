@@ -462,40 +462,103 @@ function injectInstagram(photoDataUrls, caption, songName, location) {
       if (zone) dropFilesOn(zone, files);
     }
 
-    // Wait for the crop/arrange screen — the "Next" button signals it's ready
+    // Wait for the crop/arrange screen — editor ready when "Next" appears in the dialog
     step(2, total, 'Waiting for Instagram to process photos…');
-    const nextAfterUpload = await waitForBtn(
-      /^(next|volgende|suivant|weiter|siguiente)$/i, 18000
-    );
-    if (nextAfterUpload) { dbg('"Next" button appeared — photos loaded in editor'); }
-    else { dbg('WARNING: "Next" button did not appear within 18s'); step(2, total, 'Photos sent. Please wait for the editor to load, then click <strong>Next</strong>.', 'warn'); }
 
-    // ══ STEP 3: Crop → Next ═══════════════════════════════════════════════════
-    step(3, total, 'Advancing past crop step…');
-    const cropNext = await waitForBtn(/^(next|volgende|suivant|weiter|siguiente)$/i, 8000);
-    if (cropNext) {
-      dbg(`Clicking crop Next: "${cropNext.innerText || cropNext.textContent}"`);
-      cropNext.click(); await sleep(2500);
-    } else {
-      dbg('Crop Next button not found — waiting for manual click');
-      step(3, total, 'Please click <strong>Next</strong> to advance past the crop step.', 'warn');
-      await sleep(6000);
+    // ── Helper: find & click "Next" INSIDE the modal only ─────────────────────
+    // Searches [role="dialog"] first, falls back to full document.
+    // Dispatches the full mousedown→mouseup→click sequence React needs.
+    // Returns the button text if clicked, null if not found within timeout.
+    async function clickNextInDialog(ms = 15000) {
+      const NEXT_RE = /^(next|volgende|suivant|weiter|siguiente|næste|neste|seuraava)$/i;
+
+      function findNextBtn() {
+        // Prefer buttons inside the modal dialog
+        const roots = [
+          document.querySelector('[role="dialog"]'),
+          document.body,
+        ].filter(Boolean);
+
+        for (const root of roots) {
+          const btn = [...root.querySelectorAll(
+            '[role="button"], button, [tabindex="0"], a'
+          )].find(el => {
+            const txt = (el.innerText || el.textContent || '').trim();
+            const lbl = el.getAttribute('aria-label') || '';
+            return NEXT_RE.test(txt) || NEXT_RE.test(lbl);
+          });
+          if (btn) return btn;
+        }
+        return null;
+      }
+
+      // Wait for the button to appear
+      const start = Date.now();
+      let btn = null;
+      while (Date.now() - start < ms) {
+        btn = findNextBtn();
+        if (btn) break;
+        await sleep(400);
+      }
+      if (!btn) { dbg(`"Next" button not found after ${ms}ms`); return null; }
+
+      const btnText = (btn.innerText || btn.textContent || '').trim();
+      dbg(`Found Next button: <${btn.tagName}> text="${btnText}" role="${btn.getAttribute('role')}" aria="${btn.getAttribute('aria-label')}"`);
+
+      // Small pause — ensure button is interactive before firing events
+      await sleep(400);
+
+      // Dispatch full mouse interaction sequence (required for React synthetic events)
+      btn.focus();
+      ['mouseenter', 'mouseover', 'mousedown', 'mouseup', 'click'].forEach(type => {
+        btn.dispatchEvent(new MouseEvent(type, {
+          bubbles: true, cancelable: true, view: window,
+          buttons: 1, detail: type === 'click' ? 1 : 0,
+        }));
+      });
+
+      // Verify the click registered: the same "Next" button should disappear
+      // (Instagram will remove or replace it as the modal advances)
+      await sleep(600);
+      const stillThere = document.contains(btn) &&
+        NEXT_RE.test((btn.innerText || btn.textContent || '').trim());
+      if (stillThere) {
+        dbg('Button still present after click — trying once more with pointer events');
+        btn.dispatchEvent(new PointerEvent('pointerdown', { bubbles: true, cancelable: true, pointerId: 1 }));
+        btn.dispatchEvent(new PointerEvent('pointerup',   { bubbles: true, cancelable: true, pointerId: 1 }));
+        btn.click();
+        await sleep(600);
+      }
+
+      return btnText;
     }
 
-    // ══ STEP 4: Edit/Filters → Next ═══════════════════════════════════════════
-    step(4, total, 'Advancing past edit step…');
-    const editNext = await waitForBtn(/^(next|volgende|suivant|weiter|siguiente)$/i, 8000);
-    if (editNext) {
-      dbg(`Clicking edit Next: "${editNext.innerText || editNext.textContent}"`);
-      editNext.click(); await sleep(2500);
+    // Wait for the editor "Next" to confirm photos are loaded
+    const editorReady = await clickNextInDialog(20000); // this is the crop-screen Next
+    if (editorReady) {
+      dbg(`Editor ready — clicked first "Next" (crop step): "${editorReady}"`);
+      step(2, total, `Photos loaded ✓ — advancing past crop step…`);
+      await sleep(2500);
     } else {
-      dbg('Edit Next button not found — waiting for manual click');
-      step(4, total, 'Please click <strong>Next</strong> to advance past the edit step.', 'warn');
-      await sleep(6000);
+      step(2, total, 'Photos sent — please click <strong>Next</strong> at the top-right of the popup to continue.', 'warn');
+      dbg('Manual: waiting 10s for user to click crop Next');
+      await sleep(10000);
     }
 
-    // ══ STEP 5: Fill caption ══════════════════════════════════════════════════
-    step(5, total, 'Filling caption…');
+    // ══ STEP 3: Filters/Edit → Next ═══════════════════════════════════════════
+    step(3, total, 'Advancing past edit/filter step…');
+    const editClicked = await clickNextInDialog(12000);
+    if (editClicked) {
+      dbg(`Clicked edit Next: "${editClicked}"`);
+      await sleep(2500);
+    } else {
+      step(3, total, 'Please click <strong>Next</strong> at the top-right of the popup to continue.', 'warn');
+      dbg('Manual: waiting 10s for user to click edit Next');
+      await sleep(10000);
+    }
+
+    // ══ STEP 4: Fill caption — now on Details screen (Share button visible) ════
+    step(4, total, 'Filling caption…');
     const captionSels = [
       'textarea[aria-label="Write a caption..."]',
       'div[aria-label="Write a caption..."]',
@@ -524,10 +587,10 @@ function injectInstagram(photoDataUrls, caption, songName, location) {
       dbg('Caption filled');
     } else { dbg('WARNING: caption field not found'); }
 
-    // ══ STEP 6 (if location): Add location ════════════════════════════════════
+    // ══ STEP 5 (if location): Add location ════════════════════════════════════
     if (location) {
       await sleep(600);
-      step(6, total, 'Adding location…');
+      step(5, total, 'Adding location…');
       const cityMatch = location.match(/\d{4}\s+([A-Za-zÀ-ÿ\s-]+),\s*Belgium/i);
       const searchTerm = (cityMatch?.[1] || location.split(',')[0] || location).trim();
       dbg(`Location search term: "${searchTerm}"`);
