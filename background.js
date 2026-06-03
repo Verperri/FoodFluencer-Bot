@@ -870,59 +870,70 @@ function injectTikTok(photoDataUrls, caption, songName, location, opts) {
     input.dispatchEvent(new Event('input',  { bubbles: true }));
   }
 
-  // ── Check if TikTok accepted the upload (video appears / no "minute" error) ─
-  async function uploadAccepted(waitMs = 7000) {
+  // ── Check if TikTok accepted OR rejected the upload ───────────────────────
+  // Returns: 'accepted' | 'rejected:<reason>' | 'timeout'
+  async function checkUpload(waitMs = 9000) {
+    // Patterns that mean TikTok rejected the file
+    const ERROR_RE = /over.*\d+.?min|minute.*limit|\d+.?min.*limit|size.*too.*big|too.*large|file.*too|maximum.*size|not.*support|unsupport|invalid.*file|file.*invalid|upload.*fail|fail.*upload/i;
+
     const start = Date.now();
     while (Date.now() - start < waitMs) {
-      await sleep(600);
-      const pageText = (document.body.innerText || '').toLowerCase();
-      if (/over.*\d+.?min|minute.*limit|\d+.?min.*limit/i.test(pageText)) {
-        dbg('TikTok rejected: duration error in page text');
-        return false;
+      await sleep(700);
+      const pageText = document.body.innerText || '';
+
+      const errMatch = pageText.match(ERROR_RE);
+      if (errMatch) {
+        dbg(`TikTok rejected: "${errMatch[0]}"`);
+        return `rejected:${errMatch[0]}`;
       }
-      // Success: video player appeared or editor loaded
-      if (document.querySelector('video[src], video[blob], [class*="DraftEditor"], [class*="caption" i] textarea, div[contenteditable]')) {
-        dbg('Upload accepted: editor elements visible');
-        return true;
+
+      // Success signals: video playback ready, or caption/description area visible
+      if (document.querySelector('video') ||
+          document.querySelector('[class*="caption" i] div[contenteditable]') ||
+          document.querySelector('[data-placeholder*="caption" i]') ||
+          document.querySelector('[class*="DraftEditor"]')) {
+        dbg('Upload accepted: editor/video visible');
+        return 'accepted';
       }
     }
-    // If no explicit error after waitMs, assume it might have worked (or is processing)
-    const pageText = (document.body.innerText || '').toLowerCase();
-    return !/over.*\d+.?min|minute.*limit/i.test(pageText);
+    // After timeout — do one final error check
+    const finalText = document.body.innerText || '';
+    if (ERROR_RE.test(finalText)) return `rejected:timeout`;
+    // No error found = probably still processing or accepted
+    return 'timeout';
   }
 
   // ═══════════════════════════════════════════════════════════════════════════
-  // APPROACH 1 — WebM via MediaRecorder + aggressive WebM duration patch
+  // APPROACH 1 — WebM VP9 via MediaRecorder, low-res/low-bitrate for small size
   // ═══════════════════════════════════════════════════════════════════════════
   async function approach1(imgs, secPerSlide) {
-    dbg('Approach 1: WebM MediaRecorder…');
-    const W = 1080, H = 1080, fps = 25;
+    // 480×480 square, 10fps, 400Kbps → 5×1.2s = 6s → ~300KB max
+    const W = 480, H = 480, fps = 10, kbps = 400_000;
+    dbg(`Approach 1: WebM ${W}×${H} ${fps}fps ${kbps/1000}kbps…`);
     const canvas = document.createElement('canvas');
     canvas.width = W; canvas.height = H;
     const ctx = canvas.getContext('2d');
 
-    const mimeType = ['video/webm;codecs=vp8', 'video/webm'].find(t => MediaRecorder.isTypeSupported(t)) || 'video/webm';
+    const mimeType = ['video/webm;codecs=vp9', 'video/webm;codecs=vp8', 'video/webm']
+      .find(t => MediaRecorder.isTypeSupported(t)) || 'video/webm';
     dbg(`Codec: ${mimeType}`);
 
     const stream = canvas.captureStream(fps);
-    const recorder = new MediaRecorder(stream, { mimeType, videoBitsPerSecond: 2_000_000 });
+    const recorder = new MediaRecorder(stream, { mimeType, videoBitsPerSecond: kbps });
     const chunks = [];
     recorder.ondataavailable = e => { if (e.data.size > 0) chunks.push(e.data); };
-    recorder.start(50);
+    recorder.start(100);
 
     for (let i = 0; i < imgs.length; i++) {
       drawFrame(ctx, imgs[i], W, H);
-      dbg(`Slide ${i+1}/${imgs.length}`);
       await sleep(secPerSlide * 1000);
     }
     recorder.stop();
 
     const rawBlob = await new Promise(res => { recorder.onstop = () => res(new Blob(chunks, { type: 'video/webm' })); });
-    dbg(`Raw WebM: ${(rawBlob.size/1024).toFixed(0)}KB — patching duration…`);
-
-    // Patch duration in WebM binary
     const totalMs = imgs.length * secPerSlide * 1000;
     const fixed = await patchWebMDuration(rawBlob, totalMs);
+    dbg(`WebM ready: ${(fixed.size/1024).toFixed(0)}KB`);
     return new File([fixed], 'slideshow.webm', { type: 'video/webm' });
   }
 
@@ -949,13 +960,14 @@ function injectTikTok(photoDataUrls, caption, songName, location, opts) {
   }
 
   // ═══════════════════════════════════════════════════════════════════════════
-  // APPROACH 2 — Real H.264 MP4 via WebCodecs API
+  // APPROACH 2 — H.264 MP4 via WebCodecs, small dimensions for safe upload
   // ═══════════════════════════════════════════════════════════════════════════
   async function approach2(imgs, secPerSlide) {
     if (!window.VideoEncoder) throw new Error('WebCodecs VideoEncoder not available');
-    dbg('Approach 2: H.264 MP4 via WebCodecs…');
+    // 480×480, 10fps, 500Kbps → ~375KB for 6s
+    const W = 480, H = 480, fps = 10, kbps = 500_000;
+    dbg(`Approach 2: H.264 MP4 ${W}×${H} ${fps}fps via WebCodecs…`);
 
-    const W = 1080, H = 1080, fps = 25;
     const framesPerSlide = Math.ceil(secPerSlide * fps);
     const totalFrames    = imgs.length * framesPerSlide;
 
@@ -977,9 +989,9 @@ function injectTikTok(photoDataUrls, caption, songName, location, opts) {
     });
 
     encoder.configure({
-      codec: 'avc1.42001f', // H.264 Baseline Level 3.1
+      codec: 'avc1.42001e', // H.264 Baseline Level 3.0
       width: W, height: H,
-      bitrate: 2_000_000,
+      bitrate: kbps,
       framerate: fps,
       avc: { format: 'avcC' },
     });
@@ -1001,6 +1013,7 @@ function injectTikTok(photoDataUrls, caption, songName, location, opts) {
     dbg(`Encoded ${videoChunks.length} chunks — muxing MP4…`);
 
     const mp4Blob = muxMP4(videoChunks, decoderConfig, W, H, fps, totalFrames);
+    dbg(`MP4 ready: ${(mp4Blob.size/1024).toFixed(0)}KB`);
     return new File([mp4Blob], 'slideshow.mp4', { type: 'video/mp4' });
   }
 
@@ -1074,10 +1087,23 @@ function injectTikTok(photoDataUrls, caption, songName, location, opts) {
     const trak_r = box('trak', tkhd, mdia_r);
     const moov_r = box('moov', mvhd, trak_r);
 
-    const mdatData = chunks.flatMap(c => [...c.data]);
-    const mdat = box('mdat', mdatData);
+    // Build mdat box header + data separately to avoid spreading large arrays
+    const mdatBodySize = chunks.reduce((a, c) => a + c.data.length, 0);
+    const mdatHeader   = new Uint8Array([...u32(mdatBodySize + 8), ...str('mdat')]);
 
-    const all = new Uint8Array([...ftyp, ...moov_r, ...mdat]);
+    // Efficient concatenation without spreading millions of bytes into an Array
+    function concatUint8Arrays(arrays) {
+      const total = arrays.reduce((n, a) => n + a.length, 0);
+      const out   = new Uint8Array(total);
+      let off = 0;
+      for (const a of arrays) { out.set(a, off); off += a.length; }
+      return out;
+    }
+
+    const ftypArr  = new Uint8Array(ftyp);
+    const moovArr  = new Uint8Array(moov_r);
+    const allParts = [ftypArr, moovArr, mdatHeader, ...chunks.map(c => c.data)];
+    const all      = concatUint8Arrays(allParts);
     return new Blob([all], { type: 'video/mp4' });
   }
 
@@ -1116,37 +1142,44 @@ function injectTikTok(photoDataUrls, caption, songName, location, opts) {
 
     let uploadedAs = null;
 
-    // ── Approach 1: WebM ──────────────────────────────────────────────────
-    step(2, 'Approach 1/3 — WebM slideshow (MediaRecorder)…');
+    // ── Approach 1: WebM 480×480 ──────────────────────────────────────────
+    step(2, 'Approach 1/3 — WebM 480p (MediaRecorder)…');
     try {
       const file = await approach1(imgs, SEC_PER_SLIDE);
-      dbg(`Injecting WebM: ${(file.size/1024).toFixed(0)}KB`);
+      step(2, `Approach 1/3 — injecting WebM ${(file.size/1024).toFixed(0)}KB…`);
       injectFiles(fileInput, [file]);
-      if (await uploadAccepted(8000)) { uploadedAs = 'WebM'; }
-      else { dbg('Approach 1 rejected by TikTok'); }
+      const r1 = await checkUpload(9000);
+      if (r1 === 'accepted') { uploadedAs = 'WebM'; dbg('Approach 1 accepted ✓'); }
+      else { dbg(`Approach 1 result: ${r1}`); }
     } catch(e) { dbg(`Approach 1 error: ${e.message}`); }
 
-    // ── Approach 2: H.264 MP4 ─────────────────────────────────────────────
+    // ── Approach 2: H.264 MP4 480p ────────────────────────────────────────
     if (!uploadedAs) {
-      step(2, 'Approach 2/3 — H.264 MP4 (WebCodecs)…');
+      step(2, 'Approach 2/3 — H.264 MP4 480p (WebCodecs)…');
       try {
         const file = await approach2(imgs, SEC_PER_SLIDE);
-        dbg(`Injecting MP4: ${(file.size/1024).toFixed(0)}KB`);
+        step(2, `Approach 2/3 — injecting MP4 ${(file.size/1024).toFixed(0)}KB…`);
         injectFiles(fileInput, [file]);
-        if (await uploadAccepted(10000)) { uploadedAs = 'MP4'; }
-        else { dbg('Approach 2 rejected by TikTok'); }
+        const r2 = await checkUpload(10000);
+        if (r2 === 'accepted') { uploadedAs = 'H.264 MP4'; dbg('Approach 2 accepted ✓'); }
+        else { dbg(`Approach 2 result: ${r2}`); }
       } catch(e) { dbg(`Approach 2 error: ${e.message}`); }
     }
 
-    // ── Approach 3: JPEG files ─────────────────────────────────────────────
+    // ── Approach 3: JPEG photo files ──────────────────────────────────────
     if (!uploadedAs) {
-      step(2, 'Approach 3/3 — Direct JPEG upload (photo carousel)…');
+      step(2, 'Approach 3/3 — Direct JPEG upload…');
       try {
         const files = approach3(photoDataUrls);
-        dbg(`Injecting ${files.length} JPEGs`);
+        const totalKB = files.reduce((a,f) => a + f.size, 0) / 1024;
+        step(2, `Approach 3/3 — injecting ${files.length} JPEGs (${totalKB.toFixed(0)}KB total)…`);
         injectFiles(fileInput, files);
-        await sleep(5000);
-        uploadedAs = 'Photos'; // assume accepted — no easy error check for photos
+        const r3 = await checkUpload(10000);
+        // Photos don't produce a video element; accept if no error
+        if (r3 !== 'rejected:timeout' && !r3.startsWith('rejected:')) {
+          uploadedAs = 'JPEG Photos';
+          dbg('Approach 3 accepted ✓');
+        } else { dbg(`Approach 3 result: ${r3}`); }
       } catch(e) { dbg(`Approach 3 error: ${e.message}`); }
     }
 
