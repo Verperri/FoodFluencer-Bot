@@ -465,15 +465,14 @@ function injectInstagram(photoDataUrls, caption, songName, location) {
     // Wait for the crop/arrange screen — editor ready when "Next" appears in the dialog
     step(2, total, 'Waiting for Instagram to process photos…');
 
-    // ── Visibility check: only interact with elements the user can actually see ──
+    // ── Visibility check using getBoundingClientRect (works through animations) ─
     function isVisible(el) {
       if (!el || !document.contains(el)) return false;
       const s = window.getComputedStyle(el);
-      return s.display !== 'none' &&
-             s.visibility !== 'hidden' &&
-             parseFloat(s.opacity) > 0.1 &&
-             el.offsetWidth > 0 &&
-             el.offsetHeight > 0;
+      if (s.display === 'none' || s.visibility === 'hidden') return false;
+      const r = el.getBoundingClientRect();
+      // Accept if element has size and is somewhere in the viewport
+      return r.width > 0 && r.height > 0;
     }
 
     const NEXT_RE = /^(next|volgende|suivant|weiter|siguiente|næste|neste|seuraava)$/i;
@@ -536,10 +535,41 @@ function injectInstagram(photoDataUrls, caption, songName, location) {
       }
 
       if (!preClickBtn) {
-        step(clickNum + 1, total,
-          `Please click <strong>Next</strong> at the top-right of the popup (step ${clickNum}/2).`, 'warn');
-        dbg(`Manual needed for ${label} Next — waiting 12s`);
-        await sleep(12000);
+        // Fallback: log ALL elements with "Next" text (visible or not) and try each
+        const allNext = [...document.querySelectorAll('[role="button"],button,[tabindex="0"],a')]
+          .filter(el => NEXT_RE.test((el.innerText || el.textContent || '').trim()) ||
+                        NEXT_RE.test(el.getAttribute('aria-label') || ''));
+        dbg(`No visible Next found. All Next candidates (${allNext.length}):`);
+        allNext.forEach((el, i) => {
+          const r = el.getBoundingClientRect();
+          const s = window.getComputedStyle(el);
+          dbg(`  [${i}] <${el.tagName}> display=${s.display} vis=${s.visibility} op=${s.opacity} size=${Math.round(r.width)}x${Math.round(r.height)} top=${Math.round(r.top)}`);
+        });
+
+        // Try clicking all candidates, starting with any that have non-zero size
+        let triedAny = false;
+        for (const candidate of allNext) {
+          const r = candidate.getBoundingClientRect();
+          if (r.width > 0 || r.height > 0) {
+            dbg(`Trying fallback click on candidate`);
+            reactClick(candidate);
+            candidate.click();
+            triedAny = true;
+            await sleep(1500);
+            // Check if we advanced (caption area should now be visible)
+            if (document.querySelector('textarea[aria-label*="caption" i], div[aria-label*="caption" i]')) {
+              dbg('Caption screen detected — fallback click worked!');
+              break;
+            }
+          }
+        }
+
+        if (!triedAny) {
+          step(clickNum + 1, total,
+            `Please click <strong>Next</strong> at the top-right of the popup (step ${clickNum}/2).`, 'warn');
+          dbg(`All fallbacks failed — waiting 12s for manual click`);
+          await sleep(12000);
+        }
         continue;
       }
 
@@ -555,14 +585,15 @@ function injectInstagram(photoDataUrls, caption, songName, location) {
       const transitioned = await waitForBtnToDisappear(preClickBtn, 6000);
       dbg(`${label} transition: ${transitioned ? 'confirmed (button gone)' : 'uncertain — proceeding anyway'}`);
 
-      // If not confirmed, retry the click once
+      // If transition not confirmed, retry the click once more
       if (!transitioned) {
-        dbg('Retrying click — button was still visible after 6s');
+        dbg('Button still visible after 6s — retrying click');
         reactClick(preClickBtn);
-        await sleep(1500);
+        await sleep(1000);
       }
 
-      await sleep(600); // let new screen fully render before next iteration
+      // Give the next screen time to animate in before we search for its Next button
+      await sleep(1200);
     }
 
     // ══ STEP 4: Fill caption — now on Details screen (Share button visible) ════
