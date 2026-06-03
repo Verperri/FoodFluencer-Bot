@@ -1,3 +1,17 @@
+// ── Background logger ─────────────────────────────────────────────────────────
+
+function bgLog(level, message, data) {
+  const entry = {
+    ts: new Date().toISOString(), source: 'background', level, message,
+    data: data !== undefined ? (typeof data === 'string' ? data : JSON.stringify(data)) : null,
+  };
+  chrome.storage.local.get({ appLog: [] }, ({ appLog }) => {
+    appLog.push(entry);
+    if (appLog.length > 800) appLog = appLog.slice(-600);
+    chrome.storage.local.set({ appLog });
+  });
+}
+
 // ── Message router ────────────────────────────────────────────────────────────
 
 chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
@@ -29,6 +43,7 @@ const INJECTORS = {
 };
 
 async function handleSocialPost({ platform, photoDataUrls, caption, songName }) {
+  bgLog('info', `Opening ${platform}`, { photos: photoDataUrls.length, song: songName });
   const tab = await chrome.tabs.create({ url: PLATFORM_URLS[platform], active: true });
 
   await new Promise(resolve => {
@@ -50,7 +65,9 @@ async function handleSocialPost({ platform, photoDataUrls, caption, songName }) 
       args:   [photoDataUrls, caption, songName || ""],
       world:  "MAIN",
     });
+    bgLog('info', `Injected script on ${platform}`);
   } catch (err) {
+    bgLog('error', `Inject failed on ${platform}`, String(err));
     console.error(`[FoodFluencer] Inject failed on ${platform}:`, err);
   }
 }
@@ -336,113 +353,136 @@ function injectInstagram(photoDataUrls, caption, songName) {
     }
 
     let opened = false;
-    for (let i = 0; i < 5 && !opened; i++) { opened = await openCreateModal(); if (!opened) await sleep(1000); }
+    for (let i = 0; i < 6 && !opened; i++) { opened = await openCreateModal(); if (!opened) await sleep(1200); }
 
     if (!opened) {
       step(1, total, 'Click the <strong>+</strong> Create button in the Instagram sidebar to open the post dialog.', 'warn');
-      // Don't abort — wait for the modal to appear manually
     }
-    await sleep(1500);
+    // Wait for the upload dialog to appear
+    await waitFor('[role="dialog"]', 6000);
+    await sleep(1000);
 
-    // ②  Inject photos via the hidden file input inside the modal
+    // ②  Inject photos
     step(2, total, `Uploading <strong>${photoDataUrls.length} photo${photoDataUrls.length > 1 ? 's' : ''}</strong>…`);
 
     const files = photoDataUrls.map((url, i) => dataUrlToFile(url, `restaurant-${i + 1}.jpg`));
 
-    // Try file input first (with up to 6 retries, triggering "Select from computer" each time)
-    let fileInput = null;
-    for (let attempt = 0; attempt < 6 && !fileInput; attempt++) {
-      fileInput = document.querySelector('input[type="file"]');
-      if (fileInput) break;
+    async function injectAndVerify() {
+      // Find the file input — try multiple times
+      let fileInput = null;
+      for (let attempt = 0; attempt < 8 && !fileInput; attempt++) {
+        fileInput = document.querySelector('input[type="file"]');
+        if (fileInput) break;
+        // Click "Select from computer" button if present
+        const selBtn = [...document.querySelectorAll('[role="button"], button')]
+          .find(el => /select.*computer|from.*computer|select.*files/i.test(el.textContent || ''));
+        if (selBtn) { selBtn.click(); await sleep(800); continue; }
+        await sleep(700);
+      }
 
-      // Click "Select from computer" if visible
-      const selBtn = [...document.querySelectorAll('[role="button"], button')]
-        .find(el => /select.*computer|from.*computer/i.test(el.textContent || ''));
-      if (selBtn) selBtn.click();
-      await sleep(1000);
+      if (!fileInput) return false;
+
+      // Inject files using native React-compatible setter
+      const dt = new DataTransfer();
+      files.forEach(f => dt.items.add(f));
+      const nativeSetter = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'files')?.set;
+      if (nativeSetter) nativeSetter.call(fileInput, dt.files);
+      else fileInput.files = dt.files;
+
+      // Fire events in order React expects
+      fileInput.dispatchEvent(new Event('change', { bubbles: true }));
+      fileInput.dispatchEvent(new Event('input',  { bubbles: true }));
+
+      // Verify injection succeeded: wait for crop/preview UI (canvas or crop controls)
+      for (let t = 0; t < 15; t++) {
+        await sleep(500);
+        if (document.querySelector('canvas, [aria-label*="crop" i], [data-visualcompletion="ignore-dynamic"]')) {
+          return true; // crop screen appeared
+        }
+      }
+      return false; // timed out waiting for crop screen
     }
 
-    if (fileInput) {
-      setFilesOnInput(fileInput, files);
-      await sleep(3000);
-    } else {
-      // Fallback: drop files onto the dialog's drop zone
-      const dropZone = document.querySelector('[role="dialog"] > div, [class*="Dialog"], [class*="modal"]');
+    const injected = await injectAndVerify();
+
+    if (!injected) {
+      // Try drag-and-drop fallback on the dialog
+      const dropZone = document.querySelector('[role="dialog"] > *, [class*="drag"], [class*="Drop"]');
       if (dropZone) {
         dropFilesOn(dropZone, files);
-        await sleep(3000);
+        await sleep(3500);
       } else {
         step(2, total,
-          `Could not find upload area. Please click <strong>Select from computer</strong> and choose photos from <strong>Downloads/FoodFluencer</strong>.`,
+          `Upload area found but injection failed. Please click <strong>Select from computer</strong> and choose your photos.`,
           'warn');
-        return;
+        // Don't abort — user can do it manually
+        await sleep(2000);
       }
     }
 
-    // ③  Click "Next" through Crop step — wait up to 8s for button to appear
+    // ③  Click "Next" through Crop — wait actively up to 10s
     step(3, total, 'Advancing through crop step…');
-    const cropNext = await waitForBtn('Next', 8000);
-    if (cropNext) { cropNext.click(); await sleep(2000); }
-    else { step(3, total, 'Please click <strong>Next</strong> to continue past the crop step.', 'warn'); await sleep(4000); }
+    const cropNext = await waitForBtn(/^(next|volgende|suivant)$/i, 10000);
+    if (cropNext) { cropNext.click(); await sleep(2200); }
+    else { step(3, total, 'Please click <strong>Next</strong> to continue past the crop step.', 'warn'); await sleep(5000); }
 
-    // ④  Click "Next" through Filters/Edit step
+    // ④  Click "Next" through Filters/Edit
     step(4, total, 'Advancing through edit step…');
-    const editNext = await waitForBtn('Next', 8000);
-    if (editNext) { editNext.click(); await sleep(2000); }
-    else { step(4, total, 'Please click <strong>Next</strong> to continue past the edit step.', 'warn'); await sleep(4000); }
+    const editNext = await waitForBtn(/^(next|volgende|suivant)$/i, 10000);
+    if (editNext) { editNext.click(); await sleep(2200); }
+    else { step(4, total, 'Please click <strong>Next</strong> to continue past the edit step.', 'warn'); await sleep(5000); }
 
-    // ⑤  Fill caption — Instagram uses either a textarea or a contenteditable div
+    // ⑤  Fill caption (textarea or contenteditable div, with retries)
     step(5, total, 'Filling caption…');
 
     const captionSelectors = [
       'textarea[aria-label="Write a caption..."]',
       'div[aria-label="Write a caption..."]',
       'textarea[placeholder*="caption" i]',
+      '[contenteditable="true"][aria-multiline="true"]',
       '[contenteditable="true"][aria-required]',
       '[role="textbox"]',
     ];
+
     let captionEl = null;
-    for (let attempt = 0; attempt < 6 && !captionEl; attempt++) {
+    for (let attempt = 0; attempt < 8 && !captionEl; attempt++) {
       for (const s of captionSelectors) { captionEl = document.querySelector(s); if (captionEl) break; }
-      if (!captionEl) await sleep(800);
+      if (!captionEl) await sleep(700);
     }
 
     if (captionEl) {
-      captionEl.click(); await sleep(300);
+      captionEl.scrollIntoView({ behavior: 'smooth', block: 'center' });
+      captionEl.click(); await sleep(400);
       if (captionEl.tagName === 'TEXTAREA') {
         const setter = Object.getOwnPropertyDescriptor(HTMLTextAreaElement.prototype, 'value')?.set;
         if (setter) setter.call(captionEl, caption); else captionEl.value = caption;
         captionEl.dispatchEvent(new Event('input', { bubbles: true }));
       } else {
-        // contenteditable div — clear then type
         captionEl.focus(); await sleep(200);
         document.execCommand('selectAll', false, null);
         document.execCommand('insertText', false, caption);
       }
     }
 
-    // ⑥  Add music (song search)
+    // ⑥  Add music
     if (songName) {
-      await sleep(600);
-      const musicBtn = await waitForBtn(/add.*music|add.*audio/i, 4000);
+      await sleep(700);
+      const musicBtn = await waitForBtn(/add.*music|add.*audio/i, 5000);
       if (musicBtn) {
-        musicBtn.click(); await sleep(1200);
+        musicBtn.click(); await sleep(1400);
         const searchInput = await waitFor('input[placeholder*="Search" i], input[type="search"]', 4000);
         if (searchInput) {
           searchInput.focus(); searchInput.value = songName;
           searchInput.dispatchEvent(new Event('input', { bubbles: true }));
-          await sleep(1800);
-          // Click the first result
-          const firstResult = document.querySelector(
-            '[class*="MusicItem"], [class*="music_item"], [class*="AudioItem"], [class*="TrackItem"]'
-          );
+          await sleep(2000);
+          const firstResult = document.querySelector('[class*="MusicItem"], [class*="AudioItem"], [class*="TrackItem"]');
           if (firstResult) firstResult.click();
           step(6, total, `🎵 <em>"${songName}"</em> searched — confirm selection, then click <strong>Share</strong>.`, 'success');
         } else {
           step(6, total, `Caption ready — search for <em>"${songName}"</em> in Add Music, then click <strong>Share</strong>.`, 'success');
         }
       } else {
-        step(6, total, `Caption ready — tap <strong>Add music</strong> to add <em>"${songName}"</em>, then click <strong>Share</strong>.`, 'success');
+        step(6, total, `Caption filled — find <strong>Add music</strong>, search for <em>"${songName}"</em>, then click <strong>Share</strong>.`, 'success');
       }
     } else {
       step(5, total, `✅ ${files.length} photo${files.length > 1 ? 's' : ''} &amp; caption ready — click <strong>Share</strong> to publish.`, 'success');

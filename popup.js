@@ -24,6 +24,28 @@ const BELGIAN_RESTAURANTS = [
   "Braserie Appelmans Antwerp",     "De Troubadour Bruges",
 ];
 
+// ── App logger ────────────────────────────────────────────────────────────────
+
+const AppLog = {
+  _write(level, message, data) {
+    const entry = {
+      ts:      new Date().toISOString(),
+      source:  "popup",
+      level,
+      message,
+      data:    data !== undefined ? (typeof data === "string" ? data : JSON.stringify(data)) : null,
+    };
+    chrome.storage.local.get({ appLog: [] }, ({ appLog }) => {
+      appLog.push(entry);
+      if (appLog.length > 800) appLog = appLog.slice(-600);
+      chrome.storage.local.set({ appLog });
+    });
+  },
+  info:  (msg, d) => AppLog._write("info",  msg, d),
+  warn:  (msg, d) => AppLog._write("warn",  msg, d),
+  error: (msg, d) => AppLog._write("error", msg, d),
+};
+
 // ── State ─────────────────────────────────────────────────────────────────────
 
 let API_KEY           = "";
@@ -162,8 +184,36 @@ function checkUsageWarning() {
 
 $("usageStatsBtn").addEventListener("click", () => {
   chrome.storage.local.get({ apiLog: [], totalCost: 0 }, ({ apiLog, totalCost }) => {
-    alert(`📊 API Usage\n\nTotal calls : ${apiLog.length}\nEst. cost   : $${totalCost.toFixed(4)}\n\nUse "Download log" in the warning banner to export full CSV history.`);
+    alert(`📊 API Usage\n\nTotal calls : ${apiLog.length}\nEst. cost   : $${totalCost.toFixed(4)}\n\nClick "Export Logs" for a full debug report.`);
   });
+});
+
+$("exportLogsBtn").addEventListener("click", () => {
+  AppLog.info("Export logs requested by user");
+  chrome.storage.local.get(
+    { appLog: [], apiLog: [], exportLog: [], totalCost: 0 },
+    (data) => {
+      const report = {
+        exportedAt:    new Date().toISOString(),
+        version:       chrome.runtime.getManifest().version,
+        apiUsage: {
+          totalCalls:   data.apiLog.length,
+          estimatedUSD: data.totalCost,
+          calls:        data.apiLog,
+        },
+        appEvents:     data.appLog,
+        exportHistory: data.exportLog,
+      };
+      const json = JSON.stringify(report, null, 2);
+      const slug = new Date().toISOString().slice(0, 19).replace(/[:.]/g, "-");
+      chrome.runtime.sendMessage({
+        type:     "DOWNLOAD",
+        url:      "data:application/json;charset=utf-8," + encodeURIComponent(json),
+        filename: `FoodFluencer/debug_log_${slug}.json`,
+      });
+      setStatus("📋 Debug log exported to Downloads/FoodFluencer/", "success");
+    }
+  );
 });
 
 $("downloadLogBtn").addEventListener("click", () => {
@@ -393,8 +443,10 @@ async function doSearch(query) {
   try {
     const place = await searchRestaurant(query);
     renderResults(place);
+    AppLog.info("Restaurant found", { name: place.displayName?.text, query });
     $("status").classList.add("hidden");
   } catch (err) {
+    AppLog.error("Restaurant search failed", { query, error: err.message });
     setStatus(err.message, "error");
   }
 }
@@ -499,66 +551,67 @@ async function exportAndPost() {
   const caption   = $("caption")?.value.trim() || buildDefaultCaption();
   const songName  = selectedSong?.name || "";
   const timestamp = new Date().toISOString().replace(/[:.]/g, "-").slice(0, 19);
-  const safeName  = name.replace(/[/\\?%*:|"<>]/g, "_");
-  const folder    = `FoodFluencer/${safeName}_${timestamp}`;
+  const platforms = [...activePlatforms];
 
   $("exportBtn").disabled = true;
+  AppLog.info("Export & Post started", { restaurant: name, photos: photos.length, platforms, song: songName });
   setStatus("Resolving photos…");
 
+  // ── 1. Resolve full-res photo URIs from Google Places CDN ─────────────────
   const photoUris = [];
   for (const photo of photos) {
-    try { photoUris.push(await resolvePhotoUri(photo.name, 1200)); }
-    catch (e) { console.warn("Photo resolve failed:", e); }
+    try {
+      photoUris.push(await resolvePhotoUri(photo.name, 1200));
+    } catch (e) {
+      AppLog.error("Photo resolve failed", { photo: photo.name, error: String(e) });
+      console.warn("Photo resolve failed:", e);
+    }
   }
+  AppLog.info(`Resolved ${photoUris.length}/${photos.length} photo URIs`);
 
-  setStatus("Saving photos…");
-  photoUris.forEach((uri, i) => {
-    chrome.runtime.sendMessage({
-      type: "DOWNLOAD", url: uri,
-      filename: `${folder}/photo_${String(i+1).padStart(2,"0")}.jpg`,
-    });
-  });
-
-  const noteLines = [
-    `Restaurant : ${name}`, `Address    : ${address}`,
-    `Exported   : ${new Date().toLocaleString()}`, `Photos     : ${photos.length}`,
-    selectedSong ? `Song       : ${selectedSong.name} – ${selectedSong.artist}` : null,
-    ``, `Caption:`, caption,
-  ].filter(l => l !== null);
-  chrome.runtime.sendMessage({
-    type: "DOWNLOAD",
-    url: "data:text/plain;charset=utf-8," + encodeURIComponent(noteLines.join("\n")),
-    filename: `${folder}/info.txt`,
-  });
-
+  // ── 2. Log the export (no local file download) ────────────────────────────
   chrome.storage.local.get({ exportLog: [] }, ({ exportLog }) => {
-    exportLog.push({ timestamp, name, address, photos: photos.length, folder,
-      song: selectedSong ? `${selectedSong.name} – ${selectedSong.artist}` : null,
-      platforms: [...activePlatforms] });
+    exportLog.push({
+      timestamp, name, address, photos: photoUris.length,
+      song:      selectedSong ? `${selectedSong.name} – ${selectedSong.artist}` : null,
+      platforms,
+      caption,
+    });
     chrome.storage.local.set({ exportLog });
   });
 
-  const platforms = [...activePlatforms];
+  // ── 3. Prepare data URLs and open social platforms ────────────────────────
   if (platforms.length > 0 && photoUris.length > 0) {
-    setStatus(`Resizing ${photoUris.length} photos…`);
+    setStatus(`Preparing ${photoUris.length} photos for upload…`);
     const photoDataUrls = [];
     for (const uri of photoUris) {
-      try { photoDataUrls.push(await photoToDataUrl(uri)); }
-      catch (e) { console.warn("Photo resize failed:", e); }
+      try {
+        photoDataUrls.push(await photoToDataUrl(uri));
+      } catch (e) {
+        AppLog.error("Photo resize failed", { uri, error: String(e) });
+        console.warn("Photo resize failed:", e);
+      }
     }
 
     if (photoDataUrls.length > 0) {
+      AppLog.info(`Sending ${photoDataUrls.length} photos to ${platforms.join(", ")}`);
       for (const platform of platforms) {
         setStatus(`Opening ${platform}…`);
         chrome.runtime.sendMessage({ type: "OPEN_SOCIAL", platform, photoDataUrls, caption, songName });
         await new Promise(r => setTimeout(r, 900));
       }
-      setStatus(`✅ Opened ${platforms.join(", ")} — ${photoDataUrls.length} photos & caption ready!`, "success");
+      setStatus(`✅ Opening ${platforms.join(", ")} — uploading ${photoDataUrls.length} photos directly!`, "success");
     } else {
+      AppLog.error("All photo resizes failed — cannot post to social media");
       setStatus("⚠️ Could not prepare photos for social media.", "error");
     }
+  } else if (platforms.length === 0) {
+    // No platforms selected — just log
+    AppLog.info("No platforms selected, logged only");
+    setStatus("✅ Logged — select a platform above to post to social media.", "success");
   } else {
-    setStatus(`✅ Exported ${photoUris.length} photos → Downloads/${folder}`, "success");
+    AppLog.error("No photo URIs resolved");
+    setStatus("⚠️ Could not resolve any photos.", "error");
   }
 
   $("exportBtn").disabled = false;
