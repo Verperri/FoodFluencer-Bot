@@ -620,7 +620,10 @@ async function exportAndPost() {
       AppLog.info(`Sending ${photoDataUrls.length} photos to ${platforms.join(", ")}`);
       for (const platform of platforms) {
         setStatus(`Opening ${platform}…`);
-        chrome.runtime.sendMessage({ type: "OPEN_SOCIAL", platform, photoDataUrls, caption, songName });
+        chrome.runtime.sendMessage({
+          type: "OPEN_SOCIAL", platform, photoDataUrls, caption, songName,
+          location: currentRestaurant.address || "",
+        });
         await new Promise(r => setTimeout(r, 900));
       }
       setStatus(`✅ Opening ${platforms.join(", ")} — uploading ${photoDataUrls.length} photos directly!`, "success");

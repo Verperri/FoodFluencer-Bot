@@ -42,8 +42,8 @@ const INJECTORS = {
   tiktok:    injectTikTok,
 };
 
-async function handleSocialPost({ platform, photoDataUrls, caption, songName }) {
-  bgLog('info', `Opening ${platform}`, { photos: photoDataUrls.length, song: songName });
+async function handleSocialPost({ platform, photoDataUrls, caption, songName, location }) {
+  bgLog('info', `Opening ${platform}`, { photos: photoDataUrls.length, song: songName, location });
   const tab = await chrome.tabs.create({ url: PLATFORM_URLS[platform], active: true });
 
   await new Promise(resolve => {
@@ -62,7 +62,7 @@ async function handleSocialPost({ platform, photoDataUrls, caption, songName }) 
     await chrome.scripting.executeScript({
       target: { tabId: tab.id },
       func:   INJECTORS[platform],
-      args:   [photoDataUrls, caption, songName || ""],
+      args:   [photoDataUrls, caption, songName || "", location || ""],
       world:  "MAIN",
     });
     bgLog('info', `Injected script on ${platform}`);
@@ -247,7 +247,7 @@ function injectFacebook(photoDataUrls, caption, songName) {
 
 // ─── Instagram ────────────────────────────────────────────────────────────────
 
-function injectInstagram(photoDataUrls, caption, songName) {
+function injectInstagram(photoDataUrls, caption, songName, location) {
   const sleep = ms => new Promise(r => setTimeout(r, ms));
 
   // Poll for an element matching selector, with retries
@@ -324,7 +324,8 @@ function injectInstagram(photoDataUrls, caption, songName) {
   }
 
   (async () => {
-    const total = songName ? 6 : 5;
+    // Steps: create+post(1) upload(2) crop-Next(3) edit-Next(4) caption(5) location(6) [song(7)]
+    const total = location ? (songName ? 7 : 6) : (songName ? 6 : 5);
 
     // ①  Find & click the Create ("+") button in the sidebar
     step(1, total, 'Finding Create Post button…');
@@ -366,41 +367,57 @@ function injectInstagram(photoDataUrls, caption, songName) {
       step(1, total, 'Create button clicked — selecting Post from menu…');
     }
 
-    // ── Step 1b: Instagram shows a sub-menu (Post / Reel / Story / Live).
-    //    We MUST click "Post" before the upload dialog appears.
-    await sleep(800);
+    // ── Step 1b: After clicking Create, Instagram shows a panel/menu with
+    //    Post / Story / Reel / Live.  We must click "Post" to open the upload dialog.
+    // Key: use innerText (visible text only) not textContent (includes hidden SVG text).
+    await sleep(1000);
 
-    async function clickPostFromSubMenu() {
-      // The sub-menu items are typically role="dialog" > [role="menuitem"] or
-      // plain <a>/<div role="button"> with visible text "Post".
-      const postLabels = /^(post|bericht|publication|publicatie|innlegg)$/i;
-      const btn = [...document.querySelectorAll(
-        '[role="menuitem"], [role="option"], [role="button"], a, button'
-      )].find(el => {
-        const txt = (el.textContent || '').trim();
-        const lbl = el.getAttribute('aria-label') || '';
-        return postLabels.test(txt) || postLabels.test(lbl);
-      });
-      if (btn) { btn.click(); return true; }
+    async function findAndClickPost() {
+      // Broaden the selector to include <a> tags (Instagram uses anchors in the panel)
+      const candidates = [...document.querySelectorAll(
+        'a, button, [role="button"], [role="menuitem"], [role="option"], [tabindex="0"]'
+      )];
+
+      for (const el of candidates) {
+        // Use innerText for visible-only text; fall back to textContent
+        const visText  = (typeof el.innerText !== 'undefined' ? el.innerText : el.textContent || '').trim();
+        const ariaLbl  = el.getAttribute('aria-label') || '';
+
+        if (visText !== 'Post' && ariaLbl !== 'Post') continue;
+
+        // Confirm this is the create-menu "Post", not some other "Post" link on the page,
+        // by checking that nearby context mentions Story / Reel / Live.
+        const ancestor = el.closest(
+          '[role="dialog"], [role="menu"], nav, [aria-label*="Create" i], [aria-label*="create" i]'
+        ) || el.parentElement?.parentElement;
+
+        const ctx = (ancestor?.innerText || ancestor?.textContent || '').toLowerCase();
+        const isCreateMenu = ctx.includes('story') || ctx.includes('reel') || ctx.includes('live');
+
+        if (isCreateMenu || !ancestor) {
+          el.click();
+          return true;
+        }
+      }
       return false;
     }
 
     let postClicked = false;
-    for (let i = 0; i < 8 && !postClicked; i++) {
-      postClicked = await clickPostFromSubMenu();
-      if (!postClicked) await sleep(600);
+    for (let i = 0; i < 12 && !postClicked; i++) {
+      postClicked = await findAndClickPost();
+      if (!postClicked) await sleep(500);
     }
 
     if (!postClicked) {
       step(1, total,
-        'Please select <strong>Post</strong> from the menu that appeared.',
+        'Please click <strong>Post</strong> from the create menu — the bot will continue once the upload dialog opens.',
         'warn');
     } else {
       step(1, total, 'Post selected — waiting for upload dialog…');
     }
 
-    // Wait for the upload dialog / drag-drop area to appear
-    await waitFor('[role="dialog"]', 8000);
+    // Wait for the upload/drop dialog to fully render
+    await waitFor('[role="dialog"]', 12000);
     await sleep(1200);
 
     // ②  Inject photos
@@ -473,7 +490,7 @@ function injectInstagram(photoDataUrls, caption, songName) {
     if (editNext) { editNext.click(); await sleep(2200); }
     else { step(4, total, 'Please click <strong>Next</strong> to continue past the edit step.', 'warn'); await sleep(5000); }
 
-    // ⑤  Fill caption (textarea or contenteditable div, with retries)
+    // ⑤  Fill caption (textarea or contenteditable, with retries)
     step(5, total, 'Filling caption…');
 
     const captionSelectors = [
@@ -484,13 +501,11 @@ function injectInstagram(photoDataUrls, caption, songName) {
       '[contenteditable="true"][aria-required]',
       '[role="textbox"]',
     ];
-
     let captionEl = null;
     for (let attempt = 0; attempt < 8 && !captionEl; attempt++) {
       for (const s of captionSelectors) { captionEl = document.querySelector(s); if (captionEl) break; }
       if (!captionEl) await sleep(700);
     }
-
     if (captionEl) {
       captionEl.scrollIntoView({ behavior: 'smooth', block: 'center' });
       captionEl.click(); await sleep(400);
@@ -505,29 +520,63 @@ function injectInstagram(photoDataUrls, caption, songName) {
       }
     }
 
-    // ⑥  Add music
-    if (songName) {
-      await sleep(700);
-      const musicBtn = await waitForBtn(/add.*music|add.*audio/i, 5000);
-      if (musicBtn) {
-        musicBtn.click(); await sleep(1400);
-        const searchInput = await waitFor('input[placeholder*="Search" i], input[type="search"]', 4000);
-        if (searchInput) {
-          searchInput.focus(); searchInput.value = songName;
-          searchInput.dispatchEvent(new Event('input', { bubbles: true }));
-          await sleep(2000);
-          const firstResult = document.querySelector('[class*="MusicItem"], [class*="AudioItem"], [class*="TrackItem"]');
-          if (firstResult) firstResult.click();
-          step(6, total, `🎵 <em>"${songName}"</em> searched — confirm selection, then click <strong>Share</strong>.`, 'success');
-        } else {
-          step(6, total, `Caption ready — search for <em>"${songName}"</em> in Add Music, then click <strong>Share</strong>.`, 'success');
-        }
-      } else {
-        step(6, total, `Caption filled — find <strong>Add music</strong>, search for <em>"${songName}"</em>, then click <strong>Share</strong>.`, 'success');
+    // ⑥  Add location (restaurant address → city search)
+    if (location) {
+      await sleep(800);
+      step(6, total, 'Adding location…');
+
+      // Extract the city — format: "Street, NNNN City, Belgium"
+      const cityMatch = location.match(/\d{4}\s+([A-Za-zÀ-ÿ\s-]+),\s*Belgium/i);
+      const searchTerm = (cityMatch?.[1] || location.split(',')[0] || location).trim();
+
+      // Find and click "Add location"
+      const locationTriggerSels = [
+        '[aria-label="Add location"]',
+        '[placeholder*="location" i]',
+        'input[aria-label*="location" i]',
+      ];
+      let locationTrigger = null;
+      for (const s of locationTriggerSels) { locationTrigger = document.querySelector(s); if (locationTrigger) break; }
+      if (!locationTrigger) {
+        locationTrigger = [...document.querySelectorAll('[role="button"], button, a')]
+          .find(el => /add.*(a\s+)?location/i.test((el.innerText || el.textContent || el.getAttribute('aria-label') || '')));
       }
-    } else {
-      step(5, total, `✅ ${files.length} photo${files.length > 1 ? 's' : ''} &amp; caption ready — click <strong>Share</strong> to publish.`, 'success');
+
+      if (locationTrigger) {
+        locationTrigger.click(); await sleep(700);
+
+        // Location search input
+        const locInput = await waitFor(
+          'input[placeholder*="Search" i][aria-label*="location" i], input[placeholder*="location" i], input[aria-label*="location" i]',
+          3000
+        );
+        if (locInput) {
+          locInput.focus(); await sleep(200);
+          // Type character-by-character to trigger Instagram's location API
+          for (const ch of searchTerm) {
+            document.execCommand('insertText', false, ch);
+            await sleep(60);
+          }
+          await sleep(2000); // wait for results to load
+
+          // Click the first suggestion
+          const firstSuggestion = document.querySelector(
+            '[role="option"]:first-child, [class*="location" i]:first-child a, [class*="Location"]:first-child'
+          );
+          if (firstSuggestion) { firstSuggestion.click(); await sleep(400); }
+        }
+      }
     }
+
+    // ⑦  Final step — show banner and STOP (user clicks Share to confirm)
+    //    Do NOT auto-click Share; the user must review photos & caption first.
+    const stepFinal = total;
+    const songHint = songName
+      ? `&nbsp; 🎵 Tap <strong>Add music</strong> to add <em>"${songName}"</em>.`
+      : '';
+    step(stepFinal, total,
+      `✅ All set! Review your photos &amp; caption${location ? ' &amp; location' : ''},${songHint} then click <strong>Share</strong> to publish.`,
+      'success');
   })();
 }
 
