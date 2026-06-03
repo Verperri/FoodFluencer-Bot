@@ -804,9 +804,10 @@ function injectInstagram(photoDataUrls, caption, songName, location, opts) {
 // Tries 3 upload approaches in sequence until TikTok accepts one.
 
 function injectTikTok(photoDataUrls, caption, songName, location, opts) {
-  const { tiktokVideoDataUrl = null, tiktokVideoPath = null } = opts || {};
+  // Video is built INSIDE the injector from the photoDataUrls that are already passed.
+  // This avoids the 2-3MB base64 string arg that chrome.scripting silently drops.
   const sleep = ms => new Promise(r => setTimeout(r, ms));
-  const waitFor = (sel, ms = 10000) => new Promise(res => {
+  const waitFor = (sel, ms = 12000) => new Promise(res => {
     const el = document.querySelector(sel); if (el) return res(el);
     const t = Date.now(); const iv = setInterval(() => {
       const e = document.querySelector(sel);
@@ -831,7 +832,7 @@ function injectTikTok(photoDataUrls, caption, songName, location, opts) {
         <button onclick="document.getElementById('ffbot-banner').remove()"
           style="background:rgba(255,255,255,.22);border:none;color:#fff;border-radius:5px;padding:3px 9px;cursor:pointer">✕</button>
       </div>
-      <div id="ffbot-log" style="font-size:.68rem;opacity:.78;max-height:32px;overflow:hidden"></div>`;
+      <div id="ffbot-log" style="font-size:.68rem;opacity:.78;max-height:30px;overflow:hidden"></div>`;
     document.body.prepend(b);
   }
   function dbg(msg) {
@@ -840,169 +841,277 @@ function injectTikTok(photoDataUrls, caption, songName, location, opts) {
     console.log(`[FoodFluencer TikTok] ${msg}`);
   }
 
-  // ── Convert data URL → File ────────────────────────────────────────────────
-  function dataUrlToFile(url, name) {
-    const [hdr, b64] = url.split(',');
-    const mime = hdr.match(/:(.*?);/)[1];
-    const raw  = atob(b64);
-    const arr  = new Uint8Array(raw.length);
-    for (let i = 0; i < raw.length; i++) arr[i] = raw.charCodeAt(i);
-    return new File([arr], name, { type: mime });
+  // ════════════════════════════════════════════════════════════════════════════
+  // Create H.264 MP4 entirely inside TikTok's page context using WebCodecs.
+  // The photoDataUrls (~200KB each × 5) are already passed as normal args.
+  // ════════════════════════════════════════════════════════════════════════════
+  async function buildH264MP4(imgDataUrls) {
+    const W = 720, H = 1280, FPS = 25, BITRATE = 2_000_000, SEC = 1.2;
+
+    // Load images
+    const images = [];
+    for (const src of imgDataUrls) {
+      await new Promise(res => {
+        const img = new Image();
+        img.onload = () => { images.push(img); res(); };
+        img.onerror = res;
+        img.src = src;
+      });
+    }
+    if (!images.length) throw new Error('No images loaded');
+
+    const canvas = document.createElement('canvas');
+    canvas.width = W; canvas.height = H;
+    const ctx = canvas.getContext('2d');
+
+    function drawSlide(img) {
+      ctx.fillStyle = '#000'; ctx.fillRect(0, 0, W, H);
+      const s = Math.min(W / img.naturalWidth, H / img.naturalHeight);
+      ctx.drawImage(img, (W - img.naturalWidth * s) / 2, (H - img.naturalHeight * s) / 2, img.naturalWidth * s, img.naturalHeight * s);
+    }
+
+    // ── Try WebCodecs H.264 ──────────────────────────────────────────────────
+    if (window.VideoEncoder) {
+      const codecs = ['avc1.4d0028','avc1.42001f','avc1.42001e','avc1.420014'];
+      let codec = null;
+      for (const c of codecs) {
+        try {
+          const s = await VideoEncoder.isConfigSupported({ codec: c, width: W, height: H, bitrate: BITRATE, framerate: FPS });
+          if (s.supported) { codec = c; break; }
+        } catch(_) {}
+      }
+
+      if (codec) {
+        dbg(`Encoding H.264 (${codec})…`);
+        const chunks = []; let dcfg = null; let encErr = null;
+        const enc = new VideoEncoder({
+          output: (chunk, meta) => {
+            if (meta?.decoderConfig) dcfg = meta.decoderConfig;
+            const buf = new ArrayBuffer(chunk.byteLength);
+            chunk.copyTo(buf);
+            chunks.push({ data: new Uint8Array(buf), isKey: chunk.type === 'key' });
+          },
+          error: e => { encErr = e; },
+        });
+        enc.configure({ codec, width: W, height: H, bitrate: BITRATE, framerate: FPS, avc: { format: 'avcC' } });
+
+        const framesPerSlide = Math.ceil(SEC * FPS);
+        let fi = 0;
+        for (let i = 0; i < images.length; i++) {
+          drawSlide(images[i]);
+          for (let f = 0; f < framesPerSlide; f++) {
+            if (encErr) throw new Error(`VideoEncoder: ${encErr.message}`);
+            const ts = Math.round(fi * 1_000_000 / FPS);
+            const frame = new VideoFrame(canvas, { timestamp: ts, duration: Math.round(1_000_000 / FPS) });
+            enc.encode(frame, { keyFrame: fi === 0 || f === 0 });
+            frame.close(); fi++;
+          }
+        }
+        await enc.flush(); enc.close();
+        if (encErr) throw new Error(`VideoEncoder: ${encErr.message}`);
+        dbg(`Encoded ${chunks.length} H.264 chunks — muxing MP4…`);
+        return { blob: muxMP4(chunks, dcfg, W, H, FPS, fi), type: 'video/mp4', ext: 'mp4' };
+      }
+    }
+
+    // ── Fallback: WebM via MediaRecorder ────────────────────────────────────
+    dbg('WebCodecs unavailable — using MediaRecorder WebM…');
+    const mt = ['video/webm;codecs=vp9','video/webm;codecs=vp8','video/webm']
+      .find(t => MediaRecorder.isTypeSupported(t)) || 'video/webm';
+    const stream = canvas.captureStream(FPS);
+    const rec = new MediaRecorder(stream, { mimeType: mt, videoBitsPerSecond: BITRATE });
+    const ch = [];
+    rec.ondataavailable = e => { if (e.data.size > 0) ch.push(e.data); };
+    rec.start(100);
+    for (const img of images) { drawSlide(img); await sleep(SEC * 1000); }
+    rec.stop();
+    const blob = await new Promise(res => { rec.onstop = () => res(new Blob(ch, { type: mt })); });
+    return { blob, type: mt, ext: 'webm' };
   }
 
-  // ── Inject file into an <input type="file"> via DataTransfer ──────────────
+  // ── Minimal MP4 muxer (self-contained, identical to popup.js version) ─────
+  function muxMP4(chunks, dcfg, W, H, fps, totalFrames) {
+    const u8  = v => [v & 0xFF];
+    const u16 = v => [(v >> 8) & 0xFF, v & 0xFF];
+    const u32 = v => [(v >>> 24) & 0xFF, (v >>> 16) & 0xFF, (v >>> 8) & 0xFF, v & 0xFF];
+    const s4  = s => [...new TextEncoder().encode(s).slice(0, 4)];
+    const z   = n => Array(n).fill(0);
+    function box(t, ...c) { const d = c.flat(Infinity); return [...u32(8+d.length), ...s4(t.padEnd(4,' ')), ...d]; }
+    function fb(t, v, f, ...c) { return box(t, u8(v), [(f>>16)&0xFF,(f>>8)&0xFF,f&0xFF], ...c); }
+
+    const TS = 90000, SD = Math.round(TS / fps), DUR = totalFrames * SD;
+    let sps = new Uint8Array([0x67,0x4d,0x00,0x28]);
+    let pps = new Uint8Array([0x68,0xee,0x31,0xb2,0x8b]);
+    if (dcfg?.description) {
+      const d = new Uint8Array(dcfg.description); let i = 5;
+      const ns = d[i++] & 0x1F;
+      for (let j=0;j<ns;j++) { const l=(d[i]<<8)|d[i+1];i+=2; sps=d.slice(i,i+l);i+=l; }
+      const np = d[i++];
+      for (let j=0;j<np;j++) { const l=(d[i]<<8)|d[i+1];i+=2; pps=d.slice(i,i+l);i+=l; }
+    }
+
+    const avcC = box('avcC', u8(1),[sps[1]||0x4d,sps[2]||0x00,sps[3]||0x28],[0xFF],[0xE1],u16(sps.length),[...sps],u8(1),u16(pps.length),[...pps]);
+    const avc1 = box('avc1', z(6),u16(1),z(16),u16(W),u16(H),[0,72,0,0,0,72,0,0],u32(0),u16(1),z(32),u16(0x18),u16(0xFFFF),avcC);
+    const mat  = [0x00,0x01,0x00,0x00,0,0,0,0,0,0,0,0,0,0,0,0,0x00,0x01,0x00,0x00,0,0,0,0,0,0,0,0,0,0,0,0,0x40,0x00,0x00,0x00];
+
+    const stsd = fb('stsd',0,0, u32(1),avc1);
+    const stts = fb('stts',0,0, u32(1),u32(chunks.length),u32(SD));
+    const keys = chunks.map((c,i)=>c.isKey?i+1:null).filter(Boolean);
+    const stss = fb('stss',0,0, u32(keys.length),...keys.flatMap(i=>u32(i)));
+    const stsz = fb('stsz',0,0, u32(0),u32(chunks.length),...chunks.flatMap(c=>u32(c.data.length)));
+    const stsc = fb('stsc',0,0, u32(1),u32(1),u32(1),u32(1));
+    const stco_ph = fb('stco',0,0, u32(chunks.length),...chunks.flatMap(()=>u32(0)));
+    const stbl_ph = box('stbl',stsd,stts,stss,stsc,stsz,stco_ph);
+    const vmhd = fb('vmhd',0,1,u16(0),z(6));
+    const dinf = box('dinf',fb('dref',0,0,u32(1),fb('url ',0,1)));
+    const minf_ph = box('minf',vmhd,dinf,stbl_ph);
+    const mdhd = fb('mdhd',0,0,u32(0),u32(0),u32(TS),u32(DUR),u16(0x55C4),u16(0));
+    const hdlr = fb('hdlr',0,0,u32(0),s4('vide'),z(12),[...s4('Vide'),0]);
+    const mdia_ph = box('mdia',mdhd,hdlr,minf_ph);
+    const tkhd = fb('tkhd',0,3,u32(0),u32(0),u32(1),u32(0),u32(DUR),z(8),u16(0),u16(0),u16(0),u16(0),mat,u32(W<<16),u32(H<<16));
+    const trak_ph = box('trak',tkhd,mdia_ph);
+    const mvhd = fb('mvhd',0,0,u32(0),u32(0),u32(TS),u32(DUR),u32(0x10000),u16(0x100),z(10),mat,z(24),u32(2));
+    const moov_ph = box('moov',mvhd,trak_ph);
+    const ftyp = box('ftyp',s4('isom'),u32(0x200),s4('isom'),s4('iso2'),s4('avc1'),s4('mp41'));
+
+    const mdatStart = ftyp.length + moov_ph.length + 8;
+    let off = mdatStart;
+    const realOff = chunks.map(c => { const o=off; off+=c.data.length; return o; });
+    const stco_r  = fb('stco',0,0,u32(chunks.length),...realOff.flatMap(o=>u32(o)));
+    const stbl_r  = box('stbl',stsd,stts,stss,stsc,stsz,stco_r);
+    const minf_r  = box('minf',vmhd,dinf,stbl_r);
+    const mdia_r  = box('mdia',mdhd,hdlr,minf_r);
+    const trak_r  = box('trak',tkhd,mdia_r);
+    const moov_r  = box('moov',mvhd,trak_r);
+
+    const mdatBodySize = chunks.reduce((a,c)=>a+c.data.length,0);
+    const mdatHdr = new Uint8Array([...u32(mdatBodySize+8),...s4('mdat')]);
+    const total   = ftyp.length + moov_r.length + mdatHdr.length + mdatBodySize;
+    const out     = new Uint8Array(total);
+    let p = 0;
+    for (const part of [new Uint8Array(ftyp), new Uint8Array(moov_r), mdatHdr, ...chunks.map(c=>c.data)]) {
+      out.set(part, p); p += part.length;
+    }
+    return new Blob([out], { type: 'video/mp4' });
+  }
+
+  // ── Inject file into TikTok's upload input ────────────────────────────────
   function injectFile(input, file) {
     const dt = new DataTransfer();
     dt.items.add(file);
     const setter = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'files')?.set;
     if (setter) setter.call(input, dt.files); else input.files = dt.files;
-    // Fire all events that React/TikTok might listen to
     ['change', 'input'].forEach(ev =>
       input.dispatchEvent(new Event(ev, { bubbles: true, cancelable: true }))
     );
   }
 
-  // ── Detect whether TikTok accepted or rejected the file ───────────────────
+  // ── Detect upload result ──────────────────────────────────────────────────
   const ERROR_RE = /over.*\d+.?min|minute.*limit|size.*too|too.*large|file.*too|maximum.*size|not.*support|unsupport|invalid.*file|upload.*fail/i;
   const SUCCESS_SEL = '[class*="DraftEditor"],[data-placeholder*="description" i],[data-placeholder*="caption" i],div[contenteditable][class*="editor"]';
 
-  async function checkUpload(timeoutMs = 15000) {
+  async function checkUpload(ms = 20000) {
     const start = Date.now();
-    while (Date.now() - start < timeoutMs) {
-      await sleep(600);
+    while (Date.now() - start < ms) {
+      await sleep(700);
       const text = document.body.innerText || '';
-      if (ERROR_RE.test(text)) {
-        const m = text.match(ERROR_RE);
-        dbg(`TikTok rejected: "${m?.[0]}"`);
-        return 'rejected';
-      }
-      if (document.querySelector(SUCCESS_SEL)) {
-        dbg('Upload accepted — editor visible');
-        return 'accepted';
-      }
+      if (ERROR_RE.test(text)) { dbg(`TikTok error: "${text.match(ERROR_RE)?.[0]}"`); return 'rejected'; }
+      if (document.querySelector(SUCCESS_SEL)) { dbg('Upload accepted — editor visible'); return 'accepted'; }
     }
-    // Final check
-    if (ERROR_RE.test(document.body.innerText)) return 'rejected';
-    if (document.querySelector(SUCCESS_SEL)) return 'accepted';
-    return 'timeout';
+    return ERROR_RE.test(document.body.innerText) ? 'rejected' : 'timeout';
   }
 
-  // ── Fill caption ──────────────────────────────────────────────────────────
-  async function fillCaption() {
-    const sels = [
-      '[class*="DraftEditor-content"]',
-      '[contenteditable="true"][class*="editor" i]',
-      '[data-placeholder*="description" i]',
-      'div[contenteditable="true"]',
-    ];
-    let box = null;
-    for (let att = 0; att < 8 && !box; att++) {
-      for (const s of sels) { box = document.querySelector(s); if (box) break; }
-      if (!box) await sleep(500);
-    }
-    if (box) {
-      box.focus(); await sleep(300);
-      document.execCommand('selectAll', false, null);
-      document.execCommand('insertText', false, caption);
-      dbg('Caption filled');
-      return true;
-    }
-    dbg('Caption box not found');
-    return false;
-  }
-
-  // ── Add sound ─────────────────────────────────────────────────────────────
-  async function addSound() {
-    if (!songName) return;
-    await sleep(600);
-    const btn = [...document.querySelectorAll('button,[role="button"]')]
-      .find(el => /add\s*(sound|music)/i.test(el.textContent || el.getAttribute('aria-label') || ''));
-    if (!btn) { dbg('Add Sound button not found'); return; }
-    btn.click(); await sleep(1200);
-    const input = document.querySelector('input[placeholder*="Search" i],input[type="search"]');
-    if (!input) { dbg('Music search input not found'); return; }
-    input.focus(); await sleep(200);
-    input.value = songName;
-    input.dispatchEvent(new Event('input', { bubbles: true }));
-    await sleep(2000);
-    const first = document.querySelector('[class*="music-item"]:first-child,[class*="MusicItem"]:first-child,[class*="sound-item"]:first-child');
-    if (first) { first.click(); dbg(`Sound selected: ${songName}`); }
-    else dbg('No sound results');
-  }
-
-  // ══════════════════════════════════════════════════════════════════════════
+  // ════════════════════════════════════════════════════════════════════════════
   // MAIN FLOW
-  // ══════════════════════════════════════════════════════════════════════════
+  // ════════════════════════════════════════════════════════════════════════════
   (async () => {
-    await sleep(2000); // let TikTok hydrate
+    await sleep(2000);
 
-    if (!tiktokVideoDataUrl) {
-      banner(1, '⚠️ No video data available. Please retry the export.', 'warn');
-      return;
-    }
+    // ── Step 1: Build video from images ───────────────────────────────────
+    banner(1, `Building ${photoDataUrls.length}-photo slideshow (H.264 720×1280)…`);
+    dbg(`Building video from ${photoDataUrls.length} photos…`);
 
-    const fileName = tiktokVideoPath ? tiktokVideoPath.split('/').pop() : 'tiktok-post.mp4';
-    const sizeMB = (tiktokVideoDataUrl.length * 0.75 / 1024 / 1024).toFixed(1); // approx
-
-    // ── STEP 1: Find the file input and inject the MP4 ─────────────────────
-    banner(1, `Locating TikTok upload area (${sizeMB}MB video)…`);
-    const fileInput = await waitFor('input[type="file"]', 12000);
-
-    if (!fileInput) {
-      banner(1, '⚠️ Upload area not found — please refresh TikTok and retry.', 'warn');
-      return;
-    }
-    dbg(`File input found — injecting ${sizeMB}MB MP4…`);
-
-    banner(1, `Injecting H.264 MP4 (${sizeMB}MB)…`);
-    const file = dataUrlToFile(tiktokVideoDataUrl, fileName);
-    injectFile(fileInput, file);
-    dbg('DataTransfer injection sent');
-
-    // ── STEP 2: Wait for TikTok to accept ──────────────────────────────────
-    banner(2, 'Waiting for TikTok to process the video…');
-    const result = await checkUpload(20000);
-
-    if (result === 'rejected') {
-      // TikTok rejected the injected file — fall back to manual selection
-      const folder = tiktokVideoPath ? tiktokVideoPath.replace(fileName, '').replace(/\/$/, '') : 'FoodFluencer';
-      banner(2,
-        `Automatic injection failed — please select the file manually:<br>
-         <strong>1.</strong> Click the TikTok upload area<br>
-         <strong>2.</strong> Go to <code>Downloads → ${folder.split('/').pop()}</code><br>
-         <strong>3.</strong> Select <strong style="color:#ffd700">${fileName}</strong>`,
-        'warn'
-      );
-      dbg('Waiting for manual selection (120s timeout)…');
-      // Wait for manual selection
-      const manual = await waitFor(SUCCESS_SEL, 120000);
-      if (!manual) {
-        banner(2, '⚠️ Upload not detected. Please retry.', 'warn');
+    let videoFile = null;
+    try {
+      const { blob, type, ext } = await buildH264MP4(photoDataUrls);
+      const sizeMB = (blob.size / 1024 / 1024).toFixed(1);
+      dbg(`Video ready: ${sizeMB}MB ${type}`);
+      videoFile = new File([blob], `tiktok-post.${ext}`, { type });
+      banner(1, `Video ready (${sizeMB}MB, ${type}) — uploading…`);
+    } catch(e) {
+      dbg(`Video build failed: ${e.message}`);
+      banner(1, `⚠️ Video build failed: ${e.message}. Retrying with simpler format…`, 'warn');
+      // Ultimate fallback: single-frame JPEG as "video"
+      try {
+        const fallback = await buildH264MP4([photoDataUrls[0]]);
+        videoFile = new File([fallback.blob], `tiktok-post.${fallback.ext}`, { type: fallback.type });
+        dbg('Fallback single-photo video created');
+      } catch(e2) {
+        banner(1, `⚠️ Could not create video: ${e2.message}`, 'warn');
         return;
       }
-      dbg('Manual upload accepted');
-    } else if (result === 'timeout') {
-      dbg('Timeout waiting for acceptance — proceeding anyway');
     }
 
-    // ── STEP 3: Fill caption ───────────────────────────────────────────────
-    banner(3, 'Filling description…');
-    await sleep(2000); // wait for editor to fully render
-    await fillCaption();
+    // ── Step 2: Find file input and inject ────────────────────────────────
+    banner(2, 'Locating TikTok upload area…');
+    const fileInput = await waitFor('input[type="file"]', 12000);
+    if (!fileInput) { banner(2, '⚠️ Upload area not found. Refresh TikTok and retry.', 'warn'); return; }
 
-    // ── STEP 4: Add sound ──────────────────────────────────────────────────
+    dbg(`Injecting ${(videoFile.size/1024/1024).toFixed(1)}MB into file input…`);
+    injectFile(fileInput, videoFile);
+
+    // ── Step 3: Wait for TikTok to process ───────────────────────────────
+    banner(3, 'Waiting for TikTok to process video…');
+    const result = await checkUpload(25000);
+
+    if (result === 'rejected') {
+      banner(3, '⚠️ TikTok rejected the video. Check the error message on the page.', 'warn');
+      dbg('Upload rejected — TikTok showed an error');
+      return;
+    }
+
+    if (result === 'timeout') {
+      dbg('Timeout — proceeding to caption anyway');
+    }
+
+    // ── Step 4: Ready — add caption & sound manually / via bot ───────────
+    await sleep(2000);
+
+    // Fill description if box is visible
+    const descSels = ['.public-DraftEditor-content','[contenteditable="true"][class*="editor" i]',
+      '[data-placeholder*="description" i]','div[contenteditable="true"]'];
+    let descBox = null;
+    for (let att=0; att<6&&!descBox; att++) {
+      for (const s of descSels) { descBox=document.querySelector(s); if(descBox) break; }
+      if (!descBox) await sleep(500);
+    }
+    if (descBox && caption) {
+      descBox.focus(); await sleep(200);
+      document.execCommand('selectAll',false,null);
+      document.execCommand('insertText',false,caption);
+      dbg('Caption filled');
+    }
+
     if (songName) {
-      banner(3, `Adding sound: <em>"${songName}"</em>…`);
-      await addSound();
+      await sleep(600);
+      const soundBtn = [...document.querySelectorAll('button,[role="button"]')]
+        .find(el => /add\s*(sound|music)/i.test(el.textContent||el.getAttribute('aria-label')||''));
+      if (soundBtn) {
+        soundBtn.click(); await sleep(1200);
+        const mi = document.querySelector('input[placeholder*="Search" i],input[type="search"]');
+        if (mi) {
+          mi.focus(); await sleep(200); mi.value=songName;
+          mi.dispatchEvent(new Event('input',{bubbles:true}));
+          await sleep(2000);
+          const fr = document.querySelector('[class*="music-item"]:first-child,[class*="MusicItem"]:first-child');
+          if (fr) { fr.click(); dbg(`Sound: ${songName}`); }
+        }
+      }
     }
 
-    // ── Done ───────────────────────────────────────────────────────────────
     const note = songName ? ` 🎵 Verify "<em>${songName}</em>" is set.` : '';
-    banner(4,
-      `✅ All ready! Review and click <strong>Post</strong> to publish.${note}`,
-      'success'
-    );
-    dbg('Bot complete — awaiting Post click');
+    banner(4, `✅ Video uploaded! Review &amp; click <strong>Post</strong>.${note}`, 'success');
+    dbg('Bot complete');
   })();
 }
 

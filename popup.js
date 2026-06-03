@@ -619,38 +619,8 @@ async function exportAndPost() {
     if (photoDataUrls.length > 0) {
       AppLog.info(`Sending ${photoDataUrls.length} photos to ${platforms.join(", ")}`);
 
-      // For TikTok: create H.264 MP4 in popup (has WebCodecs + full Web API).
-      // Pass the encoded bytes directly to the injector via executeScript args.
-      // The injector injects via DataTransfer — same mechanism that works for Instagram.
-      let tiktokVideoDataUrl = null;
-      if (platforms.includes("tiktok")) {
-        try {
-          setStatus("Creating TikTok video (H.264 MP4)…");
-          AppLog.info("Creating TikTok MP4", { photos: photoDataUrls.length });
-
-          const mp4Blob = await createTikTokMP4(photoDataUrls, (done, total) => {
-            setStatus(`Creating TikTok video… photo ${done}/${total}`);
-          });
-
-          const sizeMB = (mp4Blob.size / 1024 / 1024).toFixed(1);
-          AppLog.info(`TikTok video created: ${sizeMB}MB, type: ${mp4Blob.type}`);
-          setStatus(`TikTok video ready (${sizeMB}MB) — opening TikTok…`);
-
-          // Convert to data URL — JSON-serialisable, passes through executeScript args
-          tiktokVideoDataUrl = await new Promise((res, rej) => {
-            const fr = new FileReader();
-            fr.onload = e => res(e.target.result);
-            fr.onerror = rej;
-            fr.readAsDataURL(mp4Blob);
-          });
-          AppLog.info(`TikTok data URL ready: ${(tiktokVideoDataUrl.length / 1024).toFixed(0)}KB string`);
-
-        } catch (e) {
-          AppLog.error("TikTok video creation failed", String(e));
-          setStatus("⚠️ TikTok video creation failed: " + e.message, "error");
-          console.error("[FoodFluencer] TikTok MP4 error:", e);
-        }
-      }
+      // TikTok: video is built INSIDE the injector from photoDataUrls.
+      // No pre-processing needed here — injector receives photoDataUrls directly.
 
       for (const platform of platforms) {
         setStatus(`Opening ${platform}…`);
@@ -658,7 +628,6 @@ async function exportAndPost() {
           type: "OPEN_SOCIAL", platform, photoDataUrls, caption, songName,
           location:         currentRestaurant.address || "",
           restaurantName:   currentRestaurant.name    || "",
-          tiktokVideoDataUrl: platform === "tiktok" ? (tiktokVideoDataUrl || null) : null,
         });
         await new Promise(r => setTimeout(r, 900));
       }
