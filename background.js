@@ -906,47 +906,27 @@ function injectTikTok(photoDataUrls, caption, songName, location, opts) {
     }
     if (!imgs.length) throw new Error('No images loaded');
 
-    // Set up audio
-    const audioTracks = [];
-    let audCtx = null, audSrc = null;
-    if (audDataUrl) {
-      try {
-        audCtx = new (window.AudioContext || window.webkitAudioContext)();
-        const b64 = audDataUrl.split(',')[1];
-        const raw = atob(b64);
-        const buf = new Uint8Array(raw.length);
-        for (let i = 0; i < raw.length; i++) buf[i] = raw.charCodeAt(i);
-        const decoded = await audCtx.decodeAudioData(buf.buffer);
-        const dest = audCtx.createMediaStreamDestination();
-        audSrc = audCtx.createBufferSource();
-        audSrc.buffer = decoded;
-        audSrc.connect(dest);
-        dest.stream.getAudioTracks().forEach(t => audioTracks.push(t));
-        dbg('Audio track ready');
-      } catch(e) { dbg(`Audio setup skipped: ${e.message}`); }
-    }
-
-    // Choose best supported codec
+    // VIDEO-ONLY recording (no audio track in the stream).
+    // Reason: adding an AudioBuffer of 30s (iTunes preview) to the MediaStream
+    // causes TikTok to read the audio track duration as the video duration,
+    // triggering the "over 60-minute limit" rejection.
+    // The song is added AFTER upload via TikTok's native "Add Sound" panel.
     const mimeType = [
-      'video/webm;codecs=vp9,opus',
-      'video/webm;codecs=vp8,opus',
+      'video/webm;codecs=vp9',
+      'video/webm;codecs=vp8',
       'video/webm',
     ].find(t => MediaRecorder.isTypeSupported(t)) || 'video/webm';
-    dbg(`Recording as ${mimeType}`);
+    dbg(`Recording video-only as ${mimeType}`);
 
-    const videoStream = canvas.captureStream(25);
-    audioTracks.forEach(t => videoStream.addTrack(t));
-
+    const videoStream = canvas.captureStream(25); // no audio tracks added
     const recorder = new MediaRecorder(videoStream, { mimeType, videoBitsPerSecond: 2_500_000 });
     const chunks = [];
     recorder.ondataavailable = e => { if (e.data.size > 0) chunks.push(e.data); };
     recorder.start(100);
-    if (audSrc) audSrc.start();
 
     // Draw each photo for secPerSlide seconds
     for (let i = 0; i < imgs.length; i++) {
       const img = imgs[i];
-      // Black background + contain-fit
       ctx.fillStyle = '#111';
       ctx.fillRect(0, 0, W, H);
       const s  = Math.min(W / img.naturalWidth, H / img.naturalHeight);
@@ -957,8 +937,6 @@ function injectTikTok(photoDataUrls, caption, songName, location, opts) {
     }
 
     recorder.stop();
-    try { if (audSrc) audSrc.stop(); } catch(_) {}
-    try { if (audCtx) audCtx.close(); } catch(_) {}
 
     const rawBlob = await new Promise((res, rej) => {
       recorder.onstop = () => res(new Blob(chunks, { type: 'video/webm' }));
@@ -973,7 +951,7 @@ function injectTikTok(photoDataUrls, caption, songName, location, opts) {
   }
 
   (async () => {
-    const total = 4;
+    const total = songName ? 5 : 4; // +1 if adding sound
 
     // ①  Build the slideshow video
     const secPerSlide  = 1.2; // 1.2s per photo → 5 photos = 6s total
@@ -1008,7 +986,7 @@ function injectTikTok(photoDataUrls, caption, songName, location, opts) {
     dbg('Video file injected — waiting for TikTok to process…');
     await sleep(6000); // TikTok needs time to transcode
 
-    // ③  Fill description
+    // ③  Fill description / caption
     step(3, total, 'Filling description…');
     const descSels = [
       '.public-DraftEditor-content',
@@ -1025,9 +1003,51 @@ function injectTikTok(photoDataUrls, caption, songName, location, opts) {
       dbg('Description filled');
     } else { dbg('Description box not found'); }
 
-    // ④  Done — stop here, user reviews and clicks Post
-    step(4, total,
-      `✅ Video ready!${audioDataUrl ? ' 🎵 Song included.' : ''} Review and click <strong>Post</strong> to publish.`,
+    // ④  Add song via TikTok's native "Add Sound" panel
+    //    (song is NOT baked into the video to avoid duration metadata issues)
+    if (songName) {
+      await sleep(1000);
+      step(4, total, `Adding sound: <em>"${songName}"</em>…`);
+
+      // Find the "Add sound" button
+      let soundBtn = null;
+      const soundSels = [
+        'button[class*="sound" i]', '[class*="add-sound" i]',
+        'button[aria-label*="sound" i]', 'button[aria-label*="music" i]',
+      ];
+      for (const s of soundSels) { soundBtn = document.querySelector(s); if (soundBtn) break; }
+      if (!soundBtn) {
+        soundBtn = [...document.querySelectorAll('button,[role="button"]')]
+          .find(el => /add\s*(sound|music)/i.test(el.textContent || el.getAttribute('aria-label') || ''));
+      }
+
+      if (soundBtn) {
+        soundBtn.click(); await sleep(1200);
+        const musicInput = document.querySelector('input[placeholder*="Search" i], input[type="search"]');
+        if (musicInput) {
+          musicInput.focus(); await sleep(200);
+          musicInput.value = songName;
+          musicInput.dispatchEvent(new Event('input', { bubbles: true }));
+          await sleep(2000);
+          const firstResult = document.querySelector(
+            '[class*="music-item"]:first-child, [class*="sound-item"]:first-child, [class*="MusicItem"]:first-child'
+          );
+          if (firstResult) {
+            firstResult.click(); await sleep(600);
+            dbg(`Sound selected: ${songName}`);
+          } else {
+            dbg('No sound results — user must add manually');
+          }
+        }
+      } else {
+        dbg('Add Sound button not found — user must add manually');
+      }
+    }
+
+    // ⑤  Done — stop here, user reviews and clicks Post
+    const songNote = songName ? ` 🎵 Verify <em>"${songName}"</em> is added as sound.` : '';
+    step(total, total,
+      `✅ Video ready! Review description &amp; sound.${songNote} Click <strong>Post</strong> to publish.`,
       'success');
     dbg('Bot complete — awaiting manual Post click');
   })();
