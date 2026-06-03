@@ -188,6 +188,19 @@ h1 { font-size: 0.95rem; font-weight: 700; line-height: 1.2; }
 .song-name   { font-size: 0.78rem; font-weight: 600; display: block; }
 .song-artist { font-size: 0.71rem; color: var(--muted); display: block; }
 
+/* ── Caption editor ──────────────────────────────────────────────────────── */
+.section-header {
+  display: flex; align-items: center; justify-content: space-between; margin-bottom: 7px;
+}
+.section-header .section-label { margin-bottom: 0; }
+.caption-input {
+  width: 100%; background: var(--bg); border: 1.5px solid var(--border);
+  border-radius: var(--radius); padding: 8px 10px; font-size: 0.8rem;
+  font-family: inherit; color: var(--text); resize: vertical; outline: none;
+  transition: border-color .15s; line-height: 1.55;
+}
+.caption-input:focus { border-color: var(--accent); }
+
 /* ── Social platform icons ───────────────────────────────────────────────── */
 .social-icons { display: flex; gap: 8px; }
 .social-btn {

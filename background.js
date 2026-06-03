@@ -40,8 +40,8 @@ async function handleSocialPost({ platform, photoDataUrls, caption, songName }) 
     chrome.tabs.onUpdated.addListener(listener);
   });
 
-  // Extra buffer for SPA hydration
-  await new Promise(r => setTimeout(r, 1800));
+  // Extra buffer for SPA hydration (Facebook especially needs this)
+  await new Promise(r => setTimeout(r, 3000));
 
   try {
     await chrome.scripting.executeScript({
@@ -118,23 +118,61 @@ function injectFacebook(photoDataUrls, caption, songName) {
   (async () => {
     const total = songName ? 5 : 4;
 
-    // ①  Open composer
+    // ①  Find and open post composer (multiple strategies + retry)
     step(1, total, 'Opening post composer…');
-    const triggerSels = [
-      '[aria-placeholder="What\'s on your mind?"]',
-      '[placeholder="What\'s on your mind?"]',
-    ];
+
+    function findComposerTrigger() {
+      // 1. Direct aria/placeholder attributes
+      const attrSels = [
+        '[aria-label="Create a post"]',
+        '[aria-label="Create Post"]',
+        '[aria-placeholder*="mind" i]',
+        '[placeholder*="mind" i]',
+        '[aria-placeholder*="What" i]',
+      ];
+      for (const s of attrSels) {
+        const el = document.querySelector(s); if (el) return el;
+      }
+      // 2. Scan all interactive elements for "What's on your mind" text
+      const interactive = document.querySelectorAll(
+        '[role="button"], [role="textbox"], [tabindex="0"], input, [contenteditable]'
+      );
+      for (const el of interactive) {
+        const combined = [
+          el.textContent,
+          el.getAttribute('aria-label'),
+          el.getAttribute('aria-placeholder'),
+          el.getAttribute('placeholder'),
+        ].join(' ').toLowerCase();
+        if (combined.includes("what") && combined.includes("mind")) return el;
+      }
+      // 3. Fallback: find the first large prominent button in the main feed area
+      const main = document.querySelector('[role="main"]') || document.body;
+      const bigBtns = [...main.querySelectorAll('[role="button"]')]
+        .filter(el => el.offsetWidth > 180 && el.offsetHeight > 28);
+      // Pick the one nearest the top of the page
+      bigBtns.sort((a, b) => a.getBoundingClientRect().top - b.getBoundingClientRect().top);
+      if (bigBtns[0]) return bigBtns[0];
+      return null;
+    }
+
+    // Retry up to 5 times with 1-second gaps (Facebook hydrates slowly)
     let trigger = null;
-    for (const s of triggerSels) { trigger = document.querySelector(s); if (trigger) break; }
-    if (!trigger) trigger = [...document.querySelectorAll('[role="button"]')]
-      .find(el => el.textContent.includes("What's on your mind"));
+    for (let attempt = 0; attempt < 5; attempt++) {
+      trigger = findComposerTrigger();
+      if (trigger) break;
+      await sleep(1000);
+    }
 
     if (!trigger) {
-      step(1, total, 'Could not find post composer — click <strong>"What\'s on your mind?"</strong> manually.', 'warn');
+      step(1, total,
+        'Could not open composer automatically. Please click <strong>"What\'s on your mind?"</strong> in Facebook, then click <strong>Photo/Video</strong> and select photos from <strong>Downloads/FoodFluencer</strong>.',
+        'warn'
+      );
       return;
     }
     trigger.click();
-    await sleep(1400);
+    await sleep(1600);
 
     // ②  Click Photo/Video button
     step(2, total, 'Clicking <strong>Photo/Video</strong>…');

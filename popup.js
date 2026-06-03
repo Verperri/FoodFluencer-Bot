@@ -28,24 +28,83 @@ const BELGIAN_RESTAURANTS = [
 
 let API_KEY           = "";
 let currentRestaurant = null;
-const uriCache        = new Map(); // photoName|maxWidth → photoUri
+const uriCache        = new Map(); // "photoName|maxWidth" → uri
 let selectedSong      = null;
 let activePlatforms   = new Set();
 
 const $ = id => document.getElementById(id);
 
+// ── State persistence ─────────────────────────────────────────────────────────
+
+function saveState() {
+  if (!currentRestaurant) return;
+  chrome.storage.local.set({
+    lastState: {
+      restaurant:      currentRestaurant,
+      uriCacheEntries: [...uriCache.entries()],
+      selectedSong,
+      caption:         $("caption")?.value || "",
+      activePlatforms: [...activePlatforms],
+    },
+  });
+}
+
+// Debounced save for caption edits
+let _saveTimer = null;
+function saveStateSoon() { clearTimeout(_saveTimer); _saveTimer = setTimeout(saveState, 600); }
+
+function restoreState(saved) {
+  if (!saved?.restaurant) return;
+
+  // Restore URI cache
+  (saved.uriCacheEntries || []).forEach(([k, v]) => uriCache.set(k, v));
+
+  // Restore restaurant
+  currentRestaurant = saved.restaurant;
+
+  $("restaurantName").textContent    = currentRestaurant.name;
+  $("restaurantAddress").textContent = currentRestaurant.address;
+  $("restaurantMeta").textContent    = currentRestaurant.rating
+    ? `⭐ ${currentRestaurant.rating} · ${(currentRestaurant.totalRatings || 0).toLocaleString()} ratings` : "";
+
+  const link = $("restaurantMapsLink");
+  link.href = currentRestaurant.mapsUrl || "#";
+  link.style.display = currentRestaurant.mapsUrl ? "inline" : "none";
+
+  $("query").value = currentRestaurant.name;
+
+  renderPhotoGrid();
+
+  // Restore song
+  if (saved.selectedSong) {
+    selectedSong = saved.selectedSong;
+    $("selectedSongArt").src            = selectedSong.artwork;
+    $("selectedSongName").textContent   = selectedSong.name;
+    $("selectedSongArtist").textContent = selectedSong.artist;
+    $("selectedSong").classList.remove("hidden");
+  }
+
+  // Restore caption
+  if ($("caption")) $("caption").value = saved.caption || buildDefaultCaption();
+
+  // Restore platforms
+  (saved.activePlatforms || []).forEach(p => {
+    activePlatforms.add(p);
+    document.querySelector(`.social-btn[data-platform="${p}"]`)?.classList.add("active");
+  });
+
+  $("results").classList.remove("hidden");
+}
+
 // ── Init ──────────────────────────────────────────────────────────────────────
 
 chrome.storage.local.get(
-  { googleApiKey: "", activePlatforms: [] },
-  ({ googleApiKey, activePlatforms: saved }) => {
+  { googleApiKey: "", lastState: null },
+  ({ googleApiKey, lastState }) => {
     API_KEY = googleApiKey;
-    saved.forEach(p => {
-      activePlatforms.add(p);
-      document.querySelector(`.social-btn[data-platform="${p}"]`)?.classList.add("active");
-    });
     showKeySetup(!API_KEY);
     checkUsageWarning();
+    if (API_KEY && lastState) restoreState(lastState);
   }
 );
 
@@ -169,7 +228,6 @@ async function resolvePhotoUri(photoName, maxWidth = 400) {
 // ── Render restaurant ─────────────────────────────────────────────────────────
 
 function renderResults(place) {
-  // Store ALL photos from API (up to ~10); display first MAX_PHOTOS
   const allPhotos = (place.photos || [])
     .sort((a, b) => (b.width || 0) - (a.width || 0))
     .map(p => ({ name: p.name }));
@@ -181,7 +239,7 @@ function renderResults(place) {
     totalRatings: place.userRatingCount,
     mapsUrl:      place.googleMapsUri     || "",
     allPhotos,
-    photos: allPhotos.slice(0, CONFIG.MAX_PHOTOS), // currently shown
+    photos: allPhotos.slice(0, CONFIG.MAX_PHOTOS),
   };
 
   $("restaurantName").textContent    = currentRestaurant.name;
@@ -194,7 +252,12 @@ function renderResults(place) {
   link.style.display = currentRestaurant.mapsUrl ? "inline" : "none";
 
   renderPhotoGrid();
+
+  // Auto-fill caption on fresh search (not restore)
+  if ($("caption")) $("caption").value = buildDefaultCaption();
+
   $("results").classList.remove("hidden");
+  saveState();
 }
 
 function renderPhotoGrid() {
@@ -236,11 +299,9 @@ async function dismissPhoto(index) {
   const shownNames = new Set(photos.map(p => p.name));
   const next = allPhotos.find(p => !shownNames.has(p.name));
 
-  const grid = $("photoGrid");
-  const slot = grid.querySelector(`[data-slot="${index}"]`);
+  const slot = $("photoGrid").querySelector(`[data-slot="${index}"]`);
 
   if (next) {
-    // Replace in-place
     photos[index] = next;
     slot.classList.add("replacing");
     slot.innerHTML = `<div class="loading-thumb">Loading…</div>`;
@@ -253,19 +314,50 @@ async function dismissPhoto(index) {
       slot.innerHTML = `<div class="loading-thumb">Unavailable</div>`;
     }
   } else {
-    // No more replacements — remove slot and re-index
     photos.splice(index, 1);
     renderPhotoGrid();
   }
+  saveState();
 }
 
-// Build caption string (used internally — not shown in UI)
-function buildCaption() {
+// ── Caption ───────────────────────────────────────────────────────────────────
+
+function buildDefaultCaption() {
   if (!currentRestaurant) return "";
-  let text = `📍 ${currentRestaurant.name}\n${currentRestaurant.address}`;
-  if (selectedSong) text += `\n🎵 ${selectedSong.name} – ${selectedSong.artist}`;
+  const { name, address, rating } = currentRestaurant;
+
+  // Extract city for hashtags
+  const cityMatch = address.match(/\d{4}\s+([A-Za-zÀ-ÿ\s-]+),\s*Belgium/i);
+  const city      = (cityMatch?.[1] || "Belgium").trim().replace(/\s+/g, "");
+
+  let text = `📍 ${name}\n📌 ${address}`;
+  if (rating) text += `\n⭐ ${rating}/5`;
+  if (selectedSong) text += `\n\n🎵 ${selectedSong.name} – ${selectedSong.artist}`;
+  text += `\n\n#${city} #BelgianFood #FoodFluencer #Foodie #FoodPhotography #Restaurant #Belgium`;
   return text;
 }
+
+// Update just the song line in the caption without overwriting the user's edits
+function updateCaptionSongLine() {
+  const el = $("caption");
+  if (!el) return;
+  let text = el.value;
+  // Remove existing song line
+  text = text.replace(/\n🎵 .+/g, "").trimEnd();
+  // Re-append if a song is selected
+  if (selectedSong) text += `\n🎵 ${selectedSong.name} – ${selectedSong.artist}`;
+  el.value = text;
+  saveState();
+}
+
+// Regenerate button
+$("refreshCaptionBtn")?.addEventListener("click", () => {
+  if ($("caption")) $("caption").value = buildDefaultCaption();
+  saveState();
+});
+
+// Save caption on edit (debounced)
+$("caption")?.addEventListener("input", saveStateSoon);
 
 // ── Search ────────────────────────────────────────────────────────────────────
 
@@ -282,6 +374,9 @@ async function doSearch(query) {
   if (!API_KEY) { setStatus("Please save your API key first.", "error"); return; }
   setStatus("Searching…");
   $("results").classList.add("hidden");
+  // Clear song for a fresh search
+  selectedSong = null;
+  $("selectedSong")?.classList.add("hidden");
   try {
     const place = await searchRestaurant(query);
     renderResults(place);
@@ -306,7 +401,7 @@ document.querySelectorAll(".social-btn").forEach(btn => {
     const p = btn.dataset.platform;
     activePlatforms.has(p) ? activePlatforms.delete(p) : activePlatforms.add(p);
     btn.classList.toggle("active", activePlatforms.has(p));
-    chrome.storage.local.set({ activePlatforms: [...activePlatforms] });
+    saveState();
   });
 });
 
@@ -359,18 +454,19 @@ function selectSong(song) {
   $("selectedSongName").textContent   = song.name;
   $("selectedSongArtist").textContent = song.artist;
   $("selectedSong").classList.remove("hidden");
+  updateCaptionSongLine();
 }
 
 $("removeSongBtn").addEventListener("click", () => {
   selectedSong = null;
   $("selectedSong").classList.add("hidden");
+  updateCaptionSongLine();
 });
 
 // ── Export & Post ─────────────────────────────────────────────────────────────
 
 $("exportBtn").addEventListener("click", exportAndPost);
 
-// Resize + convert a photo URI to a compact JPEG data URL for injection
 async function photoToDataUrl(uri, maxWidth = 900) {
   const res    = await fetch(uri);
   const blob   = await res.blob();
@@ -387,7 +483,7 @@ async function exportAndPost() {
   if (!currentRestaurant) return;
 
   const { name, address, photos } = currentRestaurant;
-  const caption   = buildCaption();
+  const caption   = $("caption")?.value.trim() || buildDefaultCaption();
   const songName  = selectedSong?.name || "";
   const timestamp = new Date().toISOString().replace(/[:.]/g, "-").slice(0, 19);
   const safeName  = name.replace(/[/\\?%*:|"<>]/g, "_");
@@ -396,14 +492,12 @@ async function exportAndPost() {
   $("exportBtn").disabled = true;
   setStatus("Resolving photos…");
 
-  // 1. Resolve all photo URIs at full resolution
   const photoUris = [];
   for (const photo of photos) {
     try { photoUris.push(await resolvePhotoUri(photo.name, 1200)); }
     catch (e) { console.warn("Photo resolve failed:", e); }
   }
 
-  // 2. Download all photos to disk
   setStatus("Saving photos…");
   photoUris.forEach((uri, i) => {
     chrome.runtime.sendMessage({
@@ -412,7 +506,6 @@ async function exportAndPost() {
     });
   });
 
-  // 3. Save info note
   const noteLines = [
     `Restaurant : ${name}`, `Address    : ${address}`,
     `Exported   : ${new Date().toLocaleString()}`, `Photos     : ${photos.length}`,
@@ -425,7 +518,6 @@ async function exportAndPost() {
     filename: `${folder}/info.txt`,
   });
 
-  // 4. Persist export log
   chrome.storage.local.get({ exportLog: [] }, ({ exportLog }) => {
     exportLog.push({ timestamp, name, address, photos: photos.length, folder,
       song: selectedSong ? `${selectedSong.name} – ${selectedSong.artist}` : null,
@@ -433,10 +525,9 @@ async function exportAndPost() {
     chrome.storage.local.set({ exportLog });
   });
 
-  // 5. Open social platforms with ALL photos pre-loaded
   const platforms = [...activePlatforms];
   if (platforms.length > 0 && photoUris.length > 0) {
-    setStatus(`Resizing ${photoUris.length} photos for social media…`);
+    setStatus(`Resizing ${photoUris.length} photos…`);
     const photoDataUrls = [];
     for (const uri of photoUris) {
       try { photoDataUrls.push(await photoToDataUrl(uri)); }
@@ -449,7 +540,7 @@ async function exportAndPost() {
         chrome.runtime.sendMessage({ type: "OPEN_SOCIAL", platform, photoDataUrls, caption, songName });
         await new Promise(r => setTimeout(r, 900));
       }
-      setStatus(`✅ Opened ${platforms.join(", ")} — ${photoDataUrls.length} photos &amp; caption injected!`, "success");
+      setStatus(`✅ Opened ${platforms.join(", ")} — ${photoDataUrls.length} photos & caption ready!`, "success");
     } else {
       setStatus("⚠️ Could not prepare photos for social media.", "error");
     }
