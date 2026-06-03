@@ -31,7 +31,7 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
 // ── Social post handler ───────────────────────────────────────────────────────
 
 const PLATFORM_URLS = {
-  instagram: "https://www.instagram.com/",
+  instagram: "https://www.instagram.com/create/select/",
   facebook:  "https://www.facebook.com/",
   tiktok:    "https://www.tiktok.com/upload",
 };
@@ -246,12 +246,14 @@ function injectFacebook(photoDataUrls, caption, songName) {
 }
 
 // ─── Instagram ────────────────────────────────────────────────────────────────
+// Navigate directly to /create/select/ — this opens the upload dialog immediately,
+// bypassing the Create → Post sub-menu entirely.
 
 function injectInstagram(photoDataUrls, caption, songName, location) {
   const sleep = ms => new Promise(r => setTimeout(r, ms));
 
-  // Poll for an element matching selector, with retries
-  const waitFor = (sel, ms = 10000) => new Promise(res => {
+  // Poll for any selector, returns the element or null after timeout
+  const waitFor = (sel, ms = 12000) => new Promise(res => {
     const el = document.querySelector(sel); if (el) return res(el);
     const t = Date.now(); const iv = setInterval(() => {
       const e = document.querySelector(sel);
@@ -260,16 +262,17 @@ function injectInstagram(photoDataUrls, caption, songName, location) {
     }, 300);
   });
 
-  // Poll for a role="button" whose visible text or aria-label matches a string/regex
-  const waitForBtn = (match, ms = 10000) => new Promise(res => {
-    const find = () => [...document.querySelectorAll('[role="button"],button')]
-      .find(el => {
-        const txt = (el.textContent || '').trim();
-        const lbl = el.getAttribute('aria-label') || '';
-        return typeof match === 'string'
-          ? txt === match || lbl === match
-          : match.test(txt) || match.test(lbl);
-      });
+  // Poll for a button/link whose VISIBLE text or aria-label matches
+  const waitForBtn = (match, ms = 12000) => new Promise(res => {
+    const find = () => [...document.querySelectorAll(
+      '[role="button"], button, a, [tabindex="0"]'
+    )].find(el => {
+      const txt = (el.innerText || el.textContent || '').trim();
+      const lbl = el.getAttribute('aria-label') || '';
+      return typeof match === 'string'
+        ? txt === match || lbl === match
+        : match.test(txt) || match.test(lbl);
+    });
     const el = find(); if (el) return res(el);
     const t = Date.now(); const iv = setInterval(() => {
       const e = find();
@@ -286,16 +289,6 @@ function injectInstagram(photoDataUrls, caption, songName, location) {
     return new File([arr], name, { type: mime });
   }
 
-  function setFilesOnInput(input, files) {
-    const dt = new DataTransfer();
-    files.forEach(f => dt.items.add(f));
-    const setter = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'files')?.set;
-    if (setter) setter.call(input, dt.files); else input.files = dt.files;
-    ['change', 'input'].forEach(ev =>
-      input.dispatchEvent(new Event(ev, { bubbles: true })));
-  }
-
-  // Also try dispatching a synthetic drop event on a drop zone (fallback)
   function dropFilesOn(zone, files) {
     const dt = new DataTransfer();
     files.forEach(f => dt.items.add(f));
@@ -324,176 +317,81 @@ function injectInstagram(photoDataUrls, caption, songName, location) {
   }
 
   (async () => {
-    // Steps: create+post(1) upload(2) crop-Next(3) edit-Next(4) caption(5) location(6) [song(7)]
-    const total = location ? (songName ? 7 : 6) : (songName ? 6 : 5);
+    // Steps: upload(1) crop-Next(2) edit-Next(3) caption(4) location(5) [+1 if song]
+    const total = location ? (songName ? 6 : 5) : (songName ? 5 : 4);
 
-    // ①  Find & click the Create ("+") button in the sidebar
-    step(1, total, 'Finding Create Post button…');
-    await sleep(2500); // let IG SPA fully render
-
-    // ── Step 1a: click the Create / "+" button ────────────────────────────────
-    function findCreateButton() {
-      // A. Explicit aria-labels Instagram uses on the Create nav item
-      const attrSels = [
-        '[aria-label="New post"]',
-        '[aria-label="Create"]',
-        'a[href="/create/select/"]',
-      ];
-      for (const s of attrSels) {
-        const el = document.querySelector(s);
-        if (el) return el.closest('a,[role="button"],button') || el;
-      }
-      // B. SVG inside the nav whose label says "New post" or "Create"
-      const svg = [...document.querySelectorAll('svg[aria-label]')]
-        .find(s => /new post|create/i.test(s.getAttribute('aria-label')));
-      if (svg) return svg.closest('a,[role="button"],button') || svg;
-      // C. Nav anchor / button whose text is exactly "Create" or "New post"
-      return [...document.querySelectorAll('a,[role="button"]')]
-        .find(el => /^(create|new post)$/i.test((el.textContent || '').trim())) || null;
-    }
-
-    let createBtn = null;
-    for (let i = 0; i < 6 && !createBtn; i++) {
-      createBtn = findCreateButton();
-      if (!createBtn) await sleep(1000);
-    }
-
-    if (!createBtn) {
-      step(1, total,
-        'Could not find the <strong>+</strong> Create button. Please click it manually in the sidebar.',
-        'warn');
-    } else {
-      createBtn.click();
-      step(1, total, 'Create button clicked — selecting Post from menu…');
-    }
-
-    // ── Step 1b: After clicking Create, Instagram shows a panel/menu with
-    //    Post / Story / Reel / Live.  We must click "Post" to open the upload dialog.
-    // Key: use innerText (visible text only) not textContent (includes hidden SVG text).
-    await sleep(1000);
-
-    async function findAndClickPost() {
-      // Broaden the selector to include <a> tags (Instagram uses anchors in the panel)
-      const candidates = [...document.querySelectorAll(
-        'a, button, [role="button"], [role="menuitem"], [role="option"], [tabindex="0"]'
-      )];
-
-      for (const el of candidates) {
-        // Use innerText for visible-only text; fall back to textContent
-        const visText  = (typeof el.innerText !== 'undefined' ? el.innerText : el.textContent || '').trim();
-        const ariaLbl  = el.getAttribute('aria-label') || '';
-
-        if (visText !== 'Post' && ariaLbl !== 'Post') continue;
-
-        // Confirm this is the create-menu "Post", not some other "Post" link on the page,
-        // by checking that nearby context mentions Story / Reel / Live.
-        const ancestor = el.closest(
-          '[role="dialog"], [role="menu"], nav, [aria-label*="Create" i], [aria-label*="create" i]'
-        ) || el.parentElement?.parentElement;
-
-        const ctx = (ancestor?.innerText || ancestor?.textContent || '').toLowerCase();
-        const isCreateMenu = ctx.includes('story') || ctx.includes('reel') || ctx.includes('live');
-
-        if (isCreateMenu || !ancestor) {
-          el.click();
-          return true;
-        }
-      }
-      return false;
-    }
-
-    let postClicked = false;
-    for (let i = 0; i < 12 && !postClicked; i++) {
-      postClicked = await findAndClickPost();
-      if (!postClicked) await sleep(500);
-    }
-
-    if (!postClicked) {
-      step(1, total,
-        'Please click <strong>Post</strong> from the create menu — the bot will continue once the upload dialog opens.',
-        'warn');
-    } else {
-      step(1, total, 'Post selected — waiting for upload dialog…');
-    }
-
-    // Wait for the upload/drop dialog to fully render
-    await waitFor('[role="dialog"]', 12000);
-    await sleep(1200);
-
-    // ②  Inject photos
-    step(2, total, `Uploading <strong>${photoDataUrls.length} photo${photoDataUrls.length > 1 ? 's' : ''}</strong>…`);
+    // ①  Wait for the upload dialog that /create/select/ opens directly
+    step(1, total, 'Waiting for upload dialog…');
+    await sleep(2000); // let the SPA render
 
     const files = photoDataUrls.map((url, i) => dataUrlToFile(url, `restaurant-${i + 1}.jpg`));
 
-    async function injectAndVerify() {
-      // Find the file input — try multiple times
-      let fileInput = null;
-      for (let attempt = 0; attempt < 8 && !fileInput; attempt++) {
-        fileInput = document.querySelector('input[type="file"]');
-        if (fileInput) break;
-        // Click "Select from computer" button if present
-        const selBtn = [...document.querySelectorAll('[role="button"], button')]
-          .find(el => /select.*computer|from.*computer|select.*files/i.test(el.textContent || ''));
-        if (selBtn) { selBtn.click(); await sleep(800); continue; }
-        await sleep(700);
+    // Find the file input with up to 10 retries, clicking "Select from computer" each time
+    let fileInput = null;
+    for (let attempt = 0; attempt < 10 && !fileInput; attempt++) {
+      fileInput = document.querySelector('input[type="file"]');
+      if (fileInput) break;
+      const selBtn = [...document.querySelectorAll('[role="button"], button')]
+        .find(el => /select.*computer|from.*computer|select.*files/i.test(
+          el.innerText || el.textContent || ''));
+      if (selBtn) selBtn.click();
+      await sleep(800);
+    }
+
+    if (!fileInput) {
+      // Fallback: drag-and-drop on the dialog body
+      const dropZone = document.querySelector('[role="dialog"], [class*="drag" i]');
+      if (dropZone) {
+        step(1, total, 'Dragging photos into upload area…');
+        dropFilesOn(dropZone, files);
+        await sleep(4000);
+      } else {
+        step(1, total,
+          'Upload dialog not found. Click <strong>Select from computer</strong> and choose your photos, then the bot will continue.',
+          'warn');
+        // Wait up to 15s for the user to do it manually → then look for Next
+        await waitFor('[role="button"][aria-label="Next"], button', 15000);
       }
-
-      if (!fileInput) return false;
-
-      // Inject files using native React-compatible setter
+    } else {
+      step(1, total, `Uploading <strong>${files.length}</strong> photo${files.length > 1 ? 's' : ''}…`);
+      // Inject via native React-compatible setter
       const dt = new DataTransfer();
       files.forEach(f => dt.items.add(f));
       const nativeSetter = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'files')?.set;
       if (nativeSetter) nativeSetter.call(fileInput, dt.files);
       else fileInput.files = dt.files;
-
-      // Fire events in order React expects
       fileInput.dispatchEvent(new Event('change', { bubbles: true }));
       fileInput.dispatchEvent(new Event('input',  { bubbles: true }));
-
-      // Verify injection succeeded: wait for crop/preview UI (canvas or crop controls)
-      for (let t = 0; t < 15; t++) {
-        await sleep(500);
-        if (document.querySelector('canvas, [aria-label*="crop" i], [data-visualcompletion="ignore-dynamic"]')) {
-          return true; // crop screen appeared
-        }
-      }
-      return false; // timed out waiting for crop screen
     }
 
-    const injected = await injectAndVerify();
-
-    if (!injected) {
-      // Try drag-and-drop fallback on the dialog
-      const dropZone = document.querySelector('[role="dialog"] > *, [class*="drag"], [class*="Drop"]');
-      if (dropZone) {
-        dropFilesOn(dropZone, files);
-        await sleep(3500);
-      } else {
-        step(2, total,
-          `Upload area found but injection failed. Please click <strong>Select from computer</strong> and choose your photos.`,
-          'warn');
-        // Don't abort — user can do it manually
-        await sleep(2000);
-      }
+    // Wait for the crop screen — identified by the "Next" button appearing at the top-right
+    step(1, total, `Photos sent — waiting for Instagram to load the editor…`);
+    const firstNext = await waitForBtn(
+      /^(next|volgende|suivant|weiter|prossimo|siguiente)$/i, 15000
+    );
+    if (!firstNext) {
+      step(1, total,
+        'Editor not loading automatically. Please click the <strong>Next</strong> button when it appears.',
+        'warn');
+      await waitForBtn(/^(next|volgende|suivant)$/i, 20000);
     }
 
-    // ③  Click "Next" through Crop — wait actively up to 10s
-    step(3, total, 'Advancing through crop step…');
-    const cropNext = await waitForBtn(/^(next|volgende|suivant)$/i, 10000);
-    if (cropNext) { cropNext.click(); await sleep(2200); }
-    else { step(3, total, 'Please click <strong>Next</strong> to continue past the crop step.', 'warn'); await sleep(5000); }
+    // ②  Click "Next" → past Crop/Arrange step
+    step(2, total, 'Advancing past the crop step…');
+    const cropBtn = await waitForBtn(/^(next|volgende|suivant|weiter|prossimo|siguiente)$/i, 5000);
+    if (cropBtn) { cropBtn.click(); await sleep(2500); }
+    else { step(2, total, 'Please click <strong>Next</strong> to continue.', 'warn'); await sleep(5000); }
 
-    // ④  Click "Next" through Filters/Edit
-    step(4, total, 'Advancing through edit step…');
-    const editNext = await waitForBtn(/^(next|volgende|suivant)$/i, 10000);
-    if (editNext) { editNext.click(); await sleep(2200); }
-    else { step(4, total, 'Please click <strong>Next</strong> to continue past the edit step.', 'warn'); await sleep(5000); }
+    // ③  Click "Next" → past Filters/Edit step
+    step(3, total, 'Advancing past the edit step…');
+    const editBtn = await waitForBtn(/^(next|volgende|suivant|weiter|prossimo|siguiente)$/i, 8000);
+    if (editBtn) { editBtn.click(); await sleep(2500); }
+    else { step(3, total, 'Please click <strong>Next</strong> to continue.', 'warn'); await sleep(5000); }
 
-    // ⑤  Fill caption (textarea or contenteditable, with retries)
-    step(5, total, 'Filling caption…');
+    // ④  Fill caption — now on the Details / final screen (Share button visible)
+    step(4, total, 'Filling caption…');
 
-    const captionSelectors = [
+    const captionSels = [
       'textarea[aria-label="Write a caption..."]',
       'div[aria-label="Write a caption..."]',
       'textarea[placeholder*="caption" i]',
@@ -502,9 +400,9 @@ function injectInstagram(photoDataUrls, caption, songName, location) {
       '[role="textbox"]',
     ];
     let captionEl = null;
-    for (let attempt = 0; attempt < 8 && !captionEl; attempt++) {
-      for (const s of captionSelectors) { captionEl = document.querySelector(s); if (captionEl) break; }
-      if (!captionEl) await sleep(700);
+    for (let att = 0; att < 10 && !captionEl; att++) {
+      for (const s of captionSels) { captionEl = document.querySelector(s); if (captionEl) break; }
+      if (!captionEl) await sleep(600);
     }
     if (captionEl) {
       captionEl.scrollIntoView({ behavior: 'smooth', block: 'center' });
@@ -520,62 +418,49 @@ function injectInstagram(photoDataUrls, caption, songName, location) {
       }
     }
 
-    // ⑥  Add location (restaurant address → city search)
+    // ⑤  Add location (type city name into Instagram's location search)
     if (location) {
-      await sleep(800);
-      step(6, total, 'Adding location…');
+      await sleep(600);
+      step(5, total, 'Adding location…');
 
-      // Extract the city — format: "Street, NNNN City, Belgium"
+      // Extract city from "Street, NNNN City, Belgium" format
       const cityMatch = location.match(/\d{4}\s+([A-Za-zÀ-ÿ\s-]+),\s*Belgium/i);
       const searchTerm = (cityMatch?.[1] || location.split(',')[0] || location).trim();
 
-      // Find and click "Add location"
-      const locationTriggerSels = [
-        '[aria-label="Add location"]',
-        '[placeholder*="location" i]',
-        'input[aria-label*="location" i]',
-      ];
-      let locationTrigger = null;
-      for (const s of locationTriggerSels) { locationTrigger = document.querySelector(s); if (locationTrigger) break; }
-      if (!locationTrigger) {
-        locationTrigger = [...document.querySelectorAll('[role="button"], button, a')]
-          .find(el => /add.*(a\s+)?location/i.test((el.innerText || el.textContent || el.getAttribute('aria-label') || '')));
+      // Find "Add location" trigger (button or input placeholder)
+      let locTrigger = document.querySelector('[aria-label="Add location"], [placeholder*="location" i]');
+      if (!locTrigger) {
+        locTrigger = [...document.querySelectorAll('[role="button"], button, a, input')]
+          .find(el => /add.*(a\s+)?location|location/i.test(
+            el.getAttribute('aria-label') || el.getAttribute('placeholder') ||
+            el.innerText || el.textContent || ''));
       }
-
-      if (locationTrigger) {
-        locationTrigger.click(); await sleep(700);
-
-        // Location search input
+      if (locTrigger) {
+        locTrigger.click(); await sleep(700);
+        // Type into location search
         const locInput = await waitFor(
-          'input[placeholder*="Search" i][aria-label*="location" i], input[placeholder*="location" i], input[aria-label*="location" i]',
-          3000
+          'input[placeholder*="Search" i], input[aria-label*="location" i]', 4000
         );
         if (locInput) {
           locInput.focus(); await sleep(200);
-          // Type character-by-character to trigger Instagram's location API
           for (const ch of searchTerm) {
             document.execCommand('insertText', false, ch);
-            await sleep(60);
+            await sleep(55);
           }
-          await sleep(2000); // wait for results to load
-
-          // Click the first suggestion
-          const firstSuggestion = document.querySelector(
-            '[role="option"]:first-child, [class*="location" i]:first-child a, [class*="Location"]:first-child'
+          await sleep(2000);
+          const firstResult = document.querySelector(
+            '[role="option"]:first-child, [role="listitem"]:first-child'
           );
-          if (firstSuggestion) { firstSuggestion.click(); await sleep(400); }
+          if (firstResult) { firstResult.click(); await sleep(500); }
         }
       }
     }
 
-    // ⑦  Final step — show banner and STOP (user clicks Share to confirm)
-    //    Do NOT auto-click Share; the user must review photos & caption first.
-    const stepFinal = total;
+    // ⑥/final  Banner: stop here, let user review & click Share
     const songHint = songName
-      ? `&nbsp; 🎵 Tap <strong>Add music</strong> to add <em>"${songName}"</em>.`
-      : '';
-    step(stepFinal, total,
-      `✅ All set! Review your photos &amp; caption${location ? ' &amp; location' : ''},${songHint} then click <strong>Share</strong> to publish.`,
+      ? ` &nbsp;🎵 Tap <strong>Add music</strong> to add "<em>${songName}</em>".` : '';
+    step(total, total,
+      `✅ Almost there! Review photos &amp; caption${location ? ' &amp; location' : ''}.${songHint} Click <strong>Share</strong> when ready.`,
       'success');
   })();
 }
