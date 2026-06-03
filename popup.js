@@ -1038,5 +1038,128 @@ function buildMP4Blob(chunks, dcfg, W, H, fps, ts, sampleDur, totalFrames) {
   return new Blob([out], { type: 'video/mp4' });
 }
 
+// ── Mode selector ────────────────────────────────────────────────────────────
+
+function showMode(mode) {
+  document.getElementById("modeSelector").classList.add("hidden");
+  document.getElementById("manualMode").classList.add("hidden");
+  document.getElementById("autoMode").classList.add("hidden");
+  if (mode === "selector") {
+    document.getElementById("modeSelector").classList.remove("hidden");
+  } else if (mode === "manual") {
+    document.getElementById("manualMode").classList.remove("hidden");
+  } else if (mode === "auto") {
+    document.getElementById("autoMode").classList.remove("hidden");
+  }
+  chrome.storage.local.set({ lastMode: mode });
+}
+
+document.getElementById("btnManualMode").addEventListener("click", () => showMode("manual"));
+document.getElementById("btnAutoMode").addEventListener("click",   () => showMode("auto"));
+document.getElementById("manualBackBtn").addEventListener("click", () => showMode("selector"));
+document.getElementById("autoBackBtn").addEventListener("click",   () => showMode("selector"));
+
+// Restore last mode on open
+chrome.storage.local.get({ lastMode: "selector" }, ({ lastMode }) => {
+  // Always start at selector so the user consciously picks each session
+  showMode("selector");
+});
+
+// ── Auto Bot UI logic ─────────────────────────────────────────────────────────
+
+// ── Province / region data per country ───────────────────────────────────────
+const REGIONS = {
+  BE: [
+    "Antwerp","East Flanders","West Flanders","Flemish Brabant",
+    "Walloon Brabant","Hainaut","Liège","Luxembourg","Namur","Limburg",
+  ],
+  NL: [
+    "Groningen","Friesland","Drenthe","Overijssel","Gelderland","Flevoland",
+    "Utrecht","North Holland","South Holland","Zeeland","North Brabant","Limburg",
+  ],
+  LU: ["Luxembourg District","Diekirch District","Grevenmacher District"],
+  FR: [
+    "Île-de-France","Hauts-de-France","Grand Est","Normandie","Bretagne",
+    "Pays de la Loire","Centre-Val de Loire","Bourgogne-Franche-Comté",
+    "Nouvelle-Aquitaine","Occitanie","Auvergne-Rhône-Alpes",
+    "Provence-Alpes-Côte d'Azur","Corse",
+  ],
+  DE: [
+    "Baden-Württemberg","Bavaria","Berlin","Brandenburg","Bremen","Hamburg",
+    "Hesse","Lower Saxony","Mecklenburg-Vorpommern","North Rhine-Westphalia",
+    "Rhineland-Palatinate","Saarland","Saxony","Saxony-Anhalt",
+    "Schleswig-Holstein","Thuringia",
+  ],
+};
+
+function buildRegionChips(countryCode) {
+  const wrap = document.getElementById("abRegionWrap");
+  if (!wrap) return;
+  wrap.innerHTML = "";
+  const regions = REGIONS[countryCode] || [];
+
+  // "All" chip — selected by default
+  const allChip = document.createElement("button");
+  allChip.type = "button";
+  allChip.className = "ab-region-chip all-chip active";
+  allChip.textContent = "All";
+  allChip.addEventListener("click", () => {
+    const isActive = allChip.classList.toggle("active");
+    // If "All" is activated, deselect individual regions
+    if (isActive) wrap.querySelectorAll(".ab-region-chip:not(.all-chip)").forEach(c => c.classList.remove("active"));
+  });
+  wrap.appendChild(allChip);
+
+  regions.forEach(name => {
+    const chip = document.createElement("button");
+    chip.type = "button";
+    chip.className = "ab-region-chip";
+    chip.textContent = name;
+    chip.addEventListener("click", () => {
+      chip.classList.toggle("active");
+      // If any individual region is selected, deactivate "All"
+      const anyActive = [...wrap.querySelectorAll(".ab-region-chip:not(.all-chip)")].some(c => c.classList.contains("active"));
+      allChip.classList.toggle("active", !anyActive);
+    });
+    wrap.appendChild(chip);
+  });
+}
+
+// Build chips for initial country (Belgium)
+buildRegionChips("BE");
+
+// Rebuild when country changes
+document.getElementById("abCountry")?.addEventListener("change", e => {
+  buildRegionChips(e.target.value);
+});
+
+// ── Single-select pill groups (Type / Stars / Pics) ───────────────────────────
+["abType", "abStars", "abPics"].forEach(groupId => {
+  const group = document.getElementById(groupId);
+  if (!group) return;
+  group.addEventListener("click", e => {
+    const pill = e.target.closest(".ab-pill");
+    if (!pill) return;
+    group.querySelectorAll(".ab-pill").forEach(p => p.classList.remove("active"));
+    pill.classList.add("active");
+  });
+});
+
+// ── Social media toggles in Auto Bot ────────────────────────────────────────
+["abSocialIG", "abSocialFB", "abSocialTT"].forEach(id => {
+  document.getElementById(id)?.addEventListener("click", function() {
+    this.classList.toggle("active");
+  });
+});
+
+// ── Ratings slider live value ─────────────────────────────────────────────────
+const abSlider = document.getElementById("abMinRatings");
+const abSliderVal = document.getElementById("abMinRatingsVal");
+if (abSlider && abSliderVal) {
+  abSlider.addEventListener("input", () => {
+    abSliderVal.textContent = Number(abSlider.value).toLocaleString();
+  });
+}
+
 // Boot
 checkUsageWarning();

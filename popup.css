@@ -260,4 +260,175 @@ h1 { font-size: 0.95rem; font-weight: 700; line-height: 1.2; }
   display: flex; gap: 6px; padding-top: 8px; border-top: 1px solid var(--border);
 }
 
+/* ══════════════════════════════════════════════════════════════════
+   MODE SELECTOR
+   ══════════════════════════════════════════════════════════════════ */
+
+.mode-selector-screen {
+  padding: 20px 0 24px;
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+}
+.mode-selector-header {
+  display: flex; align-items: center; gap: 10px;
+  padding-bottom: 14px;
+  border-bottom: 1px solid var(--border);
+}
+.mode-selector-hint {
+  font-size: .82rem; color: var(--muted); text-align: center;
+  margin: 0 8px;
+}
+.mode-cards {
+  display: flex; gap: 10px;
+}
+.mode-card {
+  flex: 1; display: flex; flex-direction: column; align-items: center;
+  gap: 8px; padding: 18px 12px; border-radius: 12px; cursor: pointer;
+  border: 2px solid var(--border); background: var(--surface);
+  transition: all .18s; text-align: center; box-shadow: var(--shadow);
+}
+.mode-card:hover {
+  border-color: var(--accent); transform: translateY(-2px);
+  box-shadow: 0 4px 14px rgba(0,0,0,.12);
+}
+.mode-card--auto:hover { border-color: #7c3aed; }
+.mode-card--auto:hover .mode-card-title { color: #7c3aed; }
+.mode-card-icon { font-size: 2rem; line-height: 1; }
+.mode-card-title { font-size: .9rem; font-weight: 700; color: var(--text); }
+.mode-card-desc  { font-size: .72rem; color: var(--muted); line-height: 1.45; }
+
+/* ── Mode topbar (back button inside each mode) ─── */
+.mode-topbar {
+  display: flex; align-items: center; gap: 10px;
+  padding: 8px 0 10px;
+  border-bottom: 1px solid var(--border);
+  margin-bottom: 10px;
+}
+.btn-mode-back {
+  background: transparent; border: 1px solid var(--border);
+  color: var(--muted); font-size: .74rem; font-weight: 600;
+  padding: 4px 10px; border-radius: 8px; cursor: pointer;
+  transition: all .15s;
+}
+.btn-mode-back:hover { border-color: var(--accent); color: var(--accent); }
+.mode-topbar-title {
+  font-size: .85rem; font-weight: 700; color: var(--text);
+}
+.mode-content { display: flex; flex-direction: column; }
+
+/* ══════════════════════════════════════════════════════════════════
+   AUTO BOT CONFIGURATION
+   ══════════════════════════════════════════════════════════════════ */
+
+.autobot-intro {
+  font-size: .78rem; color: var(--muted); margin-bottom: 6px;
+  line-height: 1.5;
+}
+.autobot-body {
+  display: flex; flex-direction: column; gap: 14px;
+  padding-bottom: 16px;
+}
+
+/* ── Group (label + control) ── */
+.ab-group { display: flex; flex-direction: column; gap: 6px; }
+.ab-label {
+  font-size: .74rem; font-weight: 700; color: var(--text);
+  text-transform: uppercase; letter-spacing: .04em;
+  display: flex; align-items: center; gap: 6px;
+}
+.ab-label-hint {
+  font-weight: 400; text-transform: none; letter-spacing: 0;
+  color: var(--muted); font-size: .68rem;
+}
+
+/* ── Select ── */
+.ab-select {
+  background: var(--surface); border: 1.5px solid var(--border);
+  color: var(--text); border-radius: var(--radius);
+  padding: 7px 10px; font-size: .82rem; outline: none;
+  cursor: pointer; transition: border-color .15s;
+}
+.ab-select:focus { border-color: var(--accent); }
+
+/* ── Pills (single-select toggles) ── */
+.pill-row { display: flex; gap: 6px; flex-wrap: wrap; }
+.ab-pill {
+  background: var(--bg); border: 1.5px solid var(--border);
+  color: var(--muted); border-radius: 20px; cursor: pointer;
+  font-size: .76rem; font-weight: 600; padding: 5px 12px;
+  transition: all .15s; white-space: nowrap;
+}
+.ab-pill:hover { border-color: #aaa; color: var(--text); }
+.ab-pill.active {
+  background: var(--accent); border-color: var(--accent);
+  color: #fff;
+}
+
+/* ── Region multi-select ── */
+.ab-region-wrap {
+  display: flex; flex-wrap: wrap; gap: 5px;
+  background: var(--surface); border: 1.5px solid var(--border);
+  border-radius: var(--radius); padding: 8px 10px;
+  max-height: 110px; overflow-y: auto;
+}
+.ab-region-chip {
+  background: var(--bg); border: 1.5px solid var(--border);
+  color: var(--muted); border-radius: 16px; cursor: pointer;
+  font-size: .7rem; font-weight: 600; padding: 3px 9px;
+  transition: all .15s; user-select: none;
+}
+.ab-region-chip:hover { border-color: #aaa; color: var(--text); }
+.ab-region-chip.active {
+  background: #f0f9ff; border-color: #3b82f6; color: #1d4ed8;
+}
+.ab-region-chip.all-chip.active {
+  background: #f0fdf4; border-color: #22c55e; color: #15803d;
+}
+
+/* ── Slider ── */
+.ab-slider {
+  width: 100%; accent-color: var(--accent);
+  height: 4px; cursor: pointer;
+}
+.ab-slider-range {
+  display: flex; justify-content: space-between;
+  font-size: .65rem; color: var(--muted); margin-top: 2px;
+}
+.ab-slider-val {
+  background: var(--accent); color: #fff; border-radius: 10px;
+  padding: 1px 7px; font-size: .7rem; font-weight: 700;
+  margin-left: auto;
+}
+
+/* ── Checkboxes ── */
+.ab-checkbox-grid {
+  display: grid; grid-template-columns: 1fr 1fr;
+  gap: 6px;
+}
+.ab-checkbox {
+  display: flex; align-items: center; gap: 7px;
+  background: var(--surface); border: 1.5px solid var(--border);
+  border-radius: 8px; padding: 7px 10px; cursor: pointer;
+  font-size: .78rem; color: var(--text); transition: border-color .15s;
+}
+.ab-checkbox:hover { border-color: var(--accent); }
+.ab-checkbox input[type="checkbox"] {
+  accent-color: var(--accent); width: 14px; height: 14px;
+  flex-shrink: 0; cursor: pointer;
+}
+.ab-checkbox input:checked + span { color: var(--text); font-weight: 600; }
+
+/* ── Schedule button ── */
+.ab-actions { margin-top: 4px; }
+.btn--schedule {
+  position: relative; opacity: .6; cursor: not-allowed;
+  display: flex; align-items: center; justify-content: center; gap: 8px;
+}
+.ab-coming-soon {
+  background: rgba(255,255,255,.25); border-radius: 10px;
+  padding: 1px 7px; font-size: .65rem; font-weight: 700;
+  letter-spacing: .06em; text-transform: uppercase;
+}
+
 .hidden { display: none !important; }

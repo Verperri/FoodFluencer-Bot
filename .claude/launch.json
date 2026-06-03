@@ -4,8 +4,8 @@
     {
       "name": "FoodFluencer Bot",
       "runtimeExecutable": "C:\\Users\\stefan\\AppData\\Local\\Programs\\Python\\Python312\\python.exe",
-      "runtimeArgs": ["app.py"],
-      "port": 5000
+      "runtimeArgs": ["-m", "http.server", "5050"],
+      "port": 5050
     }
   ]
 }
