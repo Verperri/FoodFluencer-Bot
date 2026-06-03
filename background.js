@@ -477,18 +477,41 @@ function injectInstagram(photoDataUrls, caption, songName, location) {
 
     const NEXT_RE = /^(next|volgende|suivant|weiter|siguiente|næste|neste|seuraava)$/i;
 
-    // Find the VISIBLE "Next" button inside the modal (ignores hidden/transitioning ones)
+    // Find the STEP "Next" button (header, top-right) — NOT the carousel arrow.
+    // The header Next has visible TEXT "Next"; the carousel arrow is icon-only (empty text).
+    // Priority: text match first, then aria-label match sorted by position in dialog.
     function findVisibleNextBtn() {
-      const roots = [document.querySelector('[role="dialog"]'), document.body].filter(Boolean);
+      const dialog = document.querySelector('[role="dialog"]');
+      const roots  = [dialog, document.body].filter(Boolean);
+
+      // ① Prefer elements whose visible text IS "Next" (header step button)
       for (const root of roots) {
         const btn = [...root.querySelectorAll('[role="button"],button,[tabindex="0"],a')]
           .find(el => {
             const txt = (el.innerText || el.textContent || '').trim();
-            const lbl = el.getAttribute('aria-label') || '';
-            return (NEXT_RE.test(txt) || NEXT_RE.test(lbl)) && isVisible(el);
+            return NEXT_RE.test(txt) && isVisible(el);
           });
-        if (btn) return btn;
+        if (btn) {
+          dbg(`Next by text: "${(btn.innerText||btn.textContent||'').trim()}" top=${Math.round(btn.getBoundingClientRect().top)}`);
+          return btn;
+        }
       }
+
+      // ② Fall back to aria-label — but pick the TOPMOST one inside the dialog
+      //    (header Next is at the top; carousel arrows are mid-screen)
+      if (dialog) {
+        const dlgTop = dialog.getBoundingClientRect().top;
+        const ariaNexts = [...dialog.querySelectorAll('[role="button"],button,[tabindex="0"],a')]
+          .filter(el => NEXT_RE.test(el.getAttribute('aria-label') || '') && isVisible(el))
+          .sort((a, b) => a.getBoundingClientRect().top - b.getBoundingClientRect().top);
+
+        if (ariaNexts.length > 0) {
+          const picked = ariaNexts[0];
+          dbg(`Next by aria-label (topmost, rel-top=${Math.round(picked.getBoundingClientRect().top - dlgTop)}px): aria="${picked.getAttribute('aria-label')}"`);
+          return picked;
+        }
+      }
+
       return null;
     }
 
