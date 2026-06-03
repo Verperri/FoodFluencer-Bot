@@ -42,8 +42,8 @@ const INJECTORS = {
   tiktok:    injectTikTok,
 };
 
-async function handleSocialPost({ platform, photoDataUrls, caption, songName, location, restaurantName, tiktokVideoDataUrl }) {
-  bgLog('info', `Opening ${platform}`, { photos: photoDataUrls.length, song: songName, location, tiktokVideoKB: tiktokVideoDataUrl ? Math.round(tiktokVideoDataUrl.length * 0.75 / 1024) : 0 });
+async function handleSocialPost({ platform, photoDataUrls, caption, songName, location, restaurantName, tiktokAudioDataUrl }) {
+  bgLog('info', `Opening ${platform}`, { photos: photoDataUrls.length, song: songName, location, tiktokAudioKB: tiktokAudioDataUrl ? Math.round(tiktokAudioDataUrl.length * 0.75 / 1024) : 0 });
   const tab = await chrome.tabs.create({ url: PLATFORM_URLS[platform], active: true });
 
   await new Promise(resolve => {
@@ -62,7 +62,7 @@ async function handleSocialPost({ platform, photoDataUrls, caption, songName, lo
     await chrome.scripting.executeScript({
       target: { tabId: tab.id },
       func:   INJECTORS[platform],
-      args:   [photoDataUrls, caption, songName || "", location || "", { restaurantName: restaurantName || "", tiktokVideoDataUrl: tiktokVideoDataUrl || null }],
+      args:   [photoDataUrls, caption, songName || "", location || "", { restaurantName: restaurantName || "", tiktokAudioDataUrl: tiktokAudioDataUrl || null }],
       world:  "MAIN",
     });
     bgLog('info', `Injected script on ${platform}`);
@@ -804,8 +804,7 @@ function injectInstagram(photoDataUrls, caption, songName, location, opts) {
 // Tries 3 upload approaches in sequence until TikTok accepts one.
 
 function injectTikTok(photoDataUrls, caption, songName, location, opts) {
-  // Video is built INSIDE the injector from the photoDataUrls that are already passed.
-  // This avoids the 2-3MB base64 string arg that chrome.scripting silently drops.
+  const { tiktokAudioDataUrl = null } = opts || {};
   const sleep = ms => new Promise(r => setTimeout(r, ms));
   const waitFor = (sel, ms = 12000) => new Promise(res => {
     const el = document.querySelector(sel); if (el) return res(el);
@@ -816,7 +815,7 @@ function injectTikTok(photoDataUrls, caption, songName, location, opts) {
     }, 300);
   });
 
-  const TOTAL = 4;
+  const TOTAL = 5;
   function banner(n, html, type = 'info') {
     document.getElementById('ffbot-banner')?.remove();
     const b = document.createElement('div'); b.id = 'ffbot-banner';
@@ -841,14 +840,12 @@ function injectTikTok(photoDataUrls, caption, songName, location, opts) {
     console.log(`[FoodFluencer TikTok] ${msg}`);
   }
 
-  // ════════════════════════════════════════════════════════════════════════════
-  // Create H.264 MP4 entirely inside TikTok's page context using WebCodecs.
-  // The photoDataUrls (~200KB each × 5) are already passed as normal args.
-  // ════════════════════════════════════════════════════════════════════════════
-  async function buildH264MP4(imgDataUrls) {
+  // ═══════════════════════════════════════════════════════════════════════════
+  // Build H.264 MP4 (+ optional AAC audio) entirely inside TikTok's page context
+  // ═══════════════════════════════════════════════════════════════════════════
+  async function buildH264MP4(imgDataUrls, audioDataUrl) {
     const W = 720, H = 1280, FPS = 25, BITRATE = 2_000_000, SEC = 1.2;
 
-    // Load images
     const images = [];
     for (const src of imgDataUrls) {
       await new Promise(res => {
@@ -870,67 +867,129 @@ function injectTikTok(photoDataUrls, caption, songName, location, opts) {
       ctx.drawImage(img, (W - img.naturalWidth * s) / 2, (H - img.naturalHeight * s) / 2, img.naturalWidth * s, img.naturalHeight * s);
     }
 
-    // ── Try WebCodecs H.264 ──────────────────────────────────────────────────
-    if (window.VideoEncoder) {
-      const codecs = ['avc1.4d0028','avc1.42001f','avc1.42001e','avc1.420014'];
-      let codec = null;
-      for (const c of codecs) {
-        try {
-          const s = await VideoEncoder.isConfigSupported({ codec: c, width: W, height: H, bitrate: BITRATE, framerate: FPS });
-          if (s.supported) { codec = c; break; }
-        } catch(_) {}
+    // ── Encode video with WebCodecs ──────────────────────────────────────────
+    if (!window.VideoEncoder) throw new Error('VideoEncoder not available');
+
+    const codecs = ['avc1.4d0028','avc1.42001f','avc1.42001e','avc1.420014'];
+    let codec = null;
+    for (const c of codecs) {
+      try {
+        const s = await VideoEncoder.isConfigSupported({ codec: c, width: W, height: H, bitrate: BITRATE, framerate: FPS });
+        if (s.supported) { codec = c; break; }
+      } catch(_) {}
+    }
+    if (!codec) throw new Error('No H.264 codec supported');
+    dbg(`Video codec: ${codec}`);
+
+    const vChunks = []; let vDcfg = null; let vErr = null;
+    const vEnc = new VideoEncoder({
+      output: (chunk, meta) => {
+        if (meta?.decoderConfig) vDcfg = meta.decoderConfig;
+        const buf = new ArrayBuffer(chunk.byteLength); chunk.copyTo(buf);
+        vChunks.push({ data: new Uint8Array(buf), isKey: chunk.type === 'key' });
+      },
+      error: e => { vErr = e; },
+    });
+    vEnc.configure({ codec, width: W, height: H, bitrate: BITRATE, framerate: FPS, avc: { format: 'avc' } });
+
+    const framesPerSlide = Math.ceil(SEC * FPS);
+    let fi = 0;
+    for (let i = 0; i < images.length; i++) {
+      drawSlide(images[i]);
+      for (let f = 0; f < framesPerSlide; f++) {
+        if (vErr) throw new Error('VideoEncoder: ' + vErr.message);
+        const ts = Math.round(fi * 1_000_000 / FPS);
+        const frame = new VideoFrame(canvas, { timestamp: ts, duration: Math.round(1_000_000 / FPS) });
+        vEnc.encode(frame, { keyFrame: fi === 0 || f === 0 });
+        frame.close(); fi++;
       }
+      banner(1, `Encoding video: slide ${i+1}/${images.length}${audioDataUrl ? ' + 🎵' : ''}…`);
+    }
+    await vEnc.flush(); vEnc.close();
+    if (vErr) throw new Error('VideoEncoder: ' + vErr.message);
+    dbg(`Video: ${vChunks.length} chunks`);
 
-      if (codec) {
-        dbg(`Encoding H.264 (${codec})…`);
-        const chunks = []; let dcfg = null; let encErr = null;
-        const enc = new VideoEncoder({
-          output: (chunk, meta) => {
-            if (meta?.decoderConfig) dcfg = meta.decoderConfig;
-            const buf = new ArrayBuffer(chunk.byteLength);
-            chunk.copyTo(buf);
-            chunks.push({ data: new Uint8Array(buf), isKey: chunk.type === 'key' });
-          },
-          error: e => { encErr = e; },
+    // ── Encode audio with WebCodecs (AAC-LC) ────────────────────────────────
+    let aChunks = [];
+    const AUDIO_SAMPLE_RATE = 44100;
+    const AUDIO_CHANNELS    = 2;
+    const videoSec = images.length * SEC;
+
+    if (audioDataUrl && window.AudioEncoder && window.AudioData) {
+      try {
+        banner(1, `Encoding audio (${Math.round(videoSec)}s)…`);
+        // Decode audio data URL → AudioBuffer
+        const b64   = audioDataUrl.split(',')[1];
+        const bytes = Uint8Array.from(atob(b64), c => c.charCodeAt(0));
+        const tmpCtx = new (window.AudioContext || window.webkitAudioContext)({ sampleRate: AUDIO_SAMPLE_RATE });
+        const audioBuf = await tmpCtx.decodeAudioData(bytes.buffer.slice(0));
+        await tmpCtx.close();
+
+        const totalAudioFrames = Math.min(
+          Math.ceil(videoSec * AUDIO_SAMPLE_RATE),
+          audioBuf.length
+        );
+        const numCh = Math.min(audioBuf.numberOfChannels, AUDIO_CHANNELS);
+
+        const aSupport = await AudioEncoder.isConfigSupported({
+          codec: 'mp4a.40.2', sampleRate: AUDIO_SAMPLE_RATE,
+          numberOfChannels: numCh, bitrate: 128000,
         });
-        enc.configure({ codec, width: W, height: H, bitrate: BITRATE, framerate: FPS, avc: { format: 'avc' } });
 
-        const framesPerSlide = Math.ceil(SEC * FPS);
-        let fi = 0;
-        for (let i = 0; i < images.length; i++) {
-          drawSlide(images[i]);
-          for (let f = 0; f < framesPerSlide; f++) {
-            if (encErr) throw new Error(`VideoEncoder: ${encErr.message}`);
-            const ts = Math.round(fi * 1_000_000 / FPS);
-            const frame = new VideoFrame(canvas, { timestamp: ts, duration: Math.round(1_000_000 / FPS) });
-            enc.encode(frame, { keyFrame: fi === 0 || f === 0 });
-            frame.close(); fi++;
+        if (aSupport.supported) {
+          let aErr = null;
+          const aEnc = new AudioEncoder({
+            output: (chunk) => {
+              const buf = new ArrayBuffer(chunk.byteLength); chunk.copyTo(buf);
+              aChunks.push({ data: new Uint8Array(buf), timestamp: chunk.timestamp });
+            },
+            error: e => { aErr = e; },
+          });
+          aEnc.configure({ codec: 'mp4a.40.2', sampleRate: AUDIO_SAMPLE_RATE, numberOfChannels: numCh, bitrate: 128000 });
+
+          const FRAME_SIZE = 1024;
+          const ch = [];
+          for (let c = 0; c < numCh; c++) ch.push(audioBuf.getChannelData(c));
+
+          let processed = 0;
+          while (processed < totalAudioFrames) {
+            const frames = Math.min(FRAME_SIZE, totalAudioFrames - processed);
+            const planar  = new Float32Array(frames * numCh);
+            for (let c = 0; c < numCh; c++)
+              planar.set(ch[c].slice(processed, processed + frames), c * frames);
+
+            const ad = new AudioData({
+              format: 'f32-planar',
+              sampleRate: AUDIO_SAMPLE_RATE,
+              numberOfFrames: frames,
+              numberOfChannels: numCh,
+              timestamp: Math.round(processed * 1_000_000 / AUDIO_SAMPLE_RATE),
+              data: planar,
+            });
+            aEnc.encode(ad); ad.close();
+            processed += frames;
           }
+          await aEnc.flush(); aEnc.close();
+          if (aErr) throw new Error('AudioEncoder: ' + aErr.message);
+          dbg(`Audio: ${aChunks.length} AAC chunks (${numCh}ch)`);
+        } else {
+          dbg('AAC not supported — video-only');
         }
-        await enc.flush(); enc.close();
-        if (encErr) throw new Error(`VideoEncoder: ${encErr.message}`);
-        dbg(`Encoded ${chunks.length} H.264 chunks — muxing MP4…`);
-        return { blob: muxMP4(chunks, dcfg, W, H, FPS, fi), type: 'video/mp4', ext: 'mp4' };
+      } catch(e) {
+        dbg(`Audio encoding failed: ${e.message} — video-only`);
+        aChunks = [];
       }
     }
 
-    // ── Fallback: WebM via MediaRecorder ────────────────────────────────────
-    dbg('WebCodecs unavailable — using MediaRecorder WebM…');
-    const mt = ['video/webm;codecs=vp9','video/webm;codecs=vp8','video/webm']
-      .find(t => MediaRecorder.isTypeSupported(t)) || 'video/webm';
-    const stream = canvas.captureStream(FPS);
-    const rec = new MediaRecorder(stream, { mimeType: mt, videoBitsPerSecond: BITRATE });
-    const ch = [];
-    rec.ondataavailable = e => { if (e.data.size > 0) ch.push(e.data); };
-    rec.start(100);
-    for (const img of images) { drawSlide(img); await sleep(SEC * 1000); }
-    rec.stop();
-    const blob = await new Promise(res => { rec.onstop = () => res(new Blob(ch, { type: mt })); });
-    return { blob, type: mt, ext: 'webm' };
+    const blob = muxMP4(vChunks, vDcfg, aChunks, W, H, FPS, fi, AUDIO_SAMPLE_RATE);
+    dbg(`MP4 ready: ${(blob.size/1024/1024).toFixed(1)}MB`);
+    return blob;
   }
 
-  // ── Minimal MP4 muxer (self-contained, identical to popup.js version) ─────
-  function muxMP4(chunks, dcfg, W, H, fps, totalFrames) {
+  // ═══════════════════════════════════════════════════════════════════════════
+  // MP4 muxer — video track + optional AAC audio track
+  // ═══════════════════════════════════════════════════════════════════════════
+  function muxMP4(vChunks, vDcfg, aChunks, W, H, fps, totalVideoFrames, aSampleRate) {
     const u8  = v => [v & 0xFF];
     const u16 = v => [(v >> 8) & 0xFF, v & 0xFF];
     const u32 = v => [(v >>> 24) & 0xFF, (v >>> 16) & 0xFF, (v >>> 8) & 0xFF, v & 0xFF];
@@ -939,178 +998,248 @@ function injectTikTok(photoDataUrls, caption, songName, location, opts) {
     function box(t, ...c) { const d = c.flat(Infinity); return [...u32(8+d.length), ...s4(t.padEnd(4,' ')), ...d]; }
     function fb(t, v, f, ...c) { return box(t, u8(v), [(f>>16)&0xFF,(f>>8)&0xFF,f&0xFF], ...c); }
 
-    const TS = 90000, SD = Math.round(TS / fps), DUR = totalFrames * SD;
-    let sps = new Uint8Array([0x67,0x4d,0x00,0x28]);
-    let pps = new Uint8Array([0x68,0xee,0x31,0xb2,0x8b]);
-    if (dcfg?.description) {
-      const d = new Uint8Array(dcfg.description); let i = 5;
+    // ── Video track ────────────────────────────────────────────────────────
+    const VTS = 90000, VSD = Math.round(VTS / fps), VDUR = totalVideoFrames * VSD;
+    let sps = new Uint8Array([0x67,0x4d,0x00,0x28]); let pps = new Uint8Array([0x68,0xee,0x31,0xb2]);
+    if (vDcfg?.description) {
+      const d = new Uint8Array(vDcfg.description); let i = 5;
       const ns = d[i++] & 0x1F;
       for (let j=0;j<ns;j++) { const l=(d[i]<<8)|d[i+1];i+=2; sps=d.slice(i,i+l);i+=l; }
       const np = d[i++];
       for (let j=0;j<np;j++) { const l=(d[i]<<8)|d[i+1];i+=2; pps=d.slice(i,i+l);i+=l; }
     }
-
-    const avcC = box('avcC', u8(1),[sps[1]||0x4d,sps[2]||0x00,sps[3]||0x28],[0xFF],[0xE1],u16(sps.length),[...sps],u8(1),u16(pps.length),[...pps]);
+    const avcC = box('avcC', u8(1),[sps[1]||0x4d,sps[2]||0,sps[3]||0x28],[0xFF],[0xE1],u16(sps.length),[...sps],u8(1),u16(pps.length),[...pps]);
     const avc1 = box('avc1', z(6),u16(1),z(16),u16(W),u16(H),[0,72,0,0,0,72,0,0],u32(0),u16(1),z(32),u16(0x18),u16(0xFFFF),avcC);
     const mat  = [0x00,0x01,0x00,0x00,0,0,0,0,0,0,0,0,0,0,0,0,0x00,0x01,0x00,0x00,0,0,0,0,0,0,0,0,0,0,0,0,0x40,0x00,0x00,0x00];
 
-    const stsd = fb('stsd',0,0, u32(1),avc1);
-    const stts = fb('stts',0,0, u32(1),u32(chunks.length),u32(SD));
-    const keys = chunks.map((c,i)=>c.isKey?i+1:null).filter(Boolean);
-    const stss = fb('stss',0,0, u32(keys.length),...keys.flatMap(i=>u32(i)));
-    const stsz = fb('stsz',0,0, u32(0),u32(chunks.length),...chunks.flatMap(c=>u32(c.data.length)));
-    const stsc = fb('stsc',0,0, u32(1),u32(1),u32(1),u32(1));
-    const stco_ph = fb('stco',0,0, u32(chunks.length),...chunks.flatMap(()=>u32(0)));
-    const stbl_ph = box('stbl',stsd,stts,stss,stsc,stsz,stco_ph);
-    const vmhd = fb('vmhd',0,1,u16(0),z(6));
-    const dinf = box('dinf',fb('dref',0,0,u32(1),fb('url ',0,1)));
-    const minf_ph = box('minf',vmhd,dinf,stbl_ph);
-    const mdhd = fb('mdhd',0,0,u32(0),u32(0),u32(TS),u32(DUR),u16(0x55C4),u16(0));
-    const hdlr = fb('hdlr',0,0,u32(0),s4('vide'),z(12),[...s4('Vide'),0]);
-    const mdia_ph = box('mdia',mdhd,hdlr,minf_ph);
-    const tkhd = fb('tkhd',0,3,u32(0),u32(0),u32(1),u32(0),u32(DUR),z(8),u16(0),u16(0),u16(0),u16(0),mat,u32(W<<16),u32(H<<16));
-    const trak_ph = box('trak',tkhd,mdia_ph);
-    const mvhd = fb('mvhd',0,0,u32(0),u32(0),u32(TS),u32(DUR),u32(0x10000),u16(0x100),z(10),mat,z(24),u32(2));
-    const moov_ph = box('moov',mvhd,trak_ph);
-    const ftyp = box('ftyp',s4('isom'),u32(0x200),s4('isom'),s4('iso2'),s4('avc1'),s4('mp41'));
+    const vstsd = fb('stsd',0,0,u32(1),avc1);
+    const vstts = fb('stts',0,0,u32(1),u32(vChunks.length),u32(VSD));
+    const vkeys = vChunks.map((c,i)=>c.isKey?i+1:null).filter(Boolean);
+    const vstss = fb('stss',0,0,u32(vkeys.length),...vkeys.flatMap(i=>u32(i)));
+    const vstsz = fb('stsz',0,0,u32(0),u32(vChunks.length),...vChunks.flatMap(c=>u32(c.data.length)));
+    const vstsc = fb('stsc',0,0,u32(1),u32(1),u32(1),u32(1));
+    const vstco_ph = fb('stco',0,0,u32(vChunks.length),...vChunks.flatMap(()=>u32(0)));
+    const vstbl_ph = box('stbl',vstsd,vstts,vstss,vstsc,vstsz,vstco_ph);
+    const vmhd   = fb('vmhd',0,1,u16(0),z(6));
+    const dinf   = box('dinf',fb('dref',0,0,u32(1),fb('url ',0,1)));
+    const vminf_ph = box('minf',vmhd,dinf,vstbl_ph);
+    const vmdhd  = fb('mdhd',0,0,u32(0),u32(0),u32(VTS),u32(VDUR),u16(0x55C4),u16(0));
+    const vhdlr  = fb('hdlr',0,0,u32(0),s4('vide'),z(12),[...s4('Vide'),0]);
+    const vmdia_ph = box('mdia',vmdhd,vhdlr,vminf_ph);
+    const vtkhd  = fb('tkhd',0,3,u32(0),u32(0),u32(1),u32(0),u32(VDUR),z(8),u16(0),u16(0),u16(0),u16(0),mat,u32(W<<16),u32(H<<16));
+    const vtrak_ph = box('trak',vtkhd,vmdia_ph);
 
+    // ── Audio track (AAC-LC) ────────────────────────────────────────────────
+    const hasAudio = aChunks.length > 0;
+    let atrak_ph = [];
+    if (hasAudio) {
+      const ATS  = aSampleRate;
+      const AFPF = 1024; // AAC frames per chunk
+      const ADUR = aChunks.length * AFPF;
+
+      // AAC-LC AudioSpecificConfig for 44100Hz stereo
+      // audioObjectType=2 (5 bits), freqIndex=4 (4 bits), channels=2 (4 bits)
+      // = 00010 0100 0010 → 0001 0010 0001 0000 = 0x12, 0x10
+      const asc = [0x12, 0x10];
+      const esdsData = [
+        0x03, 0x19, 0x00, 0x01, 0x00,                // ES_Descriptor (tag, size, ES_ID, flags)
+        0x04, 0x11, 0x40, 0x15,                       // DecoderConfig (tag, size, objectType, streamType)
+        0x00, 0x00, 0x00,                             // bufferSizeDB
+        0x00, 0x01, 0xF4, 0x00,                       // maxBitrate = 128000
+        0x00, 0x01, 0xF4, 0x00,                       // avgBitrate = 128000
+        0x05, 0x02, ...asc,                           // DecoderSpecificInfo
+        0x06, 0x01, 0x02,                             // SLConfig predefined
+      ];
+      const esds = fb('esds', 0, 0, esdsData);
+      const mp4a = box('mp4a', z(6),u16(1), z(8), u16(2),u16(16),u16(0),u16(0),
+        u32(ATS * 65536), // samplerate as 16.16 fixed point
+        esds);
+
+      const astsd = fb('stsd',0,0,u32(1),mp4a);
+      const astts = fb('stts',0,0,u32(1),u32(aChunks.length),u32(AFPF));
+      const astsz = fb('stsz',0,0,u32(0),u32(aChunks.length),...aChunks.flatMap(c=>u32(c.data.length)));
+      const astsc = fb('stsc',0,0,u32(1),u32(1),u32(1),u32(1));
+      const astco_ph = fb('stco',0,0,u32(aChunks.length),...aChunks.flatMap(()=>u32(0)));
+      const astbl_ph = box('stbl',astsd,astts,astsc,astsz,astco_ph);
+      const smhd   = fb('smhd',0,0,u16(0),u16(0));
+      const aminf_ph = box('minf',smhd,dinf,astbl_ph);
+      const amdhd  = fb('mdhd',0,0,u32(0),u32(0),u32(ATS),u32(ADUR),u16(0x55C4),u16(0));
+      const ahdlr  = fb('hdlr',0,0,u32(0),s4('soun'),z(12),[...s4('Soun'),0]);
+      const amdia_ph = box('mdia',amdhd,ahdlr,aminf_ph);
+      const atkhd  = fb('tkhd',0,3,u32(0),u32(0),u32(2),u32(0),u32(ADUR),z(8),u16(0),u16(0),u16(0x0100),u16(0),mat,u32(0),u32(0));
+      atrak_ph = box('trak',atkhd,amdia_ph);
+    }
+
+    const mvhd = fb('mvhd',0,0,u32(0),u32(0),u32(VTS),u32(VDUR),u32(0x10000),u16(0x100),z(10),mat,z(24),u32(hasAudio?3:2));
+    const moov_ph = box('moov', mvhd, vtrak_ph, ...(hasAudio ? [atrak_ph] : []));
+    const ftyp    = box('ftyp',s4('isom'),u32(0x200),s4('isom'),s4('iso2'),s4('avc1'),s4('mp41'));
+
+    // Compute real chunk offsets (video then audio in mdat)
     const mdatStart = ftyp.length + moov_ph.length + 8;
     let off = mdatStart;
-    const realOff = chunks.map(c => { const o=off; off+=c.data.length; return o; });
-    const stco_r  = fb('stco',0,0,u32(chunks.length),...realOff.flatMap(o=>u32(o)));
-    const stbl_r  = box('stbl',stsd,stts,stss,stsc,stsz,stco_r);
-    const minf_r  = box('minf',vmhd,dinf,stbl_r);
-    const mdia_r  = box('mdia',mdhd,hdlr,minf_r);
-    const trak_r  = box('trak',tkhd,mdia_r);
-    const moov_r  = box('moov',mvhd,trak_r);
+    const vRealOff = vChunks.map(c => { const o=off; off+=c.data.length; return o; });
+    const aRealOff = aChunks.map(c => { const o=off; off+=c.data.length; return o; });
 
-    const mdatBodySize = chunks.reduce((a,c)=>a+c.data.length,0);
-    const mdatHdr = new Uint8Array([...u32(mdatBodySize+8),...s4('mdat')]);
-    const total   = ftyp.length + moov_r.length + mdatHdr.length + mdatBodySize;
-    const out     = new Uint8Array(total);
+    // Rebuild with real offsets
+    const vstco_r  = fb('stco',0,0,u32(vChunks.length),...vRealOff.flatMap(o=>u32(o)));
+    const vstbl_r  = box('stbl',vstsd,vstts,vstss,vstsc,vstsz,vstco_r);
+    const vminf_r  = box('minf',vmhd,dinf,vstbl_r);
+    const vmdia_r  = box('mdia',vmdhd,vhdlr,vminf_r);
+    const vtrak_r  = box('trak',vtkhd,vmdia_r);
+
+    let atrak_r = [];
+    if (hasAudio) {
+      const ATS  = aSampleRate, AFPF = 1024, ADUR = aChunks.length * AFPF;
+      const asc  = [0x12, 0x10];
+      const esdsData = [0x03,0x19,0x00,0x01,0x00,0x04,0x11,0x40,0x15,0x00,0x00,0x00,0x00,0x01,0xF4,0x00,0x00,0x01,0xF4,0x00,0x05,0x02,...asc,0x06,0x01,0x02];
+      const esds  = fb('esds',0,0,esdsData);
+      const mp4a  = box('mp4a',z(6),u16(1),z(8),u16(2),u16(16),u16(0),u16(0),u32(ATS*65536),esds);
+      const astsd = fb('stsd',0,0,u32(1),mp4a);
+      const astts = fb('stts',0,0,u32(1),u32(aChunks.length),u32(AFPF));
+      const astsz = fb('stsz',0,0,u32(0),u32(aChunks.length),...aChunks.flatMap(c=>u32(c.data.length)));
+      const astsc = fb('stsc',0,0,u32(1),u32(1),u32(1),u32(1));
+      const astco_r = fb('stco',0,0,u32(aChunks.length),...aRealOff.flatMap(o=>u32(o)));
+      const astbl_r = box('stbl',astsd,astts,astsc,astsz,astco_r);
+      const smhd   = fb('smhd',0,0,u16(0),u16(0));
+      const aminf_r = box('minf',smhd,dinf,astbl_r);
+      const amdhd  = fb('mdhd',0,0,u32(0),u32(0),u32(ATS),u32(ADUR),u16(0x55C4),u16(0));
+      const ahdlr  = fb('hdlr',0,0,u32(0),s4('soun'),z(12),[...s4('Soun'),0]);
+      const amdia_r = box('mdia',amdhd,ahdlr,aminf_r);
+      const atkhd  = fb('tkhd',0,3,u32(0),u32(0),u32(2),u32(0),u32(ADUR),z(8),u16(0),u16(0),u16(0x0100),u16(0),mat,u32(0),u32(0));
+      atrak_r = box('trak',atkhd,amdia_r);
+    }
+
+    const moov_r = box('moov', mvhd, vtrak_r, ...(hasAudio ? [atrak_r] : []));
+    const mdatBodySize = [...vChunks, ...aChunks].reduce((a,c)=>a+c.data.length, 0);
+    const mdatHdr = new Uint8Array([...u32(mdatBodySize+8), ...s4('mdat')]);
+
+    const total = ftyp.length + moov_r.length + mdatHdr.length + mdatBodySize;
+    const out   = new Uint8Array(total);
     let p = 0;
-    for (const part of [new Uint8Array(ftyp), new Uint8Array(moov_r), mdatHdr, ...chunks.map(c=>c.data)]) {
+    for (const part of [new Uint8Array(ftyp), new Uint8Array(moov_r), mdatHdr,
+                        ...vChunks.map(c=>c.data), ...aChunks.map(c=>c.data)]) {
       out.set(part, p); p += part.length;
     }
     return new Blob([out], { type: 'video/mp4' });
   }
 
-  // ── Inject file into TikTok's upload input ────────────────────────────────
+  // ── Inject file ───────────────────────────────────────────────────────────
   function injectFile(input, file) {
-    const dt = new DataTransfer();
-    dt.items.add(file);
+    const dt = new DataTransfer(); dt.items.add(file);
     const setter = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'files')?.set;
     if (setter) setter.call(input, dt.files); else input.files = dt.files;
-    ['change', 'input'].forEach(ev =>
-      input.dispatchEvent(new Event(ev, { bubbles: true, cancelable: true }))
-    );
+    ['change','input'].forEach(ev => input.dispatchEvent(new Event(ev, { bubbles: true })));
   }
 
-  // ── Detect upload result ──────────────────────────────────────────────────
-  const ERROR_RE = /over.*\d+.?min|minute.*limit|size.*too|too.*large|file.*too|maximum.*size|not.*support|unsupport|invalid.*file|upload.*fail/i;
-  const SUCCESS_SEL = '[class*="DraftEditor"],[data-placeholder*="description" i],[data-placeholder*="caption" i],div[contenteditable][class*="editor"]';
-
-  async function checkUpload(ms = 20000) {
+  // ── Upload detection ──────────────────────────────────────────────────────
+  const ERR_RE = /over.*\d+.?min|minute.*limit|size.*too|too.*large|file.*too|maximum.*size|not.*support|unsupport|invalid.*file|upload.*fail/i;
+  async function checkUpload(ms = 25000) {
     const start = Date.now();
     while (Date.now() - start < ms) {
       await sleep(700);
       const text = document.body.innerText || '';
-      if (ERROR_RE.test(text)) { dbg(`TikTok error: "${text.match(ERROR_RE)?.[0]}"`); return 'rejected'; }
-      if (document.querySelector(SUCCESS_SEL)) { dbg('Upload accepted — editor visible'); return 'accepted'; }
+      if (ERR_RE.test(text)) { dbg(`Rejected: "${text.match(ERR_RE)?.[0]}"`); return 'rejected'; }
+      if (document.querySelector('[class*="DraftEditor"],[data-placeholder*="description" i],[data-placeholder*="caption" i]')) return 'accepted';
     }
-    return ERROR_RE.test(document.body.innerText) ? 'rejected' : 'timeout';
+    return ERR_RE.test(document.body.innerText) ? 'rejected' : 'timeout';
   }
 
-  // ════════════════════════════════════════════════════════════════════════════
+  // ═══════════════════════════════════════════════════════════════════════════
   // MAIN FLOW
-  // ════════════════════════════════════════════════════════════════════════════
+  // ═══════════════════════════════════════════════════════════════════════════
   (async () => {
     await sleep(2000);
 
-    // ── Step 1: Build video from images ───────────────────────────────────
-    banner(1, `Building ${photoDataUrls.length}-photo slideshow (H.264 720×1280)…`);
-    dbg(`Building video from ${photoDataUrls.length} photos…`);
+    // ── Step 1: Build the MP4 ────────────────────────────────────────────
+    const hasAudio = !!tiktokAudioDataUrl;
+    banner(1, `Building ${photoDataUrls.length}-photo slideshow${hasAudio ? ' 🎵 with song' : ''}…`);
 
     let videoFile = null;
     try {
-      const { blob, type, ext } = await buildH264MP4(photoDataUrls);
+      const blob = await buildH264MP4(photoDataUrls, tiktokAudioDataUrl);
       const sizeMB = (blob.size / 1024 / 1024).toFixed(1);
-      dbg(`Video ready: ${sizeMB}MB ${type}`);
-      videoFile = new File([blob], `tiktok-post.${ext}`, { type });
-      banner(1, `Video ready (${sizeMB}MB, ${type}) — uploading…`);
+      videoFile = new File([blob], 'tiktok-post.mp4', { type: 'video/mp4' });
+      banner(1, `Video ready: ${sizeMB}MB H.264${hasAudio ? ' + AAC 🎵' : ''} — uploading…`);
+      dbg(`Video: ${sizeMB}MB`);
     } catch(e) {
-      dbg(`Video build failed: ${e.message}`);
-      banner(1, `⚠️ Video build failed: ${e.message}. Retrying with simpler format…`, 'warn');
-      // Ultimate fallback: single-frame JPEG as "video"
-      try {
-        const fallback = await buildH264MP4([photoDataUrls[0]]);
-        videoFile = new File([fallback.blob], `tiktok-post.${fallback.ext}`, { type: fallback.type });
-        dbg('Fallback single-photo video created');
-      } catch(e2) {
-        banner(1, `⚠️ Could not create video: ${e2.message}`, 'warn');
-        return;
-      }
-    }
-
-    // ── Step 2: Find file input and inject ────────────────────────────────
-    banner(2, 'Locating TikTok upload area…');
-    const fileInput = await waitFor('input[type="file"]', 12000);
-    if (!fileInput) { banner(2, '⚠️ Upload area not found. Refresh TikTok and retry.', 'warn'); return; }
-
-    dbg(`Injecting ${(videoFile.size/1024/1024).toFixed(1)}MB into file input…`);
-    injectFile(fileInput, videoFile);
-
-    // ── Step 3: Wait for TikTok to process ───────────────────────────────
-    banner(3, 'Waiting for TikTok to process video…');
-    const result = await checkUpload(25000);
-
-    if (result === 'rejected') {
-      banner(3, '⚠️ TikTok rejected the video. Check the error message on the page.', 'warn');
-      dbg('Upload rejected — TikTok showed an error');
+      dbg(`Build failed: ${e.message}`);
+      banner(1, `⚠️ Build failed: ${e.message}`, 'warn');
       return;
     }
 
-    if (result === 'timeout') {
-      dbg('Timeout — proceeding to caption anyway');
-    }
+    // ── Step 2: Inject into TikTok file input ────────────────────────────
+    banner(2, 'Finding upload area…');
+    const fileInput = await waitFor('input[type="file"]', 12000);
+    if (!fileInput) { banner(2, '⚠️ Upload area not found. Refresh and retry.', 'warn'); return; }
 
-    // ── Step 4: Ready — add caption & sound manually / via bot ───────────
+    dbg(`Injecting ${(videoFile.size/1024/1024).toFixed(1)}MB MP4…`);
+    injectFile(fileInput, videoFile);
+
+    // ── Step 3: Wait for TikTok to process ──────────────────────────────
+    banner(3, 'Processing video…');
+    const result = await checkUpload(30000);
+    if (result === 'rejected') {
+      banner(3, '⚠️ TikTok rejected the video. Check error on page.', 'warn');
+      return;
+    }
+    dbg('Upload accepted');
     await sleep(2000);
 
-    // Fill description if box is visible
-    const descSels = ['.public-DraftEditor-content','[contenteditable="true"][class*="editor" i]',
-      '[data-placeholder*="description" i]','div[contenteditable="true"]'];
+    // ── Step 4: Fill Description ─────────────────────────────────────────
+    banner(4, 'Filling description…');
+    const descSels = [
+      '.public-DraftEditor-content',
+      '[contenteditable="true"][class*="editor" i]',
+      '[data-placeholder*="description" i]',
+      'div[contenteditable="true"]',
+    ];
     let descBox = null;
-    for (let att=0; att<6&&!descBox; att++) {
-      for (const s of descSels) { descBox=document.querySelector(s); if(descBox) break; }
+    for (let att = 0; att < 8 && !descBox; att++) {
+      for (const s of descSels) { descBox = document.querySelector(s); if (descBox) break; }
       if (!descBox) await sleep(500);
     }
     if (descBox && caption) {
-      descBox.focus(); await sleep(200);
-      document.execCommand('selectAll',false,null);
-      document.execCommand('insertText',false,caption);
-      dbg('Caption filled');
-    }
+      descBox.focus(); await sleep(300);
+      document.execCommand('selectAll', false, null);
+      document.execCommand('insertText', false, caption);
+      dbg('Description filled');
+    } else { dbg('Description box not found'); }
 
-    if (songName) {
+    // ── Step 5: Add Location ─────────────────────────────────────────────
+    if (location) {
       await sleep(600);
-      const soundBtn = [...document.querySelectorAll('button,[role="button"]')]
-        .find(el => /add\s*(sound|music)/i.test(el.textContent||el.getAttribute('aria-label')||''));
-      if (soundBtn) {
-        soundBtn.click(); await sleep(1200);
-        const mi = document.querySelector('input[placeholder*="Search" i],input[type="search"]');
-        if (mi) {
-          mi.focus(); await sleep(200); mi.value=songName;
-          mi.dispatchEvent(new Event('input',{bubbles:true}));
-          await sleep(2000);
-          const fr = document.querySelector('[class*="music-item"]:first-child,[class*="MusicItem"]:first-child');
-          if (fr) { fr.click(); dbg(`Sound: ${songName}`); }
-        }
+      banner(4, 'Adding location…');
+
+      const cityMatch  = location.match(/\d{4}\s+([A-Za-zÀ-ÿ\s-]+),\s*Belgium/i);
+      const searchTerm = (cityMatch?.[1] || location.split(',')[0] || location).trim();
+      dbg(`Location search: "${searchTerm}"`);
+
+      // Find the "Location" button/field
+      let locTrigger = document.querySelector('[aria-label*="location" i],[placeholder*="location" i]');
+      if (!locTrigger) {
+        locTrigger = [...document.querySelectorAll('[role="button"],button,div[tabindex]')]
+          .find(el => /add\s*(a\s+)?location|^location$/i.test(el.innerText || el.getAttribute('aria-label') || ''));
       }
+      if (locTrigger) {
+        locTrigger.click(); await sleep(700);
+        const locInput = await waitFor('input[placeholder*="Search" i],input[placeholder*="Location" i]', 4000);
+        if (locInput) {
+          locInput.focus(); await sleep(200);
+          for (const ch of searchTerm) { document.execCommand('insertText', false, ch); await sleep(55); }
+          await sleep(2000);
+          const first = document.querySelector('[role="option"]:first-child,[class*="location-item"]:first-child,[class*="LocationItem"]:first-child');
+          if (first) { first.click(); dbg(`Location selected: ${first.innerText?.trim()}`); }
+          else dbg('No location results');
+        }
+      } else { dbg('Location button not found'); }
     }
 
-    const note = songName ? ` 🎵 Verify "<em>${songName}</em>" is set.` : '';
-    banner(4, `✅ Video uploaded! Review &amp; click <strong>Post</strong>.${note}`, 'success');
+    // ── Done ─────────────────────────────────────────────────────────────
+    const note = hasAudio ? ` 🎵 Song baked in.` : '';
+    banner(5,
+      `✅ All set!${note} Review &amp; click <strong>Post</strong>.`,
+      'success'
+    );
     dbg('Bot complete');
   })();
 }

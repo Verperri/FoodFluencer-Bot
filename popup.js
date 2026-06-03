@@ -620,7 +620,23 @@ async function exportAndPost() {
       AppLog.info(`Sending ${photoDataUrls.length} photos to ${platforms.join(", ")}`);
 
       // TikTok: video is built INSIDE the injector from photoDataUrls.
-      // No pre-processing needed here — injector receives photoDataUrls directly.
+      // Pre-fetch song audio here (popup has iTunes host-permission; injector doesn't).
+      // 30s preview ≈ 480KB → ~640KB base64 — well within executeScript arg limits.
+      let tiktokAudioDataUrl = null;
+      if (platforms.includes("tiktok") && selectedSong?.previewUrl) {
+        try {
+          setStatus("Fetching song preview for TikTok…");
+          const ar = await fetch(selectedSong.previewUrl);
+          const ab = await ar.blob();
+          tiktokAudioDataUrl = await new Promise((res, rej) => {
+            const fr = new FileReader(); fr.onload = e => res(e.target.result); fr.onerror = rej;
+            fr.readAsDataURL(ab);
+          });
+          AppLog.info(`Song audio fetched: ${(tiktokAudioDataUrl.length/1024).toFixed(0)}KB`);
+        } catch(e) {
+          AppLog.warn("Could not fetch song audio", String(e));
+        }
+      }
 
       for (const platform of platforms) {
         setStatus(`Opening ${platform}…`);
@@ -628,6 +644,7 @@ async function exportAndPost() {
           type: "OPEN_SOCIAL", platform, photoDataUrls, caption, songName,
           location:         currentRestaurant.address || "",
           restaurantName:   currentRestaurant.name    || "",
+          tiktokAudioDataUrl: platform === "tiktok" ? (tiktokAudioDataUrl || null) : null,
         });
         await new Promise(r => setTimeout(r, 900));
       }
