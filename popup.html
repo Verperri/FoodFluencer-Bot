@@ -8,6 +8,14 @@
 </head>
 <body>
   <div class="container">
+
+    <!-- API usage warning -->
+    <div id="usageWarning" class="banner banner--warn hidden">
+      <span id="usageWarningText"></span>
+      <button id="downloadLogBtn" class="btn-link">Download log</button>
+    </div>
+
+    <!-- Header -->
     <header>
       <img src="icons/icon48.png" class="logo" alt="" />
       <div>
@@ -16,28 +24,31 @@
       </div>
     </header>
 
-    <!-- Shown only when no API key is saved yet -->
+    <!-- API key setup (first run only) -->
     <section id="keySetup" class="key-setup hidden">
       <p>Paste your <strong>Google Places API key</strong> to get started:</p>
       <div class="input-row">
         <input id="apiKeyInput" type="password" placeholder="AIza…" autocomplete="off" />
         <button id="saveKeyBtn" class="btn btn--primary">Save</button>
       </div>
-      <p class="hint">Key is stored locally in your browser — never uploaded anywhere.<br>
-        Get a free key at <strong>console.cloud.google.com</strong> → Places API.</p>
+      <p class="hint">Stored locally in your browser only.<br>
+        Get a free key at <strong>console.cloud.google.com → Places API</strong>.</p>
     </section>
 
+    <!-- ① Search -->
     <section class="search-section">
       <div class="input-row">
         <input id="query" type="text"
           placeholder="e.g. Comme Chez Soi, Brussels"
           autocomplete="off" />
         <button id="searchBtn" class="btn btn--primary">Search</button>
-        <button id="randomBtn" class="btn btn--random">🎲</button>
+        <button id="randomBtn" class="btn btn--random" title="Pick a random Belgian restaurant">🎲</button>
       </div>
     </section>
 
+    <!-- ② Restaurant result + photos -->
     <section id="results" class="results-section hidden">
+
       <div class="restaurant-card">
         <div class="restaurant-info">
           <h2 id="restaurantName"></h2>
@@ -49,20 +60,89 @@
 
       <div id="photoGrid" class="photo-grid"></div>
 
-      <div class="actions">
-        <button id="exportBtn" class="btn btn--export">⬇ Export All Photos</button>
-        <button id="changeKeyBtn" class="btn btn--ghost">⚙ Change API key</button>
-        <!-- Social media sharing — coming in next release -->
-        <div class="social-row">
-          <span class="social-label">Auto-post to:</span>
-          <button class="btn btn--social" disabled title="Coming soon">Instagram</button>
-          <button class="btn btn--social" disabled title="Coming soon">Facebook</button>
-          <button class="btn btn--social" disabled title="Coming soon">TikTok</button>
+      <div class="divider"></div>
+
+      <!-- ③ Song search -->
+      <div class="card-section">
+        <p class="section-label">🎵 Add a song to your post</p>
+        <div class="input-row">
+          <input id="songQuery" type="text" placeholder="Search artist or track…" autocomplete="off" />
+          <button id="songSearchBtn" class="btn btn--ghost-accent">Search</button>
+        </div>
+        <div id="songResults" class="song-results hidden"></div>
+        <div id="selectedSong" class="selected-song hidden">
+          <img id="selectedSongArt" src="" alt="" />
+          <div class="selected-song-info">
+            <span id="selectedSongName" class="song-name"></span>
+            <span id="selectedSongArtist" class="song-artist"></span>
+          </div>
+          <button id="removeSongBtn" class="btn-icon" title="Remove song">✕</button>
         </div>
       </div>
+
+      <div class="divider"></div>
+
+      <!-- ④ Caption editor -->
+      <div class="card-section">
+        <div class="section-header">
+          <p class="section-label">✍️ Caption</p>
+          <button id="refreshCaptionBtn" class="btn-link" title="Regenerate caption">↺ Regenerate</button>
+        </div>
+        <textarea id="caption" class="caption-input" rows="4"
+          placeholder="Caption will be auto-filled after searching a restaurant…"></textarea>
+      </div>
+
+      <div class="divider"></div>
+
+      <!-- ⑤ Social media platforms -->
+      <div class="card-section">
+        <p class="section-label">📲 Post to social media</p>
+        <div class="social-icons">
+
+          <button class="social-btn" data-platform="instagram" title="Instagram">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8">
+              <rect x="2" y="2" width="20" height="20" rx="5" ry="5"/>
+              <circle cx="12" cy="12" r="4.5"/>
+              <circle cx="17.5" cy="6.5" r="1" fill="currentColor" stroke="none"/>
+            </svg>
+            <span>Instagram</span>
+          </button>
+
+          <button class="social-btn" data-platform="facebook" title="Facebook">
+            <svg viewBox="0 0 24 24" fill="currentColor">
+              <path d="M18 2h-3a5 5 0 0 0-5 5v3H7v4h3v8h4v-8h3l1-4h-4V7a1 1 0 0 1 1-1h3z"/>
+            </svg>
+            <span>Facebook</span>
+          </button>
+
+          <button class="social-btn" data-platform="tiktok" title="TikTok">
+            <svg viewBox="0 0 24 24" fill="currentColor">
+              <path d="M19.59 6.69a4.83 4.83 0 0 1-3.77-4.25V2h-3.45v13.67a2.89 2.89 0 0 1-2.88 2.5 2.89 2.89 0 0 1-2.89-2.89 2.89 2.89 0 0 1 2.89-2.89c.28 0 .54.04.79.1V9.01a6.33 6.33 0 0 0-.79-.05 6.34 6.34 0 0 0-6.34 6.34 6.34 6.34 0 0 0 6.34 6.34 6.34 6.34 0 0 0 6.33-6.34V8.73a8.18 8.18 0 0 0 4.78 1.52V6.8a4.85 4.85 0 0 1-1.01-.11z"/>
+            </svg>
+            <span>TikTok</span>
+          </button>
+
+        </div>
+      </div>
+
+      <div class="divider"></div>
+
+      <!-- ⑤ Export -->
+      <div class="export-section">
+        <button id="exportBtn" class="btn btn--export">⬇ Export &amp; Post</button>
+      </div>
+
     </section>
 
+    <!-- Status bar -->
     <div id="status" class="status hidden"></div>
+
+    <!-- Settings footer -->
+    <footer class="settings-footer hidden" id="settingsFooter">
+      <button id="changeKeyBtn" class="btn btn--ghost">⚙ Change API key</button>
+      <button id="usageStatsBtn" class="btn btn--ghost">📊 API usage</button>
+    </footer>
+
   </div>
 
   <script src="config.js"></script>
