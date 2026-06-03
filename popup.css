@@ -136,6 +136,26 @@ h1 { font-size: 0.95rem; font-weight: 700; line-height: 1.2; }
   background: rgba(0,0,0,.55); color: #fff; font-size: 0.62rem;
   padding: 1px 5px; border-radius: 20px;
 }
+/* ── Cover photo badge & controls ───────────────────────────────────────── */
+.photo-item.is-cover {
+  border: 2px solid var(--accent);
+  border-radius: 9px;
+}
+.cover-badge {
+  position: absolute; top: 5px; left: 5px; z-index: 6;
+  background: var(--accent); color: #fff;
+  font-size: .52rem; font-weight: 700; letter-spacing: .1em;
+  text-transform: uppercase; padding: 2px 6px; border-radius: 4px;
+}
+.make-cover-btn {
+  position: absolute; top: 4px; left: 5px; z-index: 5;
+  background: rgba(0,0,0,.55); color: #fff; border: none;
+  border-radius: 4px; font-size: .6rem; font-weight: 600;
+  padding: 2px 6px; cursor: pointer; transition: background .15s;
+  line-height: 1.4;
+}
+.make-cover-btn:hover { background: rgba(232,73,15,.85); }
+
 .dismiss-btn {
   position: absolute; top: 4px; right: 4px;
   width: 20px; height: 20px; border-radius: 50%;
