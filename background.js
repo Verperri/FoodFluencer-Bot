@@ -1210,9 +1210,13 @@ function injectTikTok(photoDataUrls, caption, songName, location, opts) {
       await sleep(600);
       banner(4, 'Adding location…');
 
-      const cityMatch  = location.match(/\d{4}\s+([A-Za-zÀ-ÿ\s-]+),\s*Belgium/i);
-      const searchTerm = (cityMatch?.[1] || location.split(',')[0] || location).trim();
-      dbg(`Location search: "${searchTerm}"`);
+      const cityMatch = location.match(/\d{4}\s+([A-Za-zÀ-ÿ\s-]+),\s*Belgium/i);
+      const city      = (cityMatch?.[1] || location.split(',')[0] || '').trim();
+      // Search by restaurant name first (finds the actual TikTok venue tag).
+      // Fall back to city name if restaurant name produces no results.
+      const { restaurantName: rName = '' } = opts || {};
+      const searchTerm = rName || city || location.split(',')[0].trim();
+      dbg(`Location search: "${searchTerm}" (${rName ? 'venue' : 'city'})`);
 
       // Find the "Location" button/field
       let locTrigger = document.querySelector('[aria-label*="location" i],[placeholder*="location" i]');
@@ -1224,12 +1228,30 @@ function injectTikTok(photoDataUrls, caption, songName, location, opts) {
         locTrigger.click(); await sleep(700);
         const locInput = await waitFor('input[placeholder*="Search" i],input[placeholder*="Location" i]', 4000);
         if (locInput) {
-          locInput.focus(); await sleep(200);
-          for (const ch of searchTerm) { document.execCommand('insertText', false, ch); await sleep(55); }
-          await sleep(2000);
-          const first = document.querySelector('[role="option"]:first-child,[class*="location-item"]:first-child,[class*="LocationItem"]:first-child');
-          if (first) { first.click(); dbg(`Location selected: ${first.innerText?.trim()}`); }
-          else dbg('No location results');
+          // Helper: type a term and wait for results
+          async function typeAndSelect(term) {
+            locInput.focus(); await sleep(200);
+            // Clear existing text
+            document.execCommand('selectAll', false, null);
+            document.execCommand('insertText', false, '');
+            await sleep(100);
+            for (const ch of term) { document.execCommand('insertText', false, ch); await sleep(55); }
+            await sleep(2000);
+            const first = document.querySelector(
+              '[role="option"]:first-child,[class*="location-item"]:first-child,[class*="LocationItem"]:first-child'
+            );
+            if (first) { first.click(); dbg(`Location selected: ${first.innerText?.trim()}`); return true; }
+            return false;
+          }
+
+          // Try restaurant name first, fall back to city
+          const selected = await typeAndSelect(searchTerm);
+          if (!selected && rName && city) {
+            dbg(`No venue results for "${rName}" — retrying with city "${city}"`);
+            await typeAndSelect(city);
+          } else if (!selected) {
+            dbg('No location results found');
+          }
         }
       } else { dbg('Location button not found'); }
     }

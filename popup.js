@@ -66,6 +66,23 @@ async function ensureCoverFont() {
 }
 ensureCoverFont();
 
+// Short tagline for cover — varies per restaurant (consistent per name)
+function getCoverTagline(restaurantName, city) {
+  const seed = restaurantName.split('').reduce((a, c) => a + c.charCodeAt(0), 0);
+  const c = city || 'Belgium';
+  const lines = [
+    `Must visit in ${c} 📍`,
+    `Hidden gem in ${c} ✨`,
+    `Have you been here? 🍽️`,
+    `${c}'s finest dining`,
+    `Worth every bite 😍`,
+    `Don't miss this spot! 🔥`,
+    `A must in ${c}!`,
+    `Next stop: ${c} 📍`,
+  ];
+  return lines[seed % lines.length];
+}
+
 async function createCoverOverlay(imgUri, restaurantName, address) {
   const key = `${imgUri.slice(-40)}|${restaurantName}`;
   if (coverOverlayCache.has(key)) return coverOverlayCache.get(key);
@@ -83,40 +100,88 @@ async function createCoverOverlay(imgUri, restaurantName, address) {
       // Draw base image
       ctx.drawImage(img, 0, 0, W, H);
 
-      // Subtle radial vignette so text is readable on any background
-      const vig = ctx.createRadialGradient(W/2, H*0.5, H*0.05, W/2, H*0.5, H*0.78);
-      vig.addColorStop(0, 'rgba(0,0,0,0.00)');
-      vig.addColorStop(1, 'rgba(0,0,0,0.42)');
-      ctx.fillStyle = vig; ctx.fillRect(0, 0, W, H);
+      // ── Find the darkest vertical zone for best text readability ──────────
+      function sampleLuminance(x, y, w, h) {
+        try {
+          const d = ctx.getImageData(Math.round(x), Math.round(y),
+                                     Math.max(1, Math.round(w)), Math.max(1, Math.round(h))).data;
+          let sum = 0, n = 0;
+          for (let i = 0; i < d.length; i += 16) { // every 4th pixel for speed
+            sum += 0.299 * d[i] + 0.587 * d[i+1] + 0.114 * d[i+2];
+            n++;
+          }
+          return n > 0 ? sum / n : 128;
+        } catch(_) { return 128; }
+      }
 
-      // Extract city from Belgian address "NNNN City, Belgium"
+      // Three candidate zones (top / middle / bottom third)
+      const zones = [
+        { id: 'top',    lum: sampleLuminance(0, 0,       W, H*0.37), centerY: H*0.22 },
+        { id: 'middle', lum: sampleLuminance(0, H*0.30,  W, H*0.40), centerY: H*0.50 },
+        { id: 'bottom', lum: sampleLuminance(0, H*0.63,  W, H*0.37), centerY: H*0.80 },
+      ];
+      const best = zones.reduce((a, b) => a.lum <= b.lum ? a : b);
+
+      // ── Vignette — strongest toward the chosen text zone ─────────────────
+      // Linear gradient from the zone edges
+      const vigStart = best.centerY - H * 0.22;
+      const vigEnd   = best.centerY + H * 0.22;
+      const vlin = ctx.createLinearGradient(0, vigStart, 0, vigEnd);
+      vlin.addColorStop(0,   'rgba(0,0,0,0.00)');
+      vlin.addColorStop(0.5, 'rgba(0,0,0,0.48)');
+      vlin.addColorStop(1,   'rgba(0,0,0,0.00)');
+      ctx.fillStyle = vlin; ctx.fillRect(0, 0, W, H);
+      // Light overall edge vignette
+      const vedge = ctx.createRadialGradient(W/2, H/2, H*0.18, W/2, H/2, H*0.82);
+      vedge.addColorStop(0, 'rgba(0,0,0,0.00)');
+      vedge.addColorStop(1, 'rgba(0,0,0,0.28)');
+      ctx.fillStyle = vedge; ctx.fillRect(0, 0, W, H);
+
+      // ── Sizes ─────────────────────────────────────────────────────────────
+      const nameSize   = Math.max(32, Math.round(W * 0.072));
+      const tagSize    = Math.max(16, Math.round(W * 0.028));
+      const citySize   = Math.max(13, Math.round(W * 0.024));
+      const cornerSize = Math.max(10, Math.round(W * 0.016));
+      const gap        = Math.round(nameSize * 0.38);
+
+      // Extract city
       const cityM = address.match(/\d{4}\s+([A-Za-zÀ-ÿ\s-]+),\s*Belgium/i);
       const city  = (cityM?.[1] || address.split(',')[0] || '').trim();
+      const tagline = getCoverTagline(restaurantName, city);
 
-      const nameSize   = Math.max(28, Math.round(W * 0.074));
-      const citySize   = Math.max(14, Math.round(W * 0.030));
-      const cornerSize = Math.max(10, Math.round(W * 0.018));
+      // Total text block height: tagline + gap + name + (gap + city)?
+      const blockH = tagSize + gap + nameSize + (city ? gap + citySize : 0);
+      let y = best.centerY - blockH / 2;
 
-      ctx.fillStyle  = '#FFFFFF';
-      ctx.textAlign  = 'center';
-      ctx.shadowColor = 'rgba(0,0,0,0.60)';
+      ctx.fillStyle    = '#FFFFFF';
+      ctx.textAlign    = 'center';
+      ctx.textBaseline = 'top';
+      ctx.shadowColor  = 'rgba(0,0,0,0.72)';
+      ctx.shadowOffsetX = 0;
+
+      // ── Tagline (small, italic) ───────────────────────────────────────────
+      ctx.font       = `300 italic ${tagSize}px "Cormorant Garamond", Georgia, serif`;
+      ctx.shadowBlur = Math.round(tagSize * 0.55);
+      ctx.shadowOffsetY = 1;
+      ctx.fillText(tagline, W / 2, y);
+      y += tagSize + gap;
+
+      // ── Restaurant name (larger) ──────────────────────────────────────────
+      ctx.font       = `400 ${nameSize}px "Cormorant Garamond", Georgia, serif`;
+      ctx.shadowBlur = Math.round(nameSize * 0.26);
       ctx.shadowOffsetY = 2;
+      ctx.fillText(restaurantName, W / 2, y);
+      y += nameSize + gap;
 
-      // ── Restaurant name ──────────────────────────────────────────────────
-      ctx.font       = `300 ${nameSize}px "Cormorant Garamond", Georgia, serif`;
-      ctx.textBaseline = 'alphabetic';
-      ctx.shadowBlur = Math.round(nameSize * 0.32);
-      const nameY    = city ? H * 0.47 : H * 0.50;
-      ctx.fillText(restaurantName, W / 2, nameY);
-
-      // ── City subtitle ────────────────────────────────────────────────────
+      // ── City subtitle ─────────────────────────────────────────────────────
       if (city) {
         ctx.font       = `300 italic ${citySize}px "Cormorant Garamond", Georgia, serif`;
         ctx.shadowBlur = Math.round(citySize * 0.4);
-        ctx.fillText(city, W / 2, nameY + nameSize * 1.55);
+        ctx.shadowOffsetY = 1;
+        ctx.fillText(city, W / 2, y);
       }
 
-      // ── Corner micro-label ───────────────────────────────────────────────
+      // ── Bottom-right corner micro-label ───────────────────────────────────
       if (city) {
         ctx.font         = `300 ${cornerSize}px "Cormorant Garamond", Georgia, serif`;
         ctx.textAlign    = 'right';
