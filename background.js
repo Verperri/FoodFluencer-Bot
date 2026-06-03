@@ -17,7 +17,7 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
 // ── Social post handler ───────────────────────────────────────────────────────
 
 const PLATFORM_URLS = {
-  instagram: "https://www.instagram.com/create/select/",
+  instagram: "https://www.instagram.com/",
   facebook:  "https://www.facebook.com/",
   tiktok:    "https://www.tiktok.com/upload",
 };
@@ -233,13 +233,32 @@ function injectFacebook(photoDataUrls, caption, songName) {
 function injectInstagram(photoDataUrls, caption, songName) {
   const sleep = ms => new Promise(r => setTimeout(r, ms));
 
-  const waitFor = (sel, ms = 8000) => new Promise(res => {
-    if (document.querySelector(sel)) return res(document.querySelector(sel));
+  // Poll for an element matching selector, with retries
+  const waitFor = (sel, ms = 10000) => new Promise(res => {
+    const el = document.querySelector(sel); if (el) return res(el);
     const t = Date.now(); const iv = setInterval(() => {
-      const el = document.querySelector(sel);
-      if (el) { clearInterval(iv); return res(el); }
+      const e = document.querySelector(sel);
+      if (e) { clearInterval(iv); return res(e); }
       if (Date.now() - t > ms) { clearInterval(iv); return res(null); }
-    }, 250);
+    }, 300);
+  });
+
+  // Poll for a role="button" whose visible text or aria-label matches a string/regex
+  const waitForBtn = (match, ms = 10000) => new Promise(res => {
+    const find = () => [...document.querySelectorAll('[role="button"],button')]
+      .find(el => {
+        const txt = (el.textContent || '').trim();
+        const lbl = el.getAttribute('aria-label') || '';
+        return typeof match === 'string'
+          ? txt === match || lbl === match
+          : match.test(txt) || match.test(lbl);
+      });
+    const el = find(); if (el) return res(el);
+    const t = Date.now(); const iv = setInterval(() => {
+      const e = find();
+      if (e) { clearInterval(iv); return res(e); }
+      if (Date.now() - t > ms) { clearInterval(iv); return res(null); }
+    }, 300);
   });
 
   function dataUrlToFile(url, name) {
@@ -255,13 +274,21 @@ function injectInstagram(photoDataUrls, caption, songName) {
     files.forEach(f => dt.items.add(f));
     const setter = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'files')?.set;
     if (setter) setter.call(input, dt.files); else input.files = dt.files;
-    input.dispatchEvent(new Event('change', { bubbles: true }));
-    input.dispatchEvent(new Event('input',  { bubbles: true }));
+    ['change', 'input'].forEach(ev =>
+      input.dispatchEvent(new Event(ev, { bubbles: true })));
+  }
+
+  // Also try dispatching a synthetic drop event on a drop zone (fallback)
+  function dropFilesOn(zone, files) {
+    const dt = new DataTransfer();
+    files.forEach(f => dt.items.add(f));
+    ['dragenter', 'dragover'].forEach(ev =>
+      zone.dispatchEvent(new DragEvent(ev, { bubbles: true, cancelable: true, dataTransfer: dt })));
+    zone.dispatchEvent(new DragEvent('drop', { bubbles: true, cancelable: true, dataTransfer: dt }));
   }
 
   function step(n, total, html, type = 'info') {
-    const existing = document.getElementById('ffbot-banner');
-    if (existing) existing.remove();
+    document.getElementById('ffbot-banner')?.remove();
     const b = document.createElement('div'); b.id = 'ffbot-banner';
     const bg = { info: '#e8490f', success: '#16a34a', warn: '#d97706' }[type] || '#e8490f';
     b.style.cssText = `position:fixed;top:0;left:0;right:0;z-index:2147483647;
@@ -270,7 +297,8 @@ function injectInstagram(photoDataUrls, caption, songName) {
       box-shadow:0 3px 14px rgba(0,0,0,.28);`;
     b.innerHTML = `
       <strong style="white-space:nowrap">🍽️ FoodFluencer</strong>
-      <span style="background:rgba(255,255,255,.22);border-radius:20px;padding:1px 8px;font-size:.75rem;white-space:nowrap">${n}/${total}</span>
+      <span style="background:rgba(255,255,255,.22);border-radius:20px;padding:1px 8px;
+        font-size:.75rem;white-space:nowrap">${n}/${total}</span>
       <span style="font-weight:400;flex:1">${html}</span>
       <button onclick="document.getElementById('ffbot-banner').remove()"
         style="background:rgba(255,255,255,.22);border:none;color:#fff;border-radius:5px;
@@ -278,75 +306,143 @@ function injectInstagram(photoDataUrls, caption, songName) {
     document.body.prepend(b);
   }
 
-  function clickNext() {
-    const btn = [...document.querySelectorAll('[role="button"]')]
-      .find(el => el.textContent.trim() === 'Next');
-    if (btn) { btn.click(); return true; } return false;
-  }
-
   (async () => {
     const total = songName ? 6 : 5;
 
-    // ①  Wait for create page
-    step(1, total, 'Loading create page…');
-    await sleep(1800);
+    // ①  Find & click the Create ("+") button in the sidebar
+    step(1, total, 'Finding Create Post button…');
+    await sleep(2500); // let IG SPA fully render
 
-    // ②  Select photos via file input
-    step(2, total, `Selecting <strong>${photoDataUrls.length} photo${photoDataUrls.length > 1 ? 's' : ''}</strong>…`);
-    let fileInput = document.querySelector('input[type="file"]');
-    if (!fileInput) {
-      const selBtn = [...document.querySelectorAll('[role="button"]')]
-        .find(el => /select.*computer|from computer/i.test(el.textContent));
-      if (selBtn) { selBtn.click(); await sleep(600); }
-      fileInput = document.querySelector('input[type="file"]');
+    async function openCreateModal() {
+      // Strategy A: known aria-labels for the create button
+      const createSelectors = [
+        '[aria-label="New post"]',
+        'a[href="/create/select/"]',
+        '[aria-label="Create"]',
+      ];
+      for (const s of createSelectors) {
+        const el = document.querySelector(s);
+        if (el) { (el.closest('a,[role="button"],button') || el).click(); return true; }
+      }
+      // Strategy B: scan SVGs whose aria-label matches
+      const svgCreate = [...document.querySelectorAll('svg[aria-label]')]
+        .find(s => /new post|create/i.test(s.getAttribute('aria-label')));
+      if (svgCreate) { (svgCreate.closest('a,[role="button"],button') || svgCreate).click(); return true; }
+      // Strategy C: text scan of nav links
+      const navCreate = [...document.querySelectorAll('a, [role="button"]')]
+        .find(el => /^(create|new post)$/i.test((el.textContent || '').trim()));
+      if (navCreate) { navCreate.click(); return true; }
+      return false;
     }
-    if (!fileInput) {
-      step(2, total, 'Select your photos from <strong>Downloads/FoodFluencer</strong> in the dialog.', 'warn');
-      return;
+
+    let opened = false;
+    for (let i = 0; i < 5 && !opened; i++) { opened = await openCreateModal(); if (!opened) await sleep(1000); }
+
+    if (!opened) {
+      step(1, total, 'Click the <strong>+</strong> Create button in the Instagram sidebar to open the post dialog.', 'warn');
+      // Don't abort — wait for the modal to appear manually
     }
+    await sleep(1500);
+
+    // ②  Inject photos via the hidden file input inside the modal
+    step(2, total, `Uploading <strong>${photoDataUrls.length} photo${photoDataUrls.length > 1 ? 's' : ''}</strong>…`);
+
     const files = photoDataUrls.map((url, i) => dataUrlToFile(url, `restaurant-${i + 1}.jpg`));
-    setFilesOnInput(fileInput, files);
-    await sleep(2500);
 
-    // ③  Next through Crop
-    step(3, total, 'Advancing through crop step…');
-    clickNext(); await sleep(1600);
+    // Try file input first (with up to 6 retries, triggering "Select from computer" each time)
+    let fileInput = null;
+    for (let attempt = 0; attempt < 6 && !fileInput; attempt++) {
+      fileInput = document.querySelector('input[type="file"]');
+      if (fileInput) break;
 
-    // ④  Next through Filters
-    step(4, total, 'Advancing through filters step…');
-    clickNext(); await sleep(1600);
-
-    // ⑤  Fill caption on Details screen
-    step(5, total, 'Filling caption…');
-    const captionArea = await waitFor(
-      'textarea[aria-label="Write a caption..."], textarea[placeholder*="caption" i], textarea[placeholder*="Caption" i]',
-      5000
-    );
-    if (captionArea) {
-      captionArea.focus(); await sleep(200);
-      const setter = Object.getOwnPropertyDescriptor(HTMLTextAreaElement.prototype, 'value')?.set;
-      if (setter) setter.call(captionArea, caption); else captionArea.value = caption;
-      captionArea.dispatchEvent(new Event('input', { bubbles: true }));
+      // Click "Select from computer" if visible
+      const selBtn = [...document.querySelectorAll('[role="button"], button')]
+        .find(el => /select.*computer|from.*computer/i.test(el.textContent || ''));
+      if (selBtn) selBtn.click();
+      await sleep(1000);
     }
 
-    // ⑥  Try to add music
+    if (fileInput) {
+      setFilesOnInput(fileInput, files);
+      await sleep(3000);
+    } else {
+      // Fallback: drop files onto the dialog's drop zone
+      const dropZone = document.querySelector('[role="dialog"] > div, [class*="Dialog"], [class*="modal"]');
+      if (dropZone) {
+        dropFilesOn(dropZone, files);
+        await sleep(3000);
+      } else {
+        step(2, total,
+          `Could not find upload area. Please click <strong>Select from computer</strong> and choose photos from <strong>Downloads/FoodFluencer</strong>.`,
+          'warn');
+        return;
+      }
+    }
+
+    // ③  Click "Next" through Crop step — wait up to 8s for button to appear
+    step(3, total, 'Advancing through crop step…');
+    const cropNext = await waitForBtn('Next', 8000);
+    if (cropNext) { cropNext.click(); await sleep(2000); }
+    else { step(3, total, 'Please click <strong>Next</strong> to continue past the crop step.', 'warn'); await sleep(4000); }
+
+    // ④  Click "Next" through Filters/Edit step
+    step(4, total, 'Advancing through edit step…');
+    const editNext = await waitForBtn('Next', 8000);
+    if (editNext) { editNext.click(); await sleep(2000); }
+    else { step(4, total, 'Please click <strong>Next</strong> to continue past the edit step.', 'warn'); await sleep(4000); }
+
+    // ⑤  Fill caption — Instagram uses either a textarea or a contenteditable div
+    step(5, total, 'Filling caption…');
+
+    const captionSelectors = [
+      'textarea[aria-label="Write a caption..."]',
+      'div[aria-label="Write a caption..."]',
+      'textarea[placeholder*="caption" i]',
+      '[contenteditable="true"][aria-required]',
+      '[role="textbox"]',
+    ];
+    let captionEl = null;
+    for (let attempt = 0; attempt < 6 && !captionEl; attempt++) {
+      for (const s of captionSelectors) { captionEl = document.querySelector(s); if (captionEl) break; }
+      if (!captionEl) await sleep(800);
+    }
+
+    if (captionEl) {
+      captionEl.click(); await sleep(300);
+      if (captionEl.tagName === 'TEXTAREA') {
+        const setter = Object.getOwnPropertyDescriptor(HTMLTextAreaElement.prototype, 'value')?.set;
+        if (setter) setter.call(captionEl, caption); else captionEl.value = caption;
+        captionEl.dispatchEvent(new Event('input', { bubbles: true }));
+      } else {
+        // contenteditable div — clear then type
+        captionEl.focus(); await sleep(200);
+        document.execCommand('selectAll', false, null);
+        document.execCommand('insertText', false, caption);
+      }
+    }
+
+    // ⑥  Add music (song search)
     if (songName) {
       await sleep(600);
-      const musicBtn = [...document.querySelectorAll('[role="button"]')]
-        .find(el => /add music|music/i.test(el.getAttribute('aria-label') || el.textContent));
+      const musicBtn = await waitForBtn(/add.*music|add.*audio/i, 4000);
       if (musicBtn) {
-        musicBtn.click(); await sleep(1000);
-        const searchInput = document.querySelector('input[placeholder*="Search" i], input[type="search"]');
+        musicBtn.click(); await sleep(1200);
+        const searchInput = await waitFor('input[placeholder*="Search" i], input[type="search"]', 4000);
         if (searchInput) {
           searchInput.focus(); searchInput.value = songName;
           searchInput.dispatchEvent(new Event('input', { bubbles: true }));
-          await sleep(1500);
-          const firstTrack = document.querySelector('[class*="MusicItem"], [class*="music_item"], [class*="track"]');
-          if (firstTrack) firstTrack.click();
+          await sleep(1800);
+          // Click the first result
+          const firstResult = document.querySelector(
+            '[class*="MusicItem"], [class*="music_item"], [class*="AudioItem"], [class*="TrackItem"]'
+          );
+          if (firstResult) firstResult.click();
+          step(6, total, `🎵 <em>"${songName}"</em> searched — confirm selection, then click <strong>Share</strong>.`, 'success');
+        } else {
+          step(6, total, `Caption ready — search for <em>"${songName}"</em> in Add Music, then click <strong>Share</strong>.`, 'success');
         }
-        step(6, total, `🎵 <em>"${songName}"</em> searched — select it, then click <strong>Share</strong>.`, 'success');
       } else {
-        step(6, total, `Caption filled — search for <em>"${songName}"</em> in Add Music, then click <strong>Share</strong>.`, 'success');
+        step(6, total, `Caption ready — tap <strong>Add music</strong> to add <em>"${songName}"</em>, then click <strong>Share</strong>.`, 'success');
       }
     } else {
       step(5, total, `✅ ${files.length} photo${files.length > 1 ? 's' : ''} &amp; caption ready — click <strong>Share</strong> to publish.`, 'success');

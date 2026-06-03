@@ -326,14 +326,27 @@ function buildDefaultCaption() {
   if (!currentRestaurant) return "";
   const { name, address, rating } = currentRestaurant;
 
-  // Extract city for hashtags
+  // Extract city from Belgian address format "NNNN CityName, Belgium"
   const cityMatch = address.match(/\d{4}\s+([A-Za-zÀ-ÿ\s-]+),\s*Belgium/i);
-  const city      = (cityMatch?.[1] || "Belgium").trim().replace(/\s+/g, "");
+  const cityDisplay = (cityMatch?.[1] || "Belgium").trim();
+  const cityTag     = cityDisplay.replace(/\s+/g, "");
 
-  let text = `📍 ${name}\n📌 ${address}`;
+  // Rotating engagement openers — pick based on restaurant name (consistent per restaurant)
+  const seed = name.split("").reduce((a, c) => a + c.charCodeAt(0), 0);
+  const openers = [
+    `Have you ever been to ${name} in ${cityDisplay}? 🍽️ Drop a 💬 below!`,
+    `Best restaurant in ${cityDisplay}? ${name} is definitely worth a visit! 🔥`,
+    `What do you think of ${name}? Let us know in the comments! 👇`,
+    `Discover the hidden gem of ${cityDisplay}: ${name} ✨`,
+    `Next time you're in ${cityDisplay}, make sure to visit ${name}! 📍`,
+    `Have you tried ${name} yet? This is what food dreams are made of 😍`,
+  ];
+  const opener = openers[seed % openers.length];
+
+  let text = `${opener}\n\n📍 ${name}\n📌 ${address}`;
   if (rating) text += `\n⭐ ${rating}/5`;
   if (selectedSong) text += `\n\n🎵 ${selectedSong.name} – ${selectedSong.artist}`;
-  text += `\n\n#${city} #BelgianFood #FoodFluencer #Foodie #FoodPhotography #Restaurant #Belgium`;
+  text += `\n\n#${cityTag} #BelgianFood #FoodFluencer #Foodie #FoodPhotography #Restaurant #Belgium`;
   return text;
 }
 
