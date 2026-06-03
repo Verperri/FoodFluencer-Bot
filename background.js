@@ -1,4 +1,4 @@
-// ── Background logger ─────────────────────────────────────────────────────────
+﻿// ── Background logger ─────────────────────────────────────────────────────────
 
 function bgLog(level, message, data) {
   const entry = {
@@ -801,11 +801,9 @@ function injectInstagram(photoDataUrls, caption, songName, location, opts) {
 }
 
 // ─── TikTok ───────────────────────────────────────────────────────────────────
-// Creates an MP4/WebM slideshow from the restaurant photos + song audio,
-// then uploads it. TikTok requires video — images alone won't upload.
+// Tries 3 upload approaches in sequence until TikTok accepts one.
 
 function injectTikTok(photoDataUrls, caption, songName, location, opts) {
-  const { audioDataUrl = null } = opts || {};
   const sleep = ms => new Promise(r => setTimeout(r, ms));
   const waitFor = (sel, ms = 12000) => new Promise(res => {
     const el = document.querySelector(sel); if (el) return res(el);
@@ -816,23 +814,23 @@ function injectTikTok(photoDataUrls, caption, songName, location, opts) {
     }, 300);
   });
 
-  function step(n, total, html, type = 'info') {
+  const TOTAL = 5;
+  function step(n, html, type = 'info') {
     document.getElementById('ffbot-banner')?.remove();
     const b = document.createElement('div'); b.id = 'ffbot-banner';
     const bg = { info: '#e8490f', success: '#16a34a', warn: '#d97706' }[type] || '#e8490f';
     b.style.cssText = `position:fixed;top:0;left:0;right:0;z-index:2147483647;
       background:${bg};color:#fff;font-family:-apple-system,sans-serif;font-size:13px;
-      font-weight:500;padding:10px 16px;display:flex;align-items:center;gap:10px;
-      box-shadow:0 3px 14px rgba(0,0,0,.28);`;
+      font-weight:500;padding:10px 16px;box-shadow:0 3px 14px rgba(0,0,0,.28);`;
     b.innerHTML = `
-      <strong style="white-space:nowrap">🍽️ FoodFluencer</strong>
-      <span style="background:rgba(255,255,255,.22);border-radius:20px;padding:1px 8px;
-        font-size:.75rem;white-space:nowrap">${n}/${total}</span>
-      <span style="font-weight:400;flex:1">${html}</span>
-      <div id="ffbot-log" style="font-size:.68rem;opacity:.8;margin-top:3px;max-height:40px;overflow:hidden"></div>
-      <button onclick="document.getElementById('ffbot-banner').remove()"
-        style="background:rgba(255,255,255,.22);border:none;color:#fff;border-radius:5px;
-        padding:3px 9px;cursor:pointer;flex-shrink:0">✕</button>`;
+      <div style="display:flex;align-items:center;gap:8px;margin-bottom:3px">
+        <strong>🍽️ FoodFluencer</strong>
+        <span style="background:rgba(255,255,255,.22);border-radius:20px;padding:1px 8px;font-size:.72rem">${n}/${TOTAL}</span>
+        <span style="font-weight:400;flex:1">${html}</span>
+        <button onclick="document.getElementById('ffbot-banner').remove()"
+          style="background:rgba(255,255,255,.22);border:none;color:#fff;border-radius:5px;padding:3px 9px;cursor:pointer">✕</button>
+      </div>
+      <div id="ffbot-log" style="font-size:.68rem;opacity:.8;max-height:36px;overflow:hidden"></div>`;
     document.body.prepend(b);
   }
   function dbg(msg) {
@@ -841,159 +839,329 @@ function injectTikTok(photoDataUrls, caption, songName, location, opts) {
     console.log(`[FoodFluencer TikTok] ${msg}`);
   }
 
-  // ── Fix WebM duration metadata (MediaRecorder leaves it as undefined/0) ────
-  // TikTok reads duration from the EBML container header and rejects files
-  // where the Duration element is missing or 0.
-  // The Duration element has ID 0x4489 and is a float64 in milliseconds.
-  async function fixWebMDuration(blob, totalMs) {
-    return new Promise(resolve => {
-      const reader = new FileReader();
-      reader.onload = e => {
-        const buf  = e.target.result;
-        const data = new Uint8Array(buf);
-        const view = new DataView(buf);
-
-        for (let i = 0; i < data.length - 12; i++) {
-          // Duration element ID: 0x44 0x89
-          if (data[i] !== 0x44 || data[i + 1] !== 0x89) continue;
-
-          const sizeCode = data[i + 2];
-          let dataOffset, dataSize;
-
-          if (sizeCode >= 0x80) {
-            // 1-byte VINT
-            dataSize   = sizeCode & 0x7F;
-            dataOffset = i + 3;
-          } else if (sizeCode >= 0x40) {
-            // 2-byte VINT
-            dataSize   = ((sizeCode & 0x3F) << 8) | data[i + 3];
-            dataOffset = i + 4;
-          } else {
-            continue;
-          }
-
-          if (dataSize === 8) {
-            // Write correct duration as big-endian float64
-            view.setFloat64(dataOffset, totalMs, false);
-            break;
-          }
-        }
-        resolve(new Blob([buf], { type: blob.type }));
-      };
-      reader.readAsArrayBuffer(blob);
-    });
+  // ── Load all images ────────────────────────────────────────────────────────
+  async function loadImages(urls) {
+    const imgs = [];
+    for (const src of urls) {
+      await new Promise(res => {
+        const img = new Image();
+        img.onload = () => { imgs.push(img); res(); };
+        img.onerror = res;
+        img.src = src;
+      });
+    }
+    return imgs;
   }
 
-  // ── Build a WebM slideshow from images + optional audio ───────────────────
-  async function buildSlideshow(imgUrls, audDataUrl, secPerSlide = 1.2) {
-    const W = 1080, H = 1080;
+  function drawFrame(ctx, img, W, H) {
+    ctx.fillStyle = '#111';
+    ctx.fillRect(0, 0, W, H);
+    const s = Math.min(W / img.naturalWidth, H / img.naturalHeight);
+    ctx.drawImage(img, (W - img.naturalWidth * s) / 2, (H - img.naturalHeight * s) / 2, img.naturalWidth * s, img.naturalHeight * s);
+  }
+
+  // ── Inject files into TikTok's file input ─────────────────────────────────
+  function injectFiles(input, files) {
+    const dt = new DataTransfer();
+    files.forEach(f => dt.items.add(f));
+    const setter = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'files')?.set;
+    if (setter) setter.call(input, dt.files); else input.files = dt.files;
+    input.dispatchEvent(new Event('change', { bubbles: true }));
+    input.dispatchEvent(new Event('input',  { bubbles: true }));
+  }
+
+  // ── Check if TikTok accepted the upload (video appears / no "minute" error) ─
+  async function uploadAccepted(waitMs = 7000) {
+    const start = Date.now();
+    while (Date.now() - start < waitMs) {
+      await sleep(600);
+      const pageText = (document.body.innerText || '').toLowerCase();
+      if (/over.*\d+.?min|minute.*limit|\d+.?min.*limit/i.test(pageText)) {
+        dbg('TikTok rejected: duration error in page text');
+        return false;
+      }
+      // Success: video player appeared or editor loaded
+      if (document.querySelector('video[src], video[blob], [class*="DraftEditor"], [class*="caption" i] textarea, div[contenteditable]')) {
+        dbg('Upload accepted: editor elements visible');
+        return true;
+      }
+    }
+    // If no explicit error after waitMs, assume it might have worked (or is processing)
+    const pageText = (document.body.innerText || '').toLowerCase();
+    return !/over.*\d+.?min|minute.*limit/i.test(pageText);
+  }
+
+  // ═══════════════════════════════════════════════════════════════════════════
+  // APPROACH 1 — WebM via MediaRecorder + aggressive WebM duration patch
+  // ═══════════════════════════════════════════════════════════════════════════
+  async function approach1(imgs, secPerSlide) {
+    dbg('Approach 1: WebM MediaRecorder…');
+    const W = 1080, H = 1080, fps = 25;
     const canvas = document.createElement('canvas');
     canvas.width = W; canvas.height = H;
     const ctx = canvas.getContext('2d');
 
-    // Load images
-    const imgs = [];
-    for (let i = 0; i < imgUrls.length; i++) {
-      dbg(`Loading image ${i + 1}/${imgUrls.length}…`);
-      try {
-        await new Promise((res, rej) => {
-          const img = new Image();
-          img.onload = () => { imgs.push(img); res(); };
-          img.onerror = () => { dbg(`Image ${i+1} failed to load`); res(); };
-          img.src = imgUrls[i];
-        });
-      } catch(e) { /* skip */ }
-    }
-    if (!imgs.length) throw new Error('No images loaded');
+    const mimeType = ['video/webm;codecs=vp8', 'video/webm'].find(t => MediaRecorder.isTypeSupported(t)) || 'video/webm';
+    dbg(`Codec: ${mimeType}`);
 
-    // VIDEO-ONLY recording (no audio track in the stream).
-    // Reason: adding an AudioBuffer of 30s (iTunes preview) to the MediaStream
-    // causes TikTok to read the audio track duration as the video duration,
-    // triggering the "over 60-minute limit" rejection.
-    // The song is added AFTER upload via TikTok's native "Add Sound" panel.
-    const mimeType = [
-      'video/webm;codecs=vp9',
-      'video/webm;codecs=vp8',
-      'video/webm',
-    ].find(t => MediaRecorder.isTypeSupported(t)) || 'video/webm';
-    dbg(`Recording video-only as ${mimeType}`);
-
-    const videoStream = canvas.captureStream(25); // no audio tracks added
-    const recorder = new MediaRecorder(videoStream, { mimeType, videoBitsPerSecond: 2_500_000 });
+    const stream = canvas.captureStream(fps);
+    const recorder = new MediaRecorder(stream, { mimeType, videoBitsPerSecond: 2_000_000 });
     const chunks = [];
     recorder.ondataavailable = e => { if (e.data.size > 0) chunks.push(e.data); };
-    recorder.start(100);
+    recorder.start(50);
 
-    // Draw each photo for secPerSlide seconds
     for (let i = 0; i < imgs.length; i++) {
-      const img = imgs[i];
-      ctx.fillStyle = '#111';
-      ctx.fillRect(0, 0, W, H);
-      const s  = Math.min(W / img.naturalWidth, H / img.naturalHeight);
-      const dw = img.naturalWidth * s, dh = img.naturalHeight * s;
-      ctx.drawImage(img, (W - dw) / 2, (H - dh) / 2, dw, dh);
-      dbg(`Rendering slide ${i + 1}/${imgs.length} (${secPerSlide}s)…`);
+      drawFrame(ctx, imgs[i], W, H);
+      dbg(`Slide ${i+1}/${imgs.length}`);
       await sleep(secPerSlide * 1000);
     }
-
     recorder.stop();
 
-    const rawBlob = await new Promise((res, rej) => {
-      recorder.onstop = () => res(new Blob(chunks, { type: 'video/webm' }));
-      setTimeout(() => rej(new Error('Video creation timed out')), 120000);
-    });
+    const rawBlob = await new Promise(res => { recorder.onstop = () => res(new Blob(chunks, { type: 'video/webm' })); });
+    dbg(`Raw WebM: ${(rawBlob.size/1024).toFixed(0)}KB — patching duration…`);
 
-    // Fix the WebM duration metadata so TikTok reads the correct length
+    // Patch duration in WebM binary
     const totalMs = imgs.length * secPerSlide * 1000;
-    dbg(`Raw blob: ${(rawBlob.size / 1024 / 1024).toFixed(1)} MB — fixing WebM duration (${totalMs}ms)…`);
-    const fixedBlob = await fixWebMDuration(rawBlob, totalMs);
-    return fixedBlob;
+    const fixed = await patchWebMDuration(rawBlob, totalMs);
+    return new File([fixed], 'slideshow.webm', { type: 'video/webm' });
   }
 
+  async function patchWebMDuration(blob, totalMs) {
+    const buf = await blob.arrayBuffer();
+    const data = new Uint8Array(buf);
+    const view = new DataView(buf);
+    let patched = false;
+
+    // Scan for EBML Duration element: ID = 0x4489
+    for (let i = 0; i < data.length - 12 && !patched; i++) {
+      if (data[i] !== 0x44 || data[i+1] !== 0x89) continue;
+      const sizeCode = data[i+2];
+      let dataOff, dataLen;
+      if      (sizeCode >= 0x80) { dataLen = sizeCode & 0x7F;                              dataOff = i + 3; }
+      else if (sizeCode >= 0x40) { dataLen = ((sizeCode & 0x3F) << 8) | data[i+3];         dataOff = i + 4; }
+      else if (sizeCode >= 0x20) { dataLen = ((sizeCode & 0x1F) << 16) | (data[i+3] << 8) | data[i+4]; dataOff = i + 5; }
+      else continue;
+      if (dataLen === 8) { view.setFloat64(dataOff, totalMs, false); patched = true; dbg(`Duration patched at byte ${i}`); }
+      else if (dataLen === 4) { view.setFloat32(dataOff, totalMs, false); patched = true; dbg(`Duration patched (f32) at byte ${i}`); }
+    }
+    if (!patched) dbg('Duration element not found in WebM — uploading without patch');
+    return new Blob([buf], { type: blob.type });
+  }
+
+  // ═══════════════════════════════════════════════════════════════════════════
+  // APPROACH 2 — Real H.264 MP4 via WebCodecs API
+  // ═══════════════════════════════════════════════════════════════════════════
+  async function approach2(imgs, secPerSlide) {
+    if (!window.VideoEncoder) throw new Error('WebCodecs VideoEncoder not available');
+    dbg('Approach 2: H.264 MP4 via WebCodecs…');
+
+    const W = 1080, H = 1080, fps = 25;
+    const framesPerSlide = Math.ceil(secPerSlide * fps);
+    const totalFrames    = imgs.length * framesPerSlide;
+
+    const canvas = document.createElement('canvas');
+    canvas.width = W; canvas.height = H;
+    const ctx = canvas.getContext('2d');
+
+    const videoChunks = [];
+    let decoderConfig = null;
+
+    const encoder = new VideoEncoder({
+      output: (chunk, meta) => {
+        if (meta?.decoderConfig) decoderConfig = meta.decoderConfig;
+        const buf = new ArrayBuffer(chunk.byteLength);
+        chunk.copyTo(buf);
+        videoChunks.push({ data: new Uint8Array(buf), ts: chunk.timestamp, isKey: chunk.type === 'key' });
+      },
+      error: e => { throw e; },
+    });
+
+    encoder.configure({
+      codec: 'avc1.42001f', // H.264 Baseline Level 3.1
+      width: W, height: H,
+      bitrate: 2_000_000,
+      framerate: fps,
+      avc: { format: 'avcC' },
+    });
+
+    let frameIdx = 0;
+    for (let i = 0; i < imgs.length; i++) {
+      drawFrame(ctx, imgs[i], W, H);
+      for (let f = 0; f < framesPerSlide; f++) {
+        const ts = Math.round((frameIdx / fps) * 1_000_000);
+        const frame = new VideoFrame(canvas, { timestamp: ts, duration: Math.round(1_000_000 / fps) });
+        encoder.encode(frame, { keyFrame: frameIdx === 0 || f === 0 });
+        frame.close();
+        frameIdx++;
+      }
+      dbg(`Encoded slide ${i+1}/${imgs.length}`);
+    }
+    await encoder.flush();
+    encoder.close();
+    dbg(`Encoded ${videoChunks.length} chunks — muxing MP4…`);
+
+    const mp4Blob = muxMP4(videoChunks, decoderConfig, W, H, fps, totalFrames);
+    return new File([mp4Blob], 'slideshow.mp4', { type: 'video/mp4' });
+  }
+
+  function muxMP4(chunks, decoderConfig, W, H, fps, totalFrames) {
+    const u8  = v => [v & 0xFF];
+    const u16 = v => [(v >> 8) & 0xFF, v & 0xFF];
+    const u32 = v => [(v >>> 24) & 0xFF, (v >>> 16) & 0xFF, (v >>> 8) & 0xFF, v & 0xFF];
+    const str = s => [...new TextEncoder().encode(s).slice(0, 4)];
+    const zeros = n => Array(n).fill(0);
+
+    function box(type, ...children) {
+      const data = children.flat(Infinity);
+      const size = 8 + data.length;
+      return [...u32(size), ...str(type.padEnd(4, ' ')), ...data];
+    }
+    function fb(type, ver, flags, ...children) {
+      return box(type, u8(ver), [(flags >> 16) & 0xFF, (flags >> 8) & 0xFF, flags & 0xFF], ...children);
+    }
+
+    // SPS/PPS from decoderConfig
+    let sps = new Uint8Array([0x67, 0x42, 0x00, 0x1f, 0xda, 0x0d, 0xa8]);
+    let pps = new Uint8Array([0x68, 0xce, 0x38, 0x80]);
+    if (decoderConfig?.description) {
+      const d = new Uint8Array(decoderConfig.description);
+      let i = 5;
+      const ns = d[i++] & 0x1F;
+      for (let j = 0; j < ns; j++) { const l = (d[i] << 8) | d[i+1]; i += 2; sps = d.slice(i, i+l); i += l; }
+      const np = d[i++];
+      for (let j = 0; j < np; j++) { const l = (d[i] << 8) | d[i+1]; i += 2; pps = d.slice(i, i+l); i += l; }
+    }
+
+    const avcC = box('avcC', u8(1), [sps[1], sps[2], sps[3]], [0xFF], [0xE1], u16(sps.length), [...sps], u8(1), u16(pps.length), [...pps]);
+    const avc1 = box('avc1', zeros(6), u16(1), zeros(16), u16(W), u16(H), [0,72,0,0,0,72,0,0], u32(0), u16(1), zeros(32), u16(0x18), u16(0xFFFF), avcC);
+
+    const ts = fps; // timescale = fps → 1 unit = 1/fps second
+    const dur = totalFrames;
+
+    const stts = fb('stts', 0, 0, u32(1), u32(chunks.length), u32(1));
+    const keyIdxs = chunks.map((c,i) => c.isKey ? i+1 : null).filter(Boolean);
+    const stss = fb('stss', 0, 0, u32(keyIdxs.length), ...keyIdxs.flatMap(i => u32(i)));
+    const stsz = fb('stsz', 0, 0, u32(0), u32(chunks.length), ...chunks.flatMap(c => u32(c.data.length)));
+    const stsc = fb('stsc', 0, 0, u32(1), u32(1), u32(1), u32(1));
+    const stsd = fb('stsd', 0, 0, u32(1), avc1);
+    const stco_ph = fb('stco', 0, 0, u32(chunks.length), ...chunks.flatMap(() => u32(0)));
+    const stbl_ph = box('stbl', stsd, stts, stss, stsc, stsz, stco_ph);
+    const vmhd = fb('vmhd', 0, 1, u16(0), zeros(6));
+    const url_ = fb('url ', 0, 1);
+    const dinf = box('dinf', fb('dref', 0, 0, u32(1), url_));
+    const minf_ph = box('minf', vmhd, dinf, stbl_ph);
+    const mdhd = fb('mdhd', 0, 0, u32(0), u32(0), u32(ts), u32(dur), u16(0x55C4), u16(0));
+    const hdlr = fb('hdlr', 0, 0, u32(0), str('vide'), zeros(12), [...str('Vide'), 0]);
+    const mdia_ph = box('mdia', mdhd, hdlr, minf_ph);
+    const mat = [0x00,0x01,0x00,0x00, 0,0,0,0, 0,0,0,0, 0,0,0,0, 0x00,0x01,0x00,0x00, 0,0,0,0, 0,0,0,0, 0,0,0,0, 0x40,0x00,0x00,0x00];
+    const tkhd = fb('tkhd', 0, 3, u32(0), u32(0), u32(1), u32(0), u32(dur), zeros(8), u16(0), u16(0), u16(0), u16(0), mat, u32(W << 16), u32(H << 16));
+    const trak_ph = box('trak', tkhd, mdia_ph);
+    const mvhd = fb('mvhd', 0, 0, u32(0), u32(0), u32(ts), u32(dur), u32(0x10000), u16(0x100), zeros(10), mat, zeros(24), u32(2));
+    const moov_ph = box('moov', mvhd, trak_ph);
+    const ftyp = box('ftyp', str('isom'), u32(0x200), str('isom'), str('iso2'), str('avc1'), str('mp41'));
+
+    // Compute real chunk offsets
+    const mdatHdrSize = 8;
+    const mdatStart = ftyp.length + moov_ph.length + mdatHdrSize;
+    let off = mdatStart;
+    const realOffsets = chunks.map(c => { const o = off; off += c.data.length; return o; });
+
+    // Rebuild with real offsets (same size → offsets remain valid)
+    const stco_r = fb('stco', 0, 0, u32(chunks.length), ...realOffsets.flatMap(o => u32(o)));
+    const stbl_r = box('stbl', stsd, stts, stss, stsc, stsz, stco_r);
+    const minf_r = box('minf', vmhd, dinf, stbl_r);
+    const mdia_r = box('mdia', mdhd, hdlr, minf_r);
+    const trak_r = box('trak', tkhd, mdia_r);
+    const moov_r = box('moov', mvhd, trak_r);
+
+    const mdatData = chunks.flatMap(c => [...c.data]);
+    const mdat = box('mdat', mdatData);
+
+    const all = new Uint8Array([...ftyp, ...moov_r, ...mdat]);
+    return new Blob([all], { type: 'video/mp4' });
+  }
+
+  // ═══════════════════════════════════════════════════════════════════════════
+  // APPROACH 3 — Upload JPEGs directly (TikTok photo carousel)
+  // ═══════════════════════════════════════════════════════════════════════════
+  function approach3(urls) {
+    dbg('Approach 3: Direct JPEG upload…');
+    return urls.map((url, i) => {
+      const [hdr, b64] = url.split(',');
+      const mime = hdr.match(/:(.*?);/)[1];
+      const raw  = atob(b64);
+      const arr  = new Uint8Array(raw.length);
+      for (let j = 0; j < raw.length; j++) arr[j] = raw.charCodeAt(j);
+      return new File([arr], `photo${i+1}.jpg`, { type: mime });
+    });
+  }
+
+  // ═══════════════════════════════════════════════════════════════════════════
+  // MAIN FLOW
+  // ═══════════════════════════════════════════════════════════════════════════
   (async () => {
-    const total = songName ? 5 : 4; // +1 if adding sound
+    const SEC_PER_SLIDE = 1.2;
 
-    // ①  Build the slideshow video
-    const secPerSlide  = 1.2; // 1.2s per photo → 5 photos = 6s total
-    const videoDuration = photoDataUrls.length * secPerSlide;
-    step(1, total, `Creating ${videoDuration.toFixed(0)}s slideshow${audioDataUrl ? ' 🎵 with song' : ''}… (please wait)`);
-    await sleep(500);
+    step(1, 'Loading upload page…');
+    await sleep(1500);
+    const fileInput = await waitFor('input[type="file"]', 12000);
+    if (!fileInput) { step(1, 'Upload area not found — refresh TikTok.', 'warn'); return; }
+    dbg('File input found');
 
-    let videoBlob;
+    // ── Pre-load images ────────────────────────────────────────────────────
+    step(1, 'Loading images…');
+    const imgs = await loadImages(photoDataUrls);
+    if (!imgs.length) { step(1, 'No images loaded.', 'warn'); return; }
+    dbg(`Loaded ${imgs.length} images`);
+
+    let uploadedAs = null;
+
+    // ── Approach 1: WebM ──────────────────────────────────────────────────
+    step(2, 'Approach 1/3 — WebM slideshow (MediaRecorder)…');
     try {
-      videoBlob = await buildSlideshow(photoDataUrls, audioDataUrl, secPerSlide);
-      dbg(`Video ready: ${(videoBlob.size / 1024 / 1024).toFixed(1)} MB`);
-    } catch(e) {
-      step(1, total, `Video creation failed: ${e.message}. Please upload manually.`, 'warn');
+      const file = await approach1(imgs, SEC_PER_SLIDE);
+      dbg(`Injecting WebM: ${(file.size/1024).toFixed(0)}KB`);
+      injectFiles(fileInput, [file]);
+      if (await uploadAccepted(8000)) { uploadedAs = 'WebM'; }
+      else { dbg('Approach 1 rejected by TikTok'); }
+    } catch(e) { dbg(`Approach 1 error: ${e.message}`); }
+
+    // ── Approach 2: H.264 MP4 ─────────────────────────────────────────────
+    if (!uploadedAs) {
+      step(2, 'Approach 2/3 — H.264 MP4 (WebCodecs)…');
+      try {
+        const file = await approach2(imgs, SEC_PER_SLIDE);
+        dbg(`Injecting MP4: ${(file.size/1024).toFixed(0)}KB`);
+        injectFiles(fileInput, [file]);
+        if (await uploadAccepted(10000)) { uploadedAs = 'MP4'; }
+        else { dbg('Approach 2 rejected by TikTok'); }
+      } catch(e) { dbg(`Approach 2 error: ${e.message}`); }
+    }
+
+    // ── Approach 3: JPEG files ─────────────────────────────────────────────
+    if (!uploadedAs) {
+      step(2, 'Approach 3/3 — Direct JPEG upload (photo carousel)…');
+      try {
+        const files = approach3(photoDataUrls);
+        dbg(`Injecting ${files.length} JPEGs`);
+        injectFiles(fileInput, files);
+        await sleep(5000);
+        uploadedAs = 'Photos'; // assume accepted — no easy error check for photos
+      } catch(e) { dbg(`Approach 3 error: ${e.message}`); }
+    }
+
+    if (!uploadedAs) {
+      step(2, '⚠️ All 3 approaches failed. Please upload manually from <strong>Downloads/FoodFluencer</strong>.', 'warn');
       return;
     }
 
-    // ②  Inject video into TikTok's file input
-    step(2, total, 'Uploading video to TikTok…');
-    const fileInput = await waitFor('input[type="file"]', 10000);
-    if (!fileInput) {
-      step(2, total, 'Upload area not found — refresh TikTok and try again.', 'warn');
-      return;
-    }
+    dbg(`Upload accepted as: ${uploadedAs}`);
+    step(3, `Uploaded as <strong>${uploadedAs}</strong> ✓ — filling description…`);
+    await sleep(3000);
 
-    const videoFile = new File([videoBlob], 'restaurant-slideshow.mp4', { type: 'video/mp4' });
-    const dt = new DataTransfer(); dt.items.add(videoFile);
-    const setter = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'files')?.set;
-    if (setter) setter.call(fileInput, dt.files); else fileInput.files = dt.files;
-    fileInput.dispatchEvent(new Event('change', { bubbles: true }));
-    fileInput.dispatchEvent(new Event('input',  { bubbles: true }));
-
-    dbg('Video file injected — waiting for TikTok to process…');
-    await sleep(6000); // TikTok needs time to transcode
-
-    // ③  Fill description / caption
-    step(3, total, 'Filling description…');
-    const descSels = [
-      '.public-DraftEditor-content',
-      '[contenteditable="true"][data-text]',
-      '[class*="editor"][contenteditable="true"]',
-      'div[contenteditable="true"]',
-    ];
+    // ── Fill description ──────────────────────────────────────────────────
+    const descSels = ['.public-DraftEditor-content', '[contenteditable="true"][data-text]',
+      '[class*="editor"][contenteditable="true"]', 'div[contenteditable="true"]'];
     let descBox = null;
     for (const s of descSels) { descBox = document.querySelector(s); if (descBox) break; }
     if (descBox) {
@@ -1001,26 +1169,14 @@ function injectTikTok(photoDataUrls, caption, songName, location, opts) {
       document.execCommand('selectAll', false, null);
       document.execCommand('insertText', false, caption);
       dbg('Description filled');
-    } else { dbg('Description box not found'); }
+    }
 
-    // ④  Add song via TikTok's native "Add Sound" panel
-    //    (song is NOT baked into the video to avoid duration metadata issues)
+    // ── Add sound via TikTok's native panel ───────────────────────────────
     if (songName) {
       await sleep(1000);
-      step(4, total, `Adding sound: <em>"${songName}"</em>…`);
-
-      // Find the "Add sound" button
-      let soundBtn = null;
-      const soundSels = [
-        'button[class*="sound" i]', '[class*="add-sound" i]',
-        'button[aria-label*="sound" i]', 'button[aria-label*="music" i]',
-      ];
-      for (const s of soundSels) { soundBtn = document.querySelector(s); if (soundBtn) break; }
-      if (!soundBtn) {
-        soundBtn = [...document.querySelectorAll('button,[role="button"]')]
-          .find(el => /add\s*(sound|music)/i.test(el.textContent || el.getAttribute('aria-label') || ''));
-      }
-
+      step(4, `Searching TikTok sound: <em>"${songName}"</em>…`);
+      let soundBtn = [...document.querySelectorAll('button,[role="button"]')]
+        .find(el => /add\s*(sound|music)/i.test(el.textContent || el.getAttribute('aria-label') || ''));
       if (soundBtn) {
         soundBtn.click(); await sleep(1200);
         const musicInput = document.querySelector('input[placeholder*="Search" i], input[type="search"]');
@@ -1029,26 +1185,16 @@ function injectTikTok(photoDataUrls, caption, songName, location, opts) {
           musicInput.value = songName;
           musicInput.dispatchEvent(new Event('input', { bubbles: true }));
           await sleep(2000);
-          const firstResult = document.querySelector(
-            '[class*="music-item"]:first-child, [class*="sound-item"]:first-child, [class*="MusicItem"]:first-child'
-          );
-          if (firstResult) {
-            firstResult.click(); await sleep(600);
-            dbg(`Sound selected: ${songName}`);
-          } else {
-            dbg('No sound results — user must add manually');
-          }
+          const firstResult = document.querySelector('[class*="music-item"]:first-child, [class*="MusicItem"]:first-child, [class*="sound-item"]:first-child');
+          if (firstResult) { firstResult.click(); dbg('Sound selected'); await sleep(500); }
         }
-      } else {
-        dbg('Add Sound button not found — user must add manually');
-      }
+      } else { dbg('Add Sound button not found'); }
     }
 
-    // ⑤  Done — stop here, user reviews and clicks Post
-    const songNote = songName ? ` 🎵 Verify <em>"${songName}"</em> is added as sound.` : '';
-    step(total, total,
-      `✅ Video ready! Review description &amp; sound.${songNote} Click <strong>Post</strong> to publish.`,
-      'success');
-    dbg('Bot complete — awaiting manual Post click');
+    // ── Done ──────────────────────────────────────────────────────────────
+    const songNote = songName ? ` 🎵 Verify "<em>${songName}</em>" is added.` : '';
+    step(5, `✅ Uploaded as <strong>${uploadedAs}</strong>. Review &amp; click <strong>Post</strong>.${songNote}`, 'success');
+    dbg('Bot complete');
   })();
 }
+
