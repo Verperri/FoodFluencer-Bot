@@ -465,96 +465,73 @@ function injectInstagram(photoDataUrls, caption, songName, location) {
     // Wait for the crop/arrange screen — editor ready when "Next" appears in the dialog
     step(2, total, 'Waiting for Instagram to process photos…');
 
-    // ── Helper: find & click "Next" INSIDE the modal only ─────────────────────
-    // Searches [role="dialog"] first, falls back to full document.
-    // Dispatches the full mousedown→mouseup→click sequence React needs.
-    // Returns the button text if clicked, null if not found within timeout.
-    async function clickNextInDialog(ms = 12000) {
-      const NEXT_RE = /^(next|volgende|suivant|weiter|siguiente|næste|neste|seuraava)$/i;
+    // ── Visibility check: only interact with elements the user can actually see ──
+    function isVisible(el) {
+      if (!el || !document.contains(el)) return false;
+      const s = window.getComputedStyle(el);
+      return s.display !== 'none' &&
+             s.visibility !== 'hidden' &&
+             parseFloat(s.opacity) > 0.1 &&
+             el.offsetWidth > 0 &&
+             el.offsetHeight > 0;
+    }
 
-      function findNextBtn() {
-        const roots = [document.querySelector('[role="dialog"]'), document.body].filter(Boolean);
-        for (const root of roots) {
-          const btn = [...root.querySelectorAll('[role="button"],button,[tabindex="0"],a')]
-            .find(el => {
-              const txt = (el.innerText || el.textContent || '').trim();
-              const lbl = el.getAttribute('aria-label') || '';
-              return NEXT_RE.test(txt) || NEXT_RE.test(lbl);
-            });
-          if (btn) return btn;
-        }
-        return null;
+    const NEXT_RE = /^(next|volgende|suivant|weiter|siguiente|næste|neste|seuraava)$/i;
+
+    // Find the VISIBLE "Next" button inside the modal (ignores hidden/transitioning ones)
+    function findVisibleNextBtn() {
+      const roots = [document.querySelector('[role="dialog"]'), document.body].filter(Boolean);
+      for (const root of roots) {
+        const btn = [...root.querySelectorAll('[role="button"],button,[tabindex="0"],a')]
+          .find(el => {
+            const txt = (el.innerText || el.textContent || '').trim();
+            const lbl = el.getAttribute('aria-label') || '';
+            return (NEXT_RE.test(txt) || NEXT_RE.test(lbl)) && isVisible(el);
+          });
+        if (btn) return btn;
       }
+      return null;
+    }
 
-      // Poll for the button
-      const start = Date.now();
-      let btn = null;
-      while (Date.now() - start < ms) {
-        btn = findNextBtn();
-        if (btn) break;
-        await sleep(200);
-      }
-      if (!btn) { dbg(`"Next" button not found after ${ms}ms`); return null; }
-
-      const btnText = (btn.innerText || btn.textContent || '').trim();
-      dbg(`Clicking Next: <${btn.tagName}> "${btnText}" role="${btn.getAttribute('role')||''}"`);
-
-      // Small pause then fire full mouse sequence React needs
-      await sleep(150);
-      btn.focus();
+    // Fire the full React-compatible mouse event sequence on an element
+    function reactClick(el) {
+      el.focus();
       ['mouseenter', 'mouseover', 'mousedown', 'mouseup', 'click'].forEach(type =>
-        btn.dispatchEvent(new MouseEvent(type, {
+        el.dispatchEvent(new MouseEvent(type, {
           bubbles: true, cancelable: true, view: window,
           buttons: 1, detail: type === 'click' ? 1 : 0,
         }))
       );
-
-      dbg(`Next clicked — waiting for screen transition`);
-      return btnText;
     }
 
-    // After a Next click, wait until the SAME button is no longer the active Next
-    // (Instagram replaces or removes it during transitions).
-    async function waitForNextToChange(previousBtn, ms = 5000) {
-      const NEXT_RE = /^(next|volgende|suivant|weiter|siguiente|næste|neste|seuraava)$/i;
+    // Wait until a specific button is no longer visible OR removed from DOM.
+    // Instagram often hides (CSS) rather than removes buttons during transitions.
+    async function waitForBtnToDisappear(btn, ms = 6000) {
       const start = Date.now();
       while (Date.now() - start < ms) {
-        await sleep(200);
-        // If the previous button is gone from DOM, screen changed
-        if (!document.contains(previousBtn)) { dbg('Previous Next removed — screen transitioned'); return true; }
-        // Or if the previous button no longer says "Next", screen changed
-        const txt = (previousBtn.innerText || previousBtn.textContent || '').trim();
-        if (!NEXT_RE.test(txt)) { dbg(`Next button text changed to "${txt}" — screen transitioned`); return true; }
+        await sleep(150);
+        if (!document.contains(btn) || !isVisible(btn)) {
+          dbg('Previous Next hidden/removed — transition confirmed');
+          return true;
+        }
       }
-      dbg('waitForNextToChange: timed out — assuming transition happened');
+      dbg('waitForBtnToDisappear: timed out (button still visible)');
       return false;
     }
 
     // ══ STEP 2 → 3: Two "Next" clicks to reach the caption/Share screen ════════
-    // Wait for editor: photos loaded when "Next" appears at top-right of dialog.
     step(2, total, 'Waiting for editor to load…');
 
     for (let clickNum = 1; clickNum <= 2; clickNum++) {
       const label = clickNum === 1 ? 'crop' : 'filter/edit';
       step(clickNum + 1, total, `Advancing past ${label} step…`);
 
-      // Find the dialog's Next button - wait up to 18s on first click (photo processing takes time)
-      const timeout = clickNum === 1 ? 18000 : 10000;
-
-      // Store a reference BEFORE clicking so we can detect when it transitions away
-      const NEXT_RE = /^(next|volgende|suivant|weiter|siguiente|næste|neste|seuraava)$/i;
-      const roots = [document.querySelector('[role="dialog"]'), document.body].filter(Boolean);
+      // Wait for a VISIBLE Next button — 18s for first (photo processing), 12s for second
+      const timeout = clickNum === 1 ? 18000 : 12000;
       let preClickBtn = null;
       const pollStart = Date.now();
       while (Date.now() - pollStart < timeout && !preClickBtn) {
-        for (const root of roots) {
-          preClickBtn = [...root.querySelectorAll('[role="button"],button,[tabindex="0"],a')]
-            .find(el => {
-              const txt = (el.innerText || el.textContent || '').trim();
-              return NEXT_RE.test(txt) || NEXT_RE.test(el.getAttribute('aria-label') || '');
-            });
-          if (preClickBtn) break;
-        }
+        preClickBtn = findVisibleNextBtn();
         if (!preClickBtn) await sleep(200);
       }
 
@@ -567,21 +544,25 @@ function injectInstagram(photoDataUrls, caption, songName, location) {
       }
 
       const btnTxt = (preClickBtn.innerText || preClickBtn.textContent || '').trim();
-      dbg(`Click ${clickNum}/2 (${label}): <${preClickBtn.tagName}> "${btnTxt}"`);
+      dbg(`Click ${clickNum}/2 (${label}): <${preClickBtn.tagName}> visible=${isVisible(preClickBtn)} "${btnTxt}"`);
 
       await sleep(150);
-      preClickBtn.focus();
-      ['mouseenter', 'mouseover', 'mousedown', 'mouseup', 'click'].forEach(type =>
-        preClickBtn.dispatchEvent(new MouseEvent(type, {
-          bubbles: true, cancelable: true, view: window,
-          buttons: 1, detail: type === 'click' ? 1 : 0,
-        }))
-      );
+      reactClick(preClickBtn);
+      dbg(`Fired mouse events on ${label} Next — waiting for it to hide/disappear`);
 
-      // Wait for this specific button to disappear from DOM = screen transitioned
-      const transitioned = await waitForNextToChange(preClickBtn, 5000);
-      dbg(`${label} transition: ${transitioned ? 'confirmed' : 'uncertain'}`);
-      await sleep(800); // brief pause for the new screen to settle
+      // Wait until THIS SPECIFIC BUTTON is no longer visible (CSS hidden or removed).
+      // Instagram often hides buttons via CSS during transitions — must check isVisible().
+      const transitioned = await waitForBtnToDisappear(preClickBtn, 6000);
+      dbg(`${label} transition: ${transitioned ? 'confirmed (button gone)' : 'uncertain — proceeding anyway'}`);
+
+      // If not confirmed, retry the click once
+      if (!transitioned) {
+        dbg('Retrying click — button was still visible after 6s');
+        reactClick(preClickBtn);
+        await sleep(1500);
+      }
+
+      await sleep(600); // let new screen fully render before next iteration
     }
 
     // ══ STEP 4: Fill caption — now on Details screen (Share button visible) ════
