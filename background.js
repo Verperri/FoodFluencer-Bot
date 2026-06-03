@@ -42,8 +42,8 @@ const INJECTORS = {
   tiktok:    injectTikTok,
 };
 
-async function handleSocialPost({ platform, photoDataUrls, caption, songName, location, restaurantName, tiktokVideoDataUrl, tiktokVideoPath }) {
-  bgLog('info', `Opening ${platform}`, { photos: photoDataUrls.length, song: songName, location, tiktokVideoDataUrl, tiktokVideoPath });
+async function handleSocialPost({ platform, photoDataUrls, caption, songName, location, restaurantName, tiktokVideoDataUrl }) {
+  bgLog('info', `Opening ${platform}`, { photos: photoDataUrls.length, song: songName, location, tiktokVideoKB: tiktokVideoDataUrl ? Math.round(tiktokVideoDataUrl.length * 0.75 / 1024) : 0 });
   const tab = await chrome.tabs.create({ url: PLATFORM_URLS[platform], active: true });
 
   await new Promise(resolve => {
@@ -62,7 +62,7 @@ async function handleSocialPost({ platform, photoDataUrls, caption, songName, lo
     await chrome.scripting.executeScript({
       target: { tabId: tab.id },
       func:   INJECTORS[platform],
-      args:   [photoDataUrls, caption, songName || "", location || "", { restaurantName: restaurantName || "", tiktokVideoDataUrl: tiktokVideoDataUrl || null, tiktokVideoPath: tiktokVideoPath || null }],
+      args:   [photoDataUrls, caption, songName || "", location || "", { restaurantName: restaurantName || "", tiktokVideoDataUrl: tiktokVideoDataUrl || null }],
       world:  "MAIN",
     });
     bgLog('info', `Injected script on ${platform}`);

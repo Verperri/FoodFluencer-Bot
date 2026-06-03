@@ -619,12 +619,10 @@ async function exportAndPost() {
     if (photoDataUrls.length > 0) {
       AppLog.info(`Sending ${photoDataUrls.length} photos to ${platforms.join(", ")}`);
 
-      // For TikTok: create H.264 MP4 in popup context (has WebCodecs + chrome APIs).
-      // We pass the encoded bytes directly to the injector, which injects them via
-      // DataTransfer — exactly the same mechanism that works for Instagram.
-      // (Previous attempts failed because the VIDEO FORMAT was wrong, not the injection.)
+      // For TikTok: create H.264 MP4 in popup (has WebCodecs + full Web API).
+      // Pass the encoded bytes directly to the injector via executeScript args.
+      // The injector injects via DataTransfer — same mechanism that works for Instagram.
       let tiktokVideoDataUrl = null;
-      let tiktokVideoPath    = null;
       if (platforms.includes("tiktok")) {
         try {
           setStatus("Creating TikTok video (H.264 MP4)…");
@@ -635,23 +633,22 @@ async function exportAndPost() {
           });
 
           const sizeMB = (mp4Blob.size / 1024 / 1024).toFixed(1);
-          AppLog.info(`TikTok MP4 created: ${sizeMB}MB`);
+          AppLog.info(`TikTok video created: ${sizeMB}MB, type: ${mp4Blob.type}`);
           setStatus(`TikTok video ready (${sizeMB}MB) — opening TikTok…`);
 
-          // Convert to data URL (JSON-serialisable, passes through executeScript args)
-          tiktokVideoDataUrl = await new Promise(res => {
-            const fr = new FileReader(); fr.onload = e => res(e.target.result); fr.readAsDataURL(mp4Blob);
+          // Convert to data URL — JSON-serialisable, passes through executeScript args
+          tiktokVideoDataUrl = await new Promise((res, rej) => {
+            const fr = new FileReader();
+            fr.onload = e => res(e.target.result);
+            fr.onerror = rej;
+            fr.readAsDataURL(mp4Blob);
           });
-
-          // Also download as backup so user can manually select if injection fails
-          const slug = new Date().toISOString().slice(0, 10);
-          tiktokVideoPath = `FoodFluencer/tiktok-post-${slug}.mp4`;
-          chrome.runtime.sendMessage({ type: "DOWNLOAD", url: tiktokVideoDataUrl, filename: tiktokVideoPath });
-          AppLog.info("TikTok MP4 also saved to Downloads", { path: tiktokVideoPath });
+          AppLog.info(`TikTok data URL ready: ${(tiktokVideoDataUrl.length / 1024).toFixed(0)}KB string`);
 
         } catch (e) {
-          AppLog.error("TikTok MP4 creation failed", String(e));
+          AppLog.error("TikTok video creation failed", String(e));
           setStatus("⚠️ TikTok video creation failed: " + e.message, "error");
+          console.error("[FoodFluencer] TikTok MP4 error:", e);
         }
       }
 
@@ -662,7 +659,6 @@ async function exportAndPost() {
           location:         currentRestaurant.address || "",
           restaurantName:   currentRestaurant.name    || "",
           tiktokVideoDataUrl: platform === "tiktok" ? (tiktokVideoDataUrl || null) : null,
-          tiktokVideoPath:    platform === "tiktok" ? (tiktokVideoPath    || null) : null,
         });
         await new Promise(r => setTimeout(r, 900));
       }
@@ -683,90 +679,107 @@ async function exportAndPost() {
   $("exportBtn").disabled = false;
 }
 
-// ── TikTok MP4 builder (runs in popup context — has full Web API + chrome APIs) ─
-// Creates a proper H.264 MP4 using the WebCodecs VideoEncoder API.
-// Falls back to MediaRecorder WebM if WebCodecs unavailable.
+// ── TikTok MP4 builder (runs in popup context — has WebCodecs + full Web APIs) ─
 
 async function createTikTokMP4(photoDataUrls, onProgress) {
-  const W = 720, H = 1280; // 9:16 portrait — TikTok's native format
-  const FPS = 25;
-  const BITRATE = 2_500_000;
-  const SEC_PER_SLIDE = 1.2;
+  const W = 720, H = 1280; // 9:16 portrait
+  const FPS = 25, BITRATE = 2_000_000, SEC_PER_SLIDE = 1.2;
 
   // Load images
   const images = [];
   for (const src of photoDataUrls) {
     const img = new Image();
-    await new Promise((res, rej) => { img.onload = res; img.onerror = rej; img.src = src; });
-    images.push(img);
+    await new Promise((res, rej) => { img.onload = res; img.onerror = () => res(); img.src = src; });
+    if (img.naturalWidth > 0) images.push(img);
   }
+  if (!images.length) throw new Error('No images loaded');
 
   const canvas = document.createElement('canvas');
   canvas.width = W; canvas.height = H;
   const ctx = canvas.getContext('2d');
 
   function drawSlide(img) {
-    ctx.fillStyle = '#000';
-    ctx.fillRect(0, 0, W, H);
+    ctx.fillStyle = '#000'; ctx.fillRect(0, 0, W, H);
     const s = Math.min(W / img.naturalWidth, H / img.naturalHeight);
     ctx.drawImage(img, (W - img.naturalWidth * s) / 2, (H - img.naturalHeight * s) / 2, img.naturalWidth * s, img.naturalHeight * s);
   }
 
-  // ── WebCodecs path ──────────────────────────────────────────────────────
+  // ── WebCodecs path ────────────────────────────────────────────────────────
   if (window.VideoEncoder) {
-    const TIMESCALE = 90000;
-    const SAMPLE_DUR = Math.round(TIMESCALE / FPS); // 3600 at 25fps
-    const framesPerSlide = Math.ceil(SEC_PER_SLIDE * FPS);
-    const totalFrames = images.length * framesPerSlide;
+    // Try codecs from most to least capable, picking the first supported one
+    const CODECS = [
+      'avc1.4d0028', // H.264 Main Level 4.0
+      'avc1.42001f', // H.264 Baseline Level 3.1
+      'avc1.42001e', // H.264 Baseline Level 3.0
+      'avc1.420014', // H.264 Baseline Level 2.0
+    ];
 
-    const chunks = []; let decoderConfig = null;
-    const encoder = new VideoEncoder({
-      output: (chunk, meta) => {
-        if (meta?.decoderConfig) decoderConfig = meta.decoderConfig;
-        const buf = new ArrayBuffer(chunk.byteLength);
-        chunk.copyTo(buf);
-        chunks.push({ data: new Uint8Array(buf), isKey: chunk.type === 'key' });
-      },
-      error: e => { throw new Error(`VideoEncoder: ${e.message}`); },
-    });
-
-    encoder.configure({
-      codec:     'avc1.4d0028', // H.264 Main profile Level 4.0
-      width: W, height: H,
-      bitrate:   BITRATE,
-      framerate: FPS,
-      avc: { format: 'avcC' },
-    });
-
-    let fi = 0;
-    for (let i = 0; i < images.length; i++) {
-      drawSlide(images[i]);
-      for (let f = 0; f < framesPerSlide; f++) {
-        const ts = Math.round(fi * 1_000_000 / FPS);
-        const frame = new VideoFrame(canvas, { timestamp: ts, duration: Math.round(1_000_000 / FPS) });
-        encoder.encode(frame, { keyFrame: fi === 0 || f === 0 });
-        frame.close(); fi++;
-      }
-      if (onProgress) onProgress(i + 1, images.length);
-      // Yield to keep popup responsive
-      await new Promise(r => setTimeout(r, 0));
+    let chosenCodec = null;
+    for (const codec of CODECS) {
+      try {
+        const support = await VideoEncoder.isConfigSupported({
+          codec, width: W, height: H, bitrate: BITRATE, framerate: FPS,
+        });
+        if (support.supported) { chosenCodec = codec; break; }
+      } catch (_) {}
     }
 
-    await encoder.flush();
-    encoder.close();
+    if (!chosenCodec) {
+      AppLog.warn('No H.264 codec supported by WebCodecs — falling back to WebM');
+    } else {
+      AppLog.info(`WebCodecs encoding with ${chosenCodec}`);
+      const TIMESCALE = 90000;
+      const SAMPLE_DUR = Math.round(TIMESCALE / FPS);
+      const framesPerSlide = Math.ceil(SEC_PER_SLIDE * FPS);
+      const totalFrames = images.length * framesPerSlide;
 
-    return buildMP4Blob(chunks, decoderConfig, W, H, FPS, TIMESCALE, SAMPLE_DUR, totalFrames);
+      const chunks = []; let decoderConfig = null; let encodeError = null;
+      const encoder = new VideoEncoder({
+        output: (chunk, meta) => {
+          if (meta?.decoderConfig) decoderConfig = meta.decoderConfig;
+          const buf = new ArrayBuffer(chunk.byteLength);
+          chunk.copyTo(buf);
+          chunks.push({ data: new Uint8Array(buf), isKey: chunk.type === 'key' });
+        },
+        error: e => { encodeError = e; },
+      });
+
+      encoder.configure({ codec: chosenCodec, width: W, height: H, bitrate: BITRATE, framerate: FPS, avc: { format: 'avcC' } });
+
+      let fi = 0;
+      for (let i = 0; i < images.length; i++) {
+        drawSlide(images[i]);
+        for (let f = 0; f < framesPerSlide; f++) {
+          if (encodeError) throw new Error(`Encoder error: ${encodeError.message}`);
+          const ts = Math.round(fi * 1_000_000 / FPS);
+          const frame = new VideoFrame(canvas, { timestamp: ts, duration: Math.round(1_000_000 / FPS) });
+          encoder.encode(frame, { keyFrame: fi === 0 || f === 0 });
+          frame.close(); fi++;
+        }
+        if (onProgress) onProgress(i + 1, images.length);
+        await new Promise(r => setTimeout(r, 0)); // yield
+      }
+      await encoder.flush();
+      encoder.close();
+      if (encodeError) throw new Error(`Encoder error: ${encodeError.message}`);
+      AppLog.info(`WebCodecs encoded ${chunks.length} chunks, ${(chunks.reduce((a,c)=>a+c.data.length,0)/1024).toFixed(0)}KB`);
+      return buildMP4Blob(chunks, decoderConfig, W, H, FPS, TIMESCALE, SAMPLE_DUR, totalFrames);
+    }
+  } else {
+    AppLog.warn('VideoEncoder (WebCodecs) not available — using MediaRecorder fallback');
   }
 
-  // ── MediaRecorder fallback (WebM) ───────────────────────────────────────
+  // ── MediaRecorder fallback ────────────────────────────────────────────────
+  // Note: produces WebM, not MP4 — TikTok might still reject it.
+  // If WebCodecs was unavailable on this browser, WebM is the only option.
   const mimeType = ['video/webm;codecs=vp9', 'video/webm;codecs=vp8', 'video/webm']
     .find(t => MediaRecorder.isTypeSupported(t)) || 'video/webm';
+  AppLog.info(`MediaRecorder fallback using ${mimeType}`);
   const stream = canvas.captureStream(FPS);
   const rec = new MediaRecorder(stream, { mimeType, videoBitsPerSecond: BITRATE });
   const ch = [];
   rec.ondataavailable = e => { if (e.data.size > 0) ch.push(e.data); };
   rec.start(100);
-
   for (let i = 0; i < images.length; i++) {
     drawSlide(images[i]);
     if (onProgress) onProgress(i + 1, images.length);
