@@ -42,8 +42,8 @@ const INJECTORS = {
   tiktok:    injectTikTok,
 };
 
-async function handleSocialPost({ platform, photoDataUrls, caption, songName, location }) {
-  bgLog('info', `Opening ${platform}`, { photos: photoDataUrls.length, song: songName, location });
+async function handleSocialPost({ platform, photoDataUrls, caption, songName, location, restaurantName, audioDataUrl }) {
+  bgLog('info', `Opening ${platform}`, { photos: photoDataUrls.length, song: songName, location, restaurantName });
   const tab = await chrome.tabs.create({ url: PLATFORM_URLS[platform], active: true });
 
   await new Promise(resolve => {
@@ -62,7 +62,7 @@ async function handleSocialPost({ platform, photoDataUrls, caption, songName, lo
     await chrome.scripting.executeScript({
       target: { tabId: tab.id },
       func:   INJECTORS[platform],
-      args:   [photoDataUrls, caption, songName || "", location || ""],
+      args:   [photoDataUrls, caption, songName || "", location || "", { restaurantName: restaurantName || "", audioDataUrl: audioDataUrl || null }],
       world:  "MAIN",
     });
     bgLog('info', `Injected script on ${platform}`);
@@ -78,7 +78,7 @@ async function handleSocialPost({ platform, photoDataUrls, caption, songName, lo
 
 // ─── Facebook ─────────────────────────────────────────────────────────────────
 
-function injectFacebook(photoDataUrls, caption, songName) {
+function injectFacebook(photoDataUrls, caption, songName, location, opts) {
   /* ── helpers ── */
   const sleep = ms => new Promise(r => setTimeout(r, ms));
 
@@ -247,7 +247,8 @@ function injectFacebook(photoDataUrls, caption, songName) {
 
 // ─── Instagram ────────────────────────────────────────────────────────────────
 
-function injectInstagram(photoDataUrls, caption, songName, location) {
+function injectInstagram(photoDataUrls, caption, songName, location, opts) {
+  const { restaurantName = '' } = opts || {};
   const sleep = ms => new Promise(r => setTimeout(r, ms));
 
   const waitFor = (sel, ms = 12000) => new Promise(res => {
@@ -349,7 +350,8 @@ function injectInstagram(photoDataUrls, caption, songName, location) {
   }
 
   (async () => {
-    const total = location ? (songName ? 6 : 5) : (songName ? 5 : 4);
+    // Steps: create+post(1) upload(2) crop-Next(3) edit-Next(4) caption(5) location(6) collab(7) [+1 if song]
+    const total = songName ? 8 : 7;
     step(1, total, 'Loading Instagram…');
     await sleep(1500); // wait for SPA hydration
 
@@ -734,49 +736,88 @@ function injectInstagram(photoDataUrls, caption, songName, location) {
       } else { dbg('Location trigger not found'); }
     }
 
+    // ══ STEP 7: Search for restaurant as collaborator ════════════════════════
+    const collabStep = total - (songName ? 1 : 0);
+    step(collabStep, total, 'Searching for restaurant collaborator…');
+    await sleep(500);
+
+    if (restaurantName) {
+      const collabTrigger = [...document.querySelectorAll('[role="button"],button,div[tabindex="0"]')]
+        .find(el => /invite.*collab|add.*collab|collab/i.test(
+          el.innerText || el.textContent || el.getAttribute('aria-label') || ''));
+
+      if (collabTrigger) {
+        dbg(`Collab trigger found: "${collabTrigger.innerText?.trim()}"`);
+        collabTrigger.click(); await sleep(1000);
+
+        const searchInput = await waitFor('input[placeholder*="Search" i],input[type="text"]', 3000);
+        if (searchInput) {
+          searchInput.focus(); await sleep(200);
+          const searchTerm = restaurantName.replace(/[^\w\s]/g, ' ').trim().slice(0, 25);
+          for (const ch of searchTerm) { document.execCommand('insertText', false, ch); await sleep(45); }
+          dbg(`Searching collaborator: "${searchTerm}"`);
+          await sleep(2000);
+
+          const results = [...document.querySelectorAll('[role="option"], [class*="user"], [class*="account"]')]
+            .filter(el => isVisible(el));
+          if (results.length > 0) {
+            const firstResult = results[0];
+            const resultText = (firstResult.innerText || firstResult.textContent || '').toLowerCase();
+            const searchLower = searchTerm.toLowerCase().replace(/\s+/g, '');
+            const resultNorm  = resultText.replace(/\s+/g, '');
+            const isMatch = resultNorm.includes(searchLower.slice(0, 5)) ||
+                            searchLower.includes(resultNorm.slice(0, 5));
+
+            if (isMatch) {
+              firstResult.click(); await sleep(500);
+              dbg(`Collaborator added: ${firstResult.innerText?.trim()}`);
+              step(collabStep, total, `✅ Collaborator <strong>${firstResult.innerText?.trim()}</strong> added.`);
+            } else {
+              dbg(`No close match for "${restaurantName}" — top result: "${firstResult.innerText?.trim()}" — skipping`);
+              step(collabStep, total, `No matching collaborator found for <em>"${restaurantName}"</em> — skipping.`);
+              const backBtn = document.querySelector('[aria-label="Back"],[aria-label="Close"]');
+              if (backBtn) { backBtn.click(); await sleep(400); }
+            }
+          } else {
+            dbg('No collaborator search results');
+            step(collabStep, total, `No Instagram account found for <em>"${restaurantName}"</em> — skipping.`);
+            const backBtn = document.querySelector('[aria-label="Back"],[aria-label="Close"]');
+            if (backBtn) { backBtn.click(); await sleep(400); }
+          }
+        }
+      } else {
+        dbg('Collab button not found on page');
+        step(collabStep, total, 'Collaborator section not found — skipping.');
+      }
+    }
+
     // ══ Final: stop here, user clicks Share ══════════════════════════════════
     const songHint = songName ? ` &nbsp;🎵 Tap <strong>Add music</strong> → <em>"${songName}"</em>.` : '';
     step(total, total,
-      `✅ All ready! Review your post${location ? ', location' : ''}.${songHint} Click <strong>Share</strong> to publish.`,
+      `✅ All ready! Review caption, location &amp; collaborator.${songHint} Click <strong>Share</strong> to publish.`,
       'success');
     dbg('Bot stopped — waiting for user to click Share');
   })();
 }
 
 // ─── TikTok ───────────────────────────────────────────────────────────────────
+// Creates an MP4/WebM slideshow from the restaurant photos + song audio,
+// then uploads it. TikTok requires video — images alone won't upload.
 
-function injectTikTok(photoDataUrls, caption, songName) {
+function injectTikTok(photoDataUrls, caption, songName, location, opts) {
+  const { audioDataUrl = null } = opts || {};
   const sleep = ms => new Promise(r => setTimeout(r, ms));
-
-  const waitFor = (sel, ms = 10000) => new Promise(res => {
-    if (document.querySelector(sel)) return res(document.querySelector(sel));
+  const waitFor = (sel, ms = 12000) => new Promise(res => {
+    const el = document.querySelector(sel); if (el) return res(el);
     const t = Date.now(); const iv = setInterval(() => {
-      const el = document.querySelector(sel);
-      if (el) { clearInterval(iv); return res(el); }
+      const e = document.querySelector(sel);
+      if (e) { clearInterval(iv); return res(e); }
       if (Date.now() - t > ms) { clearInterval(iv); return res(null); }
     }, 300);
   });
 
-  function dataUrlToFile(url, name) {
-    const [hdr, b64] = url.split(',');
-    const mime = hdr.match(/:(.*?);/)[1];
-    const bin = atob(b64); const arr = new Uint8Array(bin.length);
-    for (let i = 0; i < bin.length; i++) arr[i] = bin.charCodeAt(i);
-    return new File([arr], name, { type: mime });
-  }
-
-  function setFilesOnInput(input, files) {
-    const dt = new DataTransfer();
-    files.forEach(f => dt.items.add(f));
-    const setter = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'files')?.set;
-    if (setter) setter.call(input, dt.files); else input.files = dt.files;
-    input.dispatchEvent(new Event('change', { bubbles: true }));
-    input.dispatchEvent(new Event('input',  { bubbles: true }));
-  }
-
   function step(n, total, html, type = 'info') {
-    const existing = document.getElementById('ffbot-banner');
-    if (existing) existing.remove();
+    document.getElementById('ffbot-banner')?.remove();
     const b = document.createElement('div'); b.id = 'ffbot-banner';
     const bg = { info: '#e8490f', success: '#16a34a', warn: '#d97706' }[type] || '#e8490f';
     b.style.cssText = `position:fixed;top:0;left:0;right:0;z-index:2147483647;
@@ -785,30 +826,138 @@ function injectTikTok(photoDataUrls, caption, songName) {
       box-shadow:0 3px 14px rgba(0,0,0,.28);`;
     b.innerHTML = `
       <strong style="white-space:nowrap">🍽️ FoodFluencer</strong>
-      <span style="background:rgba(255,255,255,.22);border-radius:20px;padding:1px 8px;font-size:.75rem;white-space:nowrap">${n}/${total}</span>
+      <span style="background:rgba(255,255,255,.22);border-radius:20px;padding:1px 8px;
+        font-size:.75rem;white-space:nowrap">${n}/${total}</span>
       <span style="font-weight:400;flex:1">${html}</span>
+      <div id="ffbot-log" style="font-size:.68rem;opacity:.8;margin-top:3px;max-height:40px;overflow:hidden"></div>
       <button onclick="document.getElementById('ffbot-banner').remove()"
         style="background:rgba(255,255,255,.22);border:none;color:#fff;border-radius:5px;
-        padding:3px 9px;cursor:pointer;white-space:nowrap;flex-shrink:0">✕ Close</button>`;
+        padding:3px 9px;cursor:pointer;flex-shrink:0">✕</button>`;
     document.body.prepend(b);
+  }
+  function dbg(msg) {
+    const l = document.getElementById('ffbot-log');
+    if (l) { const d = document.createElement('div'); d.textContent = `→ ${msg}`; l.prepend(d); while(l.children.length > 3) l.lastChild.remove(); }
+    console.log(`[FoodFluencer TikTok] ${msg}`);
+  }
+
+  // ── Build a WebM/MP4 slideshow from images + optional audio ────────────────
+  async function buildSlideshow(imgUrls, audDataUrl, secPerSlide = 3.5) {
+    const W = 1080, H = 1080;
+    const canvas = document.createElement('canvas');
+    canvas.width = W; canvas.height = H;
+    const ctx = canvas.getContext('2d');
+
+    // Load images
+    const imgs = [];
+    for (let i = 0; i < imgUrls.length; i++) {
+      dbg(`Loading image ${i + 1}/${imgUrls.length}…`);
+      try {
+        await new Promise((res, rej) => {
+          const img = new Image();
+          img.onload = () => { imgs.push(img); res(); };
+          img.onerror = () => { dbg(`Image ${i+1} failed to load`); res(); };
+          img.src = imgUrls[i];
+        });
+      } catch(e) { /* skip */ }
+    }
+    if (!imgs.length) throw new Error('No images loaded');
+
+    // Set up audio
+    const audioTracks = [];
+    let audCtx = null, audSrc = null;
+    if (audDataUrl) {
+      try {
+        audCtx = new (window.AudioContext || window.webkitAudioContext)();
+        const b64 = audDataUrl.split(',')[1];
+        const raw = atob(b64);
+        const buf = new Uint8Array(raw.length);
+        for (let i = 0; i < raw.length; i++) buf[i] = raw.charCodeAt(i);
+        const decoded = await audCtx.decodeAudioData(buf.buffer);
+        const dest = audCtx.createMediaStreamDestination();
+        audSrc = audCtx.createBufferSource();
+        audSrc.buffer = decoded;
+        audSrc.connect(dest);
+        dest.stream.getAudioTracks().forEach(t => audioTracks.push(t));
+        dbg('Audio track ready');
+      } catch(e) { dbg(`Audio setup skipped: ${e.message}`); }
+    }
+
+    // Choose best supported codec
+    const mimeType = [
+      'video/webm;codecs=vp9,opus',
+      'video/webm;codecs=vp8,opus',
+      'video/webm',
+    ].find(t => MediaRecorder.isTypeSupported(t)) || 'video/webm';
+    dbg(`Recording as ${mimeType}`);
+
+    const videoStream = canvas.captureStream(25);
+    audioTracks.forEach(t => videoStream.addTrack(t));
+
+    const recorder = new MediaRecorder(videoStream, { mimeType, videoBitsPerSecond: 2_500_000 });
+    const chunks = [];
+    recorder.ondataavailable = e => { if (e.data.size > 0) chunks.push(e.data); };
+    recorder.start(100);
+    if (audSrc) audSrc.start();
+
+    // Draw each photo for secPerSlide seconds
+    for (let i = 0; i < imgs.length; i++) {
+      const img = imgs[i];
+      // Black background + contain-fit
+      ctx.fillStyle = '#111';
+      ctx.fillRect(0, 0, W, H);
+      const s  = Math.min(W / img.naturalWidth, H / img.naturalHeight);
+      const dw = img.naturalWidth * s, dh = img.naturalHeight * s;
+      ctx.drawImage(img, (W - dw) / 2, (H - dh) / 2, dw, dh);
+      dbg(`Rendering slide ${i + 1}/${imgs.length} (${secPerSlide}s)…`);
+      await sleep(secPerSlide * 1000);
+    }
+
+    recorder.stop();
+    try { if (audSrc) audSrc.stop(); } catch(_) {}
+    try { if (audCtx) audCtx.close(); } catch(_) {}
+
+    return new Promise((res, rej) => {
+      recorder.onstop = () => res(new Blob(chunks, { type: 'video/webm' }));
+      setTimeout(() => rej(new Error('Video creation timed out')), 120000);
+    });
   }
 
   (async () => {
-    const total = songName ? 4 : 3;
+    const total = 4;
 
-    // ①  Find file input on upload page
-    step(1, total, 'Locating upload area…');
-    const fileInput = await waitFor('input[type="file"]', 10000);
-    if (!fileInput) {
-      step(1, total, 'Upload area not found — refresh TikTok and try again.', 'warn');
+    // ①  Build the slideshow video
+    const secPerSlide = 3.5;
+    const videoDuration = photoDataUrls.length * secPerSlide;
+    step(1, total, `Creating ${Math.round(videoDuration)}s slideshow${audioDataUrl ? ' with song' : ''}… (please wait)`);
+    await sleep(500);
+
+    let videoBlob;
+    try {
+      videoBlob = await buildSlideshow(photoDataUrls, audioDataUrl, secPerSlide);
+      dbg(`Video ready: ${(videoBlob.size / 1024 / 1024).toFixed(1)} MB`);
+    } catch(e) {
+      step(1, total, `Video creation failed: ${e.message}. Please upload manually.`, 'warn');
       return;
     }
 
-    // ②  Upload all photos (TikTok creates a photo slideshow)
-    const files = photoDataUrls.map((url, i) => dataUrlToFile(url, `restaurant-${i + 1}.jpg`));
-    step(2, total, `Uploading <strong>${files.length} photo${files.length > 1 ? 's' : ''}</strong> as slideshow…`);
-    setFilesOnInput(fileInput, files);
-    await sleep(3500);
+    // ②  Inject video into TikTok's file input
+    step(2, total, 'Uploading video to TikTok…');
+    const fileInput = await waitFor('input[type="file"]', 10000);
+    if (!fileInput) {
+      step(2, total, 'Upload area not found — refresh TikTok and try again.', 'warn');
+      return;
+    }
+
+    const videoFile = new File([videoBlob], 'restaurant-slideshow.mp4', { type: 'video/mp4' });
+    const dt = new DataTransfer(); dt.items.add(videoFile);
+    const setter = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'files')?.set;
+    if (setter) setter.call(fileInput, dt.files); else fileInput.files = dt.files;
+    fileInput.dispatchEvent(new Event('change', { bubbles: true }));
+    fileInput.dispatchEvent(new Event('input',  { bubbles: true }));
+
+    dbg('Video file injected — waiting for TikTok to process…');
+    await sleep(6000); // TikTok needs time to transcode
 
     // ③  Fill description
     step(3, total, 'Filling description…');
@@ -824,34 +973,13 @@ function injectTikTok(photoDataUrls, caption, songName) {
       descBox.focus(); await sleep(200);
       document.execCommand('selectAll', false, null);
       document.execCommand('insertText', false, caption);
-    }
+      dbg('Description filled');
+    } else { dbg('Description box not found'); }
 
-    // ④  Add sound
-    if (songName) {
-      await sleep(800);
-      let soundBtn = null;
-      const soundSels = ['button[class*="sound"]', '[class*="add-sound"]',
-        'button[aria-label*="sound" i]', 'button[aria-label*="music" i]'];
-      for (const s of soundSels) { soundBtn = document.querySelector(s); if (soundBtn) break; }
-      if (!soundBtn) soundBtn = [...document.querySelectorAll('button,[role="button"]')]
-        .find(el => /add sound|add music/i.test(el.textContent || el.getAttribute('aria-label') || ''));
-
-      if (soundBtn) {
-        soundBtn.click(); await sleep(1200);
-        const musicInput = document.querySelector('input[placeholder*="Search" i], input[type="search"]');
-        if (musicInput) {
-          musicInput.focus(); musicInput.value = songName;
-          musicInput.dispatchEvent(new Event('input', { bubbles: true }));
-          await sleep(1800);
-          const first = document.querySelector('[class*="music-item"]:first-child, [class*="sound-item"]:first-child, [class*="MusicItem"]:first-child');
-          if (first) { first.click(); await sleep(500); }
-        }
-        step(4, total, `🎵 <em>"${songName}"</em> searched — confirm selection, then click <strong>Post</strong>.`, 'success');
-      } else {
-        step(4, total, `Description filled — add <em>"${songName}"</em> via Add Sound, then click <strong>Post</strong>.`, 'success');
-      }
-    } else {
-      step(3, total, `✅ ${files.length} photo${files.length > 1 ? 's' : ''} &amp; description ready — click <strong>Post</strong> to publish.`, 'success');
-    }
+    // ④  Done — stop here, user reviews and clicks Post
+    step(4, total,
+      `✅ Video ready!${audioDataUrl ? ' 🎵 Song included.' : ''} Review and click <strong>Post</strong> to publish.`,
+      'success');
+    dbg('Bot complete — awaiting manual Post click');
   })();
 }

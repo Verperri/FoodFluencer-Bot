@@ -618,15 +618,36 @@ async function exportAndPost() {
 
     if (photoDataUrls.length > 0) {
       AppLog.info(`Sending ${photoDataUrls.length} photos to ${platforms.join(", ")}`);
+
+      // Pre-fetch song audio as data URL for TikTok video slideshow
+      let audioDataUrl = null;
+      if (platforms.includes("tiktok") && selectedSong?.previewUrl) {
+        try {
+          setStatus("Fetching song preview for TikTok video…");
+          const ar = await fetch(selectedSong.previewUrl);
+          const ab = await ar.blob();
+          audioDataUrl = await new Promise(res => {
+            const fr = new FileReader();
+            fr.onload = e => res(e.target.result);
+            fr.readAsDataURL(ab);
+          });
+          AppLog.info("Audio preview fetched for TikTok", { song: selectedSong.name });
+        } catch (e) {
+          AppLog.warn("Could not fetch audio preview", String(e));
+        }
+      }
+
       for (const platform of platforms) {
         setStatus(`Opening ${platform}…`);
         chrome.runtime.sendMessage({
           type: "OPEN_SOCIAL", platform, photoDataUrls, caption, songName,
-          location: currentRestaurant.address || "",
+          location:       currentRestaurant.address || "",
+          restaurantName: currentRestaurant.name    || "",
+          audioDataUrl:   platform === "tiktok" ? (audioDataUrl || null) : null,
         });
         await new Promise(r => setTimeout(r, 900));
       }
-      setStatus(`✅ Opening ${platforms.join(", ")} — uploading ${photoDataUrls.length} photos directly!`, "success");
+      setStatus(`✅ Opening ${platforms.join(", ")} — ${photoDataUrls.length} photos & caption ready!`, "success");
     } else {
       AppLog.error("All photo resizes failed — cannot post to social media");
       setStatus("⚠️ Could not prepare photos for social media.", "error");
