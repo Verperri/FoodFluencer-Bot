@@ -1,4 +1,4 @@
-// ── Constants ─────────────────────────────────────────────────────────────────
+﻿// ── Constants ─────────────────────────────────────────────────────────────────
 
 const PLACES_SEARCH = "https://places.googleapis.com/v1/places:searchText";
 const PLACES_PHOTO  = "https://places.googleapis.com/v1";
@@ -713,7 +713,7 @@ async function createTikTokMP4(photoDataUrls, onProgress) {
         error: e => { encodeError = e; },
       });
 
-      encoder.configure({ codec: chosenCodec, width: W, height: H, bitrate: BITRATE, framerate: FPS, avc: { format: 'avcC' } });
+      encoder.configure({ codec: chosenCodec, width: W, height: H, bitrate: BITRATE, framerate: FPS, avc: { format: 'avc' } });
 
       let fi = 0;
       for (let i = 0; i < images.length; i++) {

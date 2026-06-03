@@ -893,7 +893,7 @@ function injectTikTok(photoDataUrls, caption, songName, location, opts) {
           },
           error: e => { encErr = e; },
         });
-        enc.configure({ codec, width: W, height: H, bitrate: BITRATE, framerate: FPS, avc: { format: 'avcC' } });
+        enc.configure({ codec, width: W, height: H, bitrate: BITRATE, framerate: FPS, avc: { format: 'avc' } });
 
         const framesPerSlide = Math.ceil(SEC * FPS);
         let fi = 0;
