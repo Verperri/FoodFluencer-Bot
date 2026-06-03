@@ -514,14 +514,19 @@ function injectInstagram(photoDataUrls, caption, songName, location) {
       );
     }
 
-    // Check if we're on the caption/details screen (final step before Share)
+    // Check if we're on the caption/details screen (final step before Share).
+    // IMPORTANT: must be specific and require visibility — the filter screen also
+    // has contenteditable/textbox elements that cause false positives.
     function onCaptionScreen() {
-      return !!(
-        document.querySelector('textarea[aria-label*="caption" i]') ||
-        document.querySelector('div[aria-label*="caption" i]') ||
-        document.querySelector('textarea[placeholder*="caption" i]') ||
-        document.querySelector('[role="textbox"]')
-      );
+      const specific = [
+        'textarea[aria-label="Write a caption..."]',
+        'div[aria-label="Write a caption..."]',
+        'textarea[placeholder*="Write a caption" i]',
+      ];
+      return specific.some(sel => {
+        const el = document.querySelector(sel);
+        return el && isVisible(el);
+      });
     }
 
     // Wait until a specific button is no longer visible OR removed from DOM.
@@ -599,45 +604,54 @@ function injectInstagram(photoDataUrls, caption, songName, location) {
       const btnPtr   = window.getComputedStyle(preClickBtn).pointerEvents;
       dbg(`Click ${clickNum}/2 (${label}): <${preClickBtn.tagName}> "${btnTxt}" ${Math.round(btnRect.width)}x${Math.round(btnRect.height)}@top${Math.round(btnRect.top)} pointer-events=${btnPtr}`);
 
-      // Try up to 4 times — checks after each attempt whether we actually advanced
-      let advanced = false;
-      for (let attempt = 1; attempt <= 4 && !advanced; attempt++) {
-        await sleep(attempt === 1 ? 200 : 600);
+      // Try up to 4 times — exit only when the BUTTON IS GONE (not a caption check,
+      // which gives false positives on the filter screen).
+      let btnGone = false;
+      for (let attempt = 1; attempt <= 4 && !btnGone; attempt++) {
+        await sleep(attempt === 1 ? 200 : 700);
         reactClick(preClickBtn);
-        dbg(`Attempt ${attempt}: fired mouse+keyboard on "${btnTxt}"`);
+        dbg(`Attempt ${attempt}/4: fired mouse+keyboard on "${btnTxt}"`);
 
-        // Wait up to 3s per attempt for evidence the screen advanced
+        // Wait up to 4s for this specific button to disappear/hide
         const t0 = Date.now();
-        while (Date.now() - t0 < 3000) {
+        while (Date.now() - t0 < 4000) {
           await sleep(200);
-          const gone    = !document.contains(preClickBtn) || !isVisible(preClickBtn);
-          const caption = onCaptionScreen();
-          if (gone || caption) {
-            dbg(`Advance confirmed on attempt ${attempt}: gone=${gone} caption=${caption}`);
-            advanced = true;
+          if (!document.contains(preClickBtn) || !isVisible(preClickBtn)) {
+            dbg(`Button gone on attempt ${attempt} — transition confirmed`);
+            btnGone = true;
             break;
           }
         }
-        if (!advanced) dbg(`Attempt ${attempt} — screen did not advance within 3s`);
+        if (!btnGone) dbg(`Attempt ${attempt} — button still visible after 4s`);
       }
 
-      if (!advanced) {
-        dbg(`4 attempts exhausted for ${label} Next — waiting for manual action`);
+      if (!btnGone) {
+        dbg(`4 attempts exhausted for ${label} Next — waiting up to 20s for manual click`);
         step(clickNum + 1, total,
           `Please click <strong>Next</strong> at the top-right to continue past the ${label} step.`, 'warn');
         const t1 = Date.now();
         while (Date.now() - t1 < 20000) {
           await sleep(500);
-          if (onCaptionScreen()) { dbg('Caption screen appeared (manual)'); break; }
-          const newNext = findVisibleNextBtn();
-          if (newNext && newNext !== preClickBtn) { dbg('New Next visible (manual advance)'); break; }
+          if (!document.contains(preClickBtn) || !isVisible(preClickBtn)) {
+            dbg('Manual advance detected (button gone)'); break;
+          }
         }
       }
 
-      await sleep(800);
+      await sleep(1000); // let the next screen fully render
     }
 
-    // ══ STEP 4: Fill caption — now on Details screen (Share button visible) ════
+    // Wait for the caption screen to actually appear before proceeding
+    dbg('Both Next clicks done — waiting for caption screen…');
+    step(4, total, 'Waiting for caption screen…');
+    const captionWait = Date.now();
+    while (Date.now() - captionWait < 10000 && !onCaptionScreen()) {
+      await sleep(300);
+    }
+    if (onCaptionScreen()) { dbg('Caption screen confirmed'); }
+    else { dbg('Caption screen not detected after 10s — proceeding anyway'); }
+
+    // ══ STEP 4: Fill caption ══════════════════════════════════════════════════════
     step(4, total, 'Filling caption…');
     const captionSels = [
       'textarea[aria-label="Write a caption..."]',
