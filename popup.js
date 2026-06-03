@@ -53,8 +53,96 @@ let currentRestaurant = null;
 const uriCache        = new Map(); // "photoName|maxWidth" → uri
 let selectedSong      = null;
 let activePlatforms   = new Set();
+let coverPhotoIndex   = 0;         // index into currentRestaurant.photos[]
+const coverOverlayCache = new Map(); // "photoName|restaurantName" → overlayDataUrl
 
 const $ = id => document.getElementById(id);
+
+// ── Cover photo overlay ───────────────────────────────────────────────────────
+
+// Wait for Cormorant Garamond (loaded via Google Fonts <link> in popup.html)
+async function ensureCoverFont() {
+  try { await document.fonts.ready; } catch(_) {}
+}
+ensureCoverFont();
+
+async function createCoverOverlay(imgUri, restaurantName, address) {
+  const key = `${imgUri.slice(-40)}|${restaurantName}`;
+  if (coverOverlayCache.has(key)) return coverOverlayCache.get(key);
+
+  return new Promise(resolve => {
+    const img = new Image();
+    img.crossOrigin = 'anonymous';
+    img.onload = () => {
+      const W = img.naturalWidth  || 900;
+      const H = img.naturalHeight || 900;
+      const canvas = document.createElement('canvas');
+      canvas.width = W; canvas.height = H;
+      const ctx = canvas.getContext('2d');
+
+      // Draw base image
+      ctx.drawImage(img, 0, 0, W, H);
+
+      // Subtle radial vignette so text is readable on any background
+      const vig = ctx.createRadialGradient(W/2, H*0.5, H*0.05, W/2, H*0.5, H*0.78);
+      vig.addColorStop(0, 'rgba(0,0,0,0.00)');
+      vig.addColorStop(1, 'rgba(0,0,0,0.42)');
+      ctx.fillStyle = vig; ctx.fillRect(0, 0, W, H);
+
+      // Extract city from Belgian address "NNNN City, Belgium"
+      const cityM = address.match(/\d{4}\s+([A-Za-zÀ-ÿ\s-]+),\s*Belgium/i);
+      const city  = (cityM?.[1] || address.split(',')[0] || '').trim();
+
+      const nameSize   = Math.max(28, Math.round(W * 0.074));
+      const citySize   = Math.max(14, Math.round(W * 0.030));
+      const cornerSize = Math.max(10, Math.round(W * 0.018));
+
+      ctx.fillStyle  = '#FFFFFF';
+      ctx.textAlign  = 'center';
+      ctx.shadowColor = 'rgba(0,0,0,0.60)';
+      ctx.shadowOffsetY = 2;
+
+      // ── Restaurant name ──────────────────────────────────────────────────
+      ctx.font       = `300 ${nameSize}px "Cormorant Garamond", Georgia, serif`;
+      ctx.textBaseline = 'alphabetic';
+      ctx.shadowBlur = Math.round(nameSize * 0.32);
+      const nameY    = city ? H * 0.47 : H * 0.50;
+      ctx.fillText(restaurantName, W / 2, nameY);
+
+      // ── City subtitle ────────────────────────────────────────────────────
+      if (city) {
+        ctx.font       = `300 italic ${citySize}px "Cormorant Garamond", Georgia, serif`;
+        ctx.shadowBlur = Math.round(citySize * 0.4);
+        ctx.fillText(city, W / 2, nameY + nameSize * 1.55);
+      }
+
+      // ── Corner micro-label ───────────────────────────────────────────────
+      if (city) {
+        ctx.font         = `300 ${cornerSize}px "Cormorant Garamond", Georgia, serif`;
+        ctx.textAlign    = 'right';
+        ctx.textBaseline = 'bottom';
+        ctx.shadowBlur   = 3;
+        ctx.shadowOffsetY = 0;
+        const pad = Math.round(W * 0.032);
+        ctx.fillText(`${city}, Belgium`, W - pad, H - pad);
+      }
+
+      const result = canvas.toDataURL('image/jpeg', 0.93);
+      coverOverlayCache.set(key, result);
+      resolve(result);
+    };
+    img.onerror = () => resolve(null);
+    img.src = imgUri;
+  });
+}
+
+function setCoverPhoto(newIndex) {
+  if (!currentRestaurant) return;
+  coverPhotoIndex = newIndex;
+  coverOverlayCache.clear(); // invalidate cache (photo changed)
+  renderPhotoGrid();
+  saveState();
+}
 
 // ── State persistence ─────────────────────────────────────────────────────────
 
@@ -304,6 +392,10 @@ function renderResults(place) {
   link.href = currentRestaurant.mapsUrl || "#";
   link.style.display = currentRestaurant.mapsUrl ? "inline" : "none";
 
+  // Reset cover to first (best quality) photo on new search
+  coverPhotoIndex = 0;
+  coverOverlayCache.clear();
+
   renderPhotoGrid();
 
   // Auto-fill caption on fresh search (not restore)
@@ -337,14 +429,39 @@ function renderPhotoGrid() {
 }
 
 function fillPhotoSlot(div, uri, index) {
+  const isCover = index === coverPhotoIndex;
+  if (isCover) div.classList.add('is-cover'); else div.classList.remove('is-cover');
+
   div.innerHTML = `
     <img src="${uri}" alt="Photo ${index + 1}" />
-    <span class="photo-label">${index + 1}</span>
+    ${isCover
+      ? '<span class="cover-badge">Cover</span>'
+      : `<button class="make-cover-btn" title="Set as cover photo">⭐ Cover</button>`}
+    <span class="photo-label">${isCover ? '★' : index + 1}</span>
     <button class="dismiss-btn" title="Replace with another photo">✕</button>`;
+
+  // Show cover overlay preview on the cover photo
+  if (isCover && currentRestaurant) {
+    createCoverOverlay(uri, currentRestaurant.name, currentRestaurant.address)
+      .then(overlayUri => {
+        if (overlayUri) {
+          const imgEl = div.querySelector('img');
+          if (imgEl && div.dataset.slot == index) imgEl.src = overlayUri;
+        }
+      });
+  }
+
   div.querySelector(".dismiss-btn").addEventListener("click", e => {
     e.stopPropagation();
     dismissPhoto(index);
   });
+
+  if (!isCover) {
+    div.querySelector(".make-cover-btn")?.addEventListener("click", e => {
+      e.stopPropagation();
+      setCoverPhoto(index);
+    });
+  }
 }
 
 async function dismissPhoto(index) {
@@ -368,6 +485,11 @@ async function dismissPhoto(index) {
     }
   } else {
     photos.splice(index, 1);
+    // Adjust cover index when a photo before/at it is removed
+    if (index < coverPhotoIndex) coverPhotoIndex = Math.max(0, coverPhotoIndex - 1);
+    else if (index === coverPhotoIndex) coverPhotoIndex = 0;
+    if (coverPhotoIndex >= photos.length) coverPhotoIndex = 0;
+    coverOverlayCache.clear();
     renderPhotoGrid();
   }
   saveState();
@@ -603,16 +725,33 @@ async function exportAndPost() {
     chrome.storage.local.set({ exportLog });
   });
 
-  // ── 3. Prepare data URLs and open social platforms ────────────────────────
+  // ── 3. Prepare data URLs — cover photo (with overlay) first ─────────────────
   if (platforms.length > 0 && photoUris.length > 0) {
-    setStatus(`Preparing ${photoUris.length} photos for upload…`);
+    setStatus(`Preparing photos… applying cover overlay…`);
+
+    // Build photo data URLs with cover (+ text overlay) at position 0
+    const covIdx   = Math.min(coverPhotoIndex, photoUris.length - 1);
     const photoDataUrls = [];
-    for (const uri of photoUris) {
+
+    // Cover photo: apply restaurant name + location overlay
+    try {
+      setStatus("Rendering cover photo overlay…");
+      const coverUri = photoUris[covIdx];
+      const overlay  = await createCoverOverlay(coverUri, name, address);
+      photoDataUrls.push(overlay || await photoToDataUrl(coverUri));
+      AppLog.info("Cover overlay applied", { index: covIdx });
+    } catch(e) {
+      AppLog.warn("Cover overlay failed, using plain photo", String(e));
+      try { photoDataUrls.push(await photoToDataUrl(photoUris[covIdx])); } catch(_) {}
+    }
+
+    // Remaining photos in original order (skip cover)
+    for (let i = 0; i < photoUris.length; i++) {
+      if (i === covIdx) continue;
       try {
-        photoDataUrls.push(await photoToDataUrl(uri));
+        photoDataUrls.push(await photoToDataUrl(photoUris[i]));
       } catch (e) {
-        AppLog.error("Photo resize failed", { uri, error: String(e) });
-        console.warn("Photo resize failed:", e);
+        AppLog.error("Photo resize failed", { uri: photoUris[i], error: String(e) });
       }
     }
 
