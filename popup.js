@@ -106,8 +106,11 @@ function restoreState(saved) {
     $("selectedSong").classList.remove("hidden");
   }
 
-  // Restore caption
-  if ($("caption")) $("caption").value = saved.caption || buildDefaultCaption();
+  // Restore caption — always guarantee an engagement opener is present
+  if ($("caption")) {
+    const raw = saved.caption || buildDefaultCaption();
+    $("caption").value = ensureOpener(raw);
+  }
 
   // Restore platforms
   (saved.activePlatforms || []).forEach(p => {
@@ -372,17 +375,13 @@ async function dismissPhoto(index) {
 
 // ── Caption ───────────────────────────────────────────────────────────────────
 
-function buildDefaultCaption() {
+// Returns one engagement opener sentence (deterministic per restaurant, consistent across restores)
+function getEngagementOpener() {
   if (!currentRestaurant) return "";
-  const { name, address, rating } = currentRestaurant;
-
-  // Extract city from Belgian address format "NNNN CityName, Belgium"
-  const cityMatch = address.match(/\d{4}\s+([A-Za-zÀ-ÿ\s-]+),\s*Belgium/i);
+  const { name, address } = currentRestaurant;
+  const cityMatch   = address.match(/\d{4}\s+([A-Za-zÀ-ÿ\s-]+),\s*Belgium/i);
   const cityDisplay = (cityMatch?.[1] || "Belgium").trim();
-  const cityTag     = cityDisplay.replace(/\s+/g, "");
-
-  // Rotating engagement openers — pick based on restaurant name (consistent per restaurant)
-  const seed = name.split("").reduce((a, c) => a + c.charCodeAt(0), 0);
+  const seed        = name.split("").reduce((a, c) => a + c.charCodeAt(0), 0);
   const openers = [
     `Have you ever been to ${name} in ${cityDisplay}? 🍽️ Drop a 💬 below!`,
     `Best restaurant in ${cityDisplay}? ${name} is definitely worth a visit! 🔥`,
@@ -391,25 +390,49 @@ function buildDefaultCaption() {
     `Next time you're in ${cityDisplay}, make sure to visit ${name}! 📍`,
     `Have you tried ${name} yet? This is what food dreams are made of 😍`,
   ];
-  const opener = openers[seed % openers.length];
+  return openers[seed % openers.length];
+}
 
-  let text = `${opener}\n\n📍 ${name}\n📌 ${address}`;
+function buildDefaultCaption() {
+  if (!currentRestaurant) return "";
+  const { name, address, rating } = currentRestaurant;
+
+  const cityMatch   = address.match(/\d{4}\s+([A-Za-zÀ-ÿ\s-]+),\s*Belgium/i);
+  const cityDisplay = (cityMatch?.[1] || "Belgium").trim();
+  const cityTag     = cityDisplay.replace(/\s+/g, "");
+
+  let text = `${getEngagementOpener()}\n\n📍 ${name}\n📌 ${address}`;
   if (rating) text += `\n⭐ ${rating}/5`;
   if (selectedSong) text += `\n\n🎵 ${selectedSong.name} – ${selectedSong.artist}`;
   text += `\n\n#${cityTag} #BelgianFood #FoodFluencer #Foodie #FoodPhotography #Restaurant #Belgium`;
   return text;
 }
 
-// Update just the song line in the caption without overwriting the user's edits
+// Ensures every caption starts with an engagement opener.
+// Preserves user edits below the first line; replaces a stale/missing opener.
+function ensureOpener(existingCaption) {
+  if (!currentRestaurant) return existingCaption;
+  const opener  = getEngagementOpener();
+  const openerRe = /^(Have you ever been|Best restaurant|What do you think|Discover the hidden|Next time you're|Have you tried)/i;
+  // Already has the correct opener — leave untouched
+  if (existingCaption.startsWith(opener)) return existingCaption;
+  // Has an old/different opener — replace just the first line
+  if (openerRe.test(existingCaption)) {
+    const rest = existingCaption.replace(/^[^\n]+(\n\n?)?/, "");
+    return `${opener}\n\n${rest}`;
+  }
+  // No opener at all — prepend it
+  return `${opener}\n\n${existingCaption}`;
+}
+
+// Update just the song line in the caption without overwriting the user's other edits
 function updateCaptionSongLine() {
   const el = $("caption");
   if (!el) return;
-  let text = el.value;
-  // Remove existing song line
-  text = text.replace(/\n🎵 .+/g, "").trimEnd();
-  // Re-append if a song is selected
+  let text = el.value.replace(/\n🎵 .+/g, "").trimEnd();
   if (selectedSong) text += `\n🎵 ${selectedSong.name} – ${selectedSong.artist}`;
-  el.value = text;
+  // Also guarantee the opener is present after song changes
+  el.value = ensureOpener(text);
   saveState();
 }
 

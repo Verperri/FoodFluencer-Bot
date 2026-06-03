@@ -330,37 +330,78 @@ function injectInstagram(photoDataUrls, caption, songName) {
     step(1, total, 'Finding Create Post button…');
     await sleep(2500); // let IG SPA fully render
 
-    async function openCreateModal() {
-      // Strategy A: known aria-labels for the create button
-      const createSelectors = [
+    // ── Step 1a: click the Create / "+" button ────────────────────────────────
+    function findCreateButton() {
+      // A. Explicit aria-labels Instagram uses on the Create nav item
+      const attrSels = [
         '[aria-label="New post"]',
-        'a[href="/create/select/"]',
         '[aria-label="Create"]',
+        'a[href="/create/select/"]',
       ];
-      for (const s of createSelectors) {
+      for (const s of attrSels) {
         const el = document.querySelector(s);
-        if (el) { (el.closest('a,[role="button"],button') || el).click(); return true; }
+        if (el) return el.closest('a,[role="button"],button') || el;
       }
-      // Strategy B: scan SVGs whose aria-label matches
-      const svgCreate = [...document.querySelectorAll('svg[aria-label]')]
+      // B. SVG inside the nav whose label says "New post" or "Create"
+      const svg = [...document.querySelectorAll('svg[aria-label]')]
         .find(s => /new post|create/i.test(s.getAttribute('aria-label')));
-      if (svgCreate) { (svgCreate.closest('a,[role="button"],button') || svgCreate).click(); return true; }
-      // Strategy C: text scan of nav links
-      const navCreate = [...document.querySelectorAll('a, [role="button"]')]
-        .find(el => /^(create|new post)$/i.test((el.textContent || '').trim()));
-      if (navCreate) { navCreate.click(); return true; }
+      if (svg) return svg.closest('a,[role="button"],button') || svg;
+      // C. Nav anchor / button whose text is exactly "Create" or "New post"
+      return [...document.querySelectorAll('a,[role="button"]')]
+        .find(el => /^(create|new post)$/i.test((el.textContent || '').trim())) || null;
+    }
+
+    let createBtn = null;
+    for (let i = 0; i < 6 && !createBtn; i++) {
+      createBtn = findCreateButton();
+      if (!createBtn) await sleep(1000);
+    }
+
+    if (!createBtn) {
+      step(1, total,
+        'Could not find the <strong>+</strong> Create button. Please click it manually in the sidebar.',
+        'warn');
+    } else {
+      createBtn.click();
+      step(1, total, 'Create button clicked — selecting Post from menu…');
+    }
+
+    // ── Step 1b: Instagram shows a sub-menu (Post / Reel / Story / Live).
+    //    We MUST click "Post" before the upload dialog appears.
+    await sleep(800);
+
+    async function clickPostFromSubMenu() {
+      // The sub-menu items are typically role="dialog" > [role="menuitem"] or
+      // plain <a>/<div role="button"> with visible text "Post".
+      const postLabels = /^(post|bericht|publication|publicatie|innlegg)$/i;
+      const btn = [...document.querySelectorAll(
+        '[role="menuitem"], [role="option"], [role="button"], a, button'
+      )].find(el => {
+        const txt = (el.textContent || '').trim();
+        const lbl = el.getAttribute('aria-label') || '';
+        return postLabels.test(txt) || postLabels.test(lbl);
+      });
+      if (btn) { btn.click(); return true; }
       return false;
     }
 
-    let opened = false;
-    for (let i = 0; i < 6 && !opened; i++) { opened = await openCreateModal(); if (!opened) await sleep(1200); }
-
-    if (!opened) {
-      step(1, total, 'Click the <strong>+</strong> Create button in the Instagram sidebar to open the post dialog.', 'warn');
+    let postClicked = false;
+    for (let i = 0; i < 8 && !postClicked; i++) {
+      postClicked = await clickPostFromSubMenu();
+      if (!postClicked) await sleep(600);
     }
-    // Wait for the upload dialog to appear
-    await waitFor('[role="dialog"]', 6000);
-    await sleep(1000);
+
+    if (!postClicked) {
+      step(1, total,
+        'Please select <strong>Post</strong> from the menu that appeared.',
+        'warn');
+    } else {
+      step(1, total, 'Post selected — waiting for upload dialog…');
+    }
+
+    // Wait for the upload dialog / drag-drop area to appear
+    await waitFor('[role="dialog"]', 8000);
+    await sleep(1200);
 
     // ②  Inject photos
     step(2, total, `Uploading <strong>${photoDataUrls.length} photo${photoDataUrls.length > 1 ? 's' : ''}</strong>…`);
