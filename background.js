@@ -351,7 +351,7 @@ function injectInstagram(photoDataUrls, caption, songName, location) {
   (async () => {
     const total = location ? (songName ? 6 : 5) : (songName ? 5 : 4);
     step(1, total, 'Loading Instagram…');
-    await sleep(3000); // wait for full SPA hydration
+    await sleep(1500); // wait for SPA hydration
 
     // ══ STEP 1a: Find and click the Create "+" button ══════════════════════════
     step(1, total, 'Looking for Create (+) button…');
@@ -377,7 +377,7 @@ function injectInstagram(photoDataUrls, caption, songName, location) {
     let createBtn = null;
     for (let i = 0; i < 8 && !createBtn; i++) {
       createBtn = findCreateBtn();
-      if (!createBtn) await sleep(1000);
+      if (!createBtn) await sleep(600);
     }
 
     if (!createBtn) {
@@ -397,7 +397,7 @@ function injectInstagram(photoDataUrls, caption, songName, location) {
     dbg(`Snapshot: ${prePostEls.size} existing elements with text "Post"`);
 
     step(1, total, 'Waiting for Post/Story/Reel menu to appear…');
-    await sleep(1200);
+    await sleep(700);
 
     async function findAndClickPostOption() {
       // Find elements with text "Post" that did NOT exist before we clicked Create
@@ -419,7 +419,7 @@ function injectInstagram(photoDataUrls, caption, songName, location) {
     let postClicked = false;
     for (let i = 0; i < 10 && !postClicked; i++) {
       postClicked = await findAndClickPostOption();
-      if (!postClicked) { dbg(`Retry ${i + 1}/10 — post option not visible yet`); await sleep(600); }
+      if (!postClicked) { dbg(`Retry ${i + 1}/10 — post option not visible yet`); await sleep(350); }
     }
 
     if (!postClicked) {
@@ -430,8 +430,8 @@ function injectInstagram(photoDataUrls, caption, songName, location) {
     }
 
     // Wait for the upload dialog to appear (has a file input or drag-drop area)
-    await waitFor('[role="dialog"]', 12000);
-    await sleep(1000);
+    await waitFor('[role="dialog"]', 10000);
+    await sleep(500);
     dbg('Upload dialog appeared');
 
     // ══ STEP 2: Inject photos ═════════════════════════════════════════════════
@@ -445,7 +445,7 @@ function injectInstagram(photoDataUrls, caption, songName, location) {
       const selBtn = [...document.querySelectorAll('[role="button"], button')]
         .find(el => /select.*computer|from.*computer/i.test(el.innerText || el.textContent || ''));
       if (selBtn) { selBtn.click(); dbg('Clicked "Select from computer"'); }
-      await sleep(700);
+      await sleep(500);
     }
 
     if (fileInput) {
@@ -469,92 +469,119 @@ function injectInstagram(photoDataUrls, caption, songName, location) {
     // Searches [role="dialog"] first, falls back to full document.
     // Dispatches the full mousedown→mouseup→click sequence React needs.
     // Returns the button text if clicked, null if not found within timeout.
-    async function clickNextInDialog(ms = 15000) {
+    async function clickNextInDialog(ms = 12000) {
       const NEXT_RE = /^(next|volgende|suivant|weiter|siguiente|næste|neste|seuraava)$/i;
 
       function findNextBtn() {
-        // Prefer buttons inside the modal dialog
-        const roots = [
-          document.querySelector('[role="dialog"]'),
-          document.body,
-        ].filter(Boolean);
-
+        const roots = [document.querySelector('[role="dialog"]'), document.body].filter(Boolean);
         for (const root of roots) {
-          const btn = [...root.querySelectorAll(
-            '[role="button"], button, [tabindex="0"], a'
-          )].find(el => {
-            const txt = (el.innerText || el.textContent || '').trim();
-            const lbl = el.getAttribute('aria-label') || '';
-            return NEXT_RE.test(txt) || NEXT_RE.test(lbl);
-          });
+          const btn = [...root.querySelectorAll('[role="button"],button,[tabindex="0"],a')]
+            .find(el => {
+              const txt = (el.innerText || el.textContent || '').trim();
+              const lbl = el.getAttribute('aria-label') || '';
+              return NEXT_RE.test(txt) || NEXT_RE.test(lbl);
+            });
           if (btn) return btn;
         }
         return null;
       }
 
-      // Wait for the button to appear
+      // Poll for the button
       const start = Date.now();
       let btn = null;
       while (Date.now() - start < ms) {
         btn = findNextBtn();
         if (btn) break;
-        await sleep(400);
+        await sleep(200);
       }
       if (!btn) { dbg(`"Next" button not found after ${ms}ms`); return null; }
 
       const btnText = (btn.innerText || btn.textContent || '').trim();
-      dbg(`Found Next button: <${btn.tagName}> text="${btnText}" role="${btn.getAttribute('role')}" aria="${btn.getAttribute('aria-label')}"`);
+      dbg(`Clicking Next: <${btn.tagName}> "${btnText}" role="${btn.getAttribute('role')||''}"`);
 
-      // Small pause — ensure button is interactive before firing events
-      await sleep(400);
-
-      // Dispatch full mouse interaction sequence (required for React synthetic events)
+      // Small pause then fire full mouse sequence React needs
+      await sleep(150);
       btn.focus();
-      ['mouseenter', 'mouseover', 'mousedown', 'mouseup', 'click'].forEach(type => {
+      ['mouseenter', 'mouseover', 'mousedown', 'mouseup', 'click'].forEach(type =>
         btn.dispatchEvent(new MouseEvent(type, {
           bubbles: true, cancelable: true, view: window,
           buttons: 1, detail: type === 'click' ? 1 : 0,
-        }));
-      });
+        }))
+      );
 
-      // Verify the click registered: the same "Next" button should disappear
-      // (Instagram will remove or replace it as the modal advances)
-      await sleep(600);
-      const stillThere = document.contains(btn) &&
-        NEXT_RE.test((btn.innerText || btn.textContent || '').trim());
-      if (stillThere) {
-        dbg('Button still present after click — trying once more with pointer events');
-        btn.dispatchEvent(new PointerEvent('pointerdown', { bubbles: true, cancelable: true, pointerId: 1 }));
-        btn.dispatchEvent(new PointerEvent('pointerup',   { bubbles: true, cancelable: true, pointerId: 1 }));
-        btn.click();
-        await sleep(600);
-      }
-
+      dbg(`Next clicked — waiting for screen transition`);
       return btnText;
     }
 
-    // Wait for the editor "Next" to confirm photos are loaded
-    const editorReady = await clickNextInDialog(20000); // this is the crop-screen Next
-    if (editorReady) {
-      dbg(`Editor ready — clicked first "Next" (crop step): "${editorReady}"`);
-      step(2, total, `Photos loaded ✓ — advancing past crop step…`);
-      await sleep(2500);
-    } else {
-      step(2, total, 'Photos sent — please click <strong>Next</strong> at the top-right of the popup to continue.', 'warn');
-      dbg('Manual: waiting 10s for user to click crop Next');
-      await sleep(10000);
+    // After a Next click, wait until the SAME button is no longer the active Next
+    // (Instagram replaces or removes it during transitions).
+    async function waitForNextToChange(previousBtn, ms = 5000) {
+      const NEXT_RE = /^(next|volgende|suivant|weiter|siguiente|næste|neste|seuraava)$/i;
+      const start = Date.now();
+      while (Date.now() - start < ms) {
+        await sleep(200);
+        // If the previous button is gone from DOM, screen changed
+        if (!document.contains(previousBtn)) { dbg('Previous Next removed — screen transitioned'); return true; }
+        // Or if the previous button no longer says "Next", screen changed
+        const txt = (previousBtn.innerText || previousBtn.textContent || '').trim();
+        if (!NEXT_RE.test(txt)) { dbg(`Next button text changed to "${txt}" — screen transitioned`); return true; }
+      }
+      dbg('waitForNextToChange: timed out — assuming transition happened');
+      return false;
     }
 
-    // ══ STEP 3: Filters/Edit → Next ═══════════════════════════════════════════
-    step(3, total, 'Advancing past edit/filter step…');
-    const editClicked = await clickNextInDialog(12000);
-    if (editClicked) {
-      dbg(`Clicked edit Next: "${editClicked}"`);
-      await sleep(2500);
-    } else {
-      step(3, total, 'Please click <strong>Next</strong> at the top-right of the popup to continue.', 'warn');
-      dbg('Manual: waiting 10s for user to click edit Next');
-      await sleep(10000);
+    // ══ STEP 2 → 3: Two "Next" clicks to reach the caption/Share screen ════════
+    // Wait for editor: photos loaded when "Next" appears at top-right of dialog.
+    step(2, total, 'Waiting for editor to load…');
+
+    for (let clickNum = 1; clickNum <= 2; clickNum++) {
+      const label = clickNum === 1 ? 'crop' : 'filter/edit';
+      step(clickNum + 1, total, `Advancing past ${label} step…`);
+
+      // Find the dialog's Next button - wait up to 18s on first click (photo processing takes time)
+      const timeout = clickNum === 1 ? 18000 : 10000;
+
+      // Store a reference BEFORE clicking so we can detect when it transitions away
+      const NEXT_RE = /^(next|volgende|suivant|weiter|siguiente|næste|neste|seuraava)$/i;
+      const roots = [document.querySelector('[role="dialog"]'), document.body].filter(Boolean);
+      let preClickBtn = null;
+      const pollStart = Date.now();
+      while (Date.now() - pollStart < timeout && !preClickBtn) {
+        for (const root of roots) {
+          preClickBtn = [...root.querySelectorAll('[role="button"],button,[tabindex="0"],a')]
+            .find(el => {
+              const txt = (el.innerText || el.textContent || '').trim();
+              return NEXT_RE.test(txt) || NEXT_RE.test(el.getAttribute('aria-label') || '');
+            });
+          if (preClickBtn) break;
+        }
+        if (!preClickBtn) await sleep(200);
+      }
+
+      if (!preClickBtn) {
+        step(clickNum + 1, total,
+          `Please click <strong>Next</strong> at the top-right of the popup (step ${clickNum}/2).`, 'warn');
+        dbg(`Manual needed for ${label} Next — waiting 12s`);
+        await sleep(12000);
+        continue;
+      }
+
+      const btnTxt = (preClickBtn.innerText || preClickBtn.textContent || '').trim();
+      dbg(`Click ${clickNum}/2 (${label}): <${preClickBtn.tagName}> "${btnTxt}"`);
+
+      await sleep(150);
+      preClickBtn.focus();
+      ['mouseenter', 'mouseover', 'mousedown', 'mouseup', 'click'].forEach(type =>
+        preClickBtn.dispatchEvent(new MouseEvent(type, {
+          bubbles: true, cancelable: true, view: window,
+          buttons: 1, detail: type === 'click' ? 1 : 0,
+        }))
+      );
+
+      // Wait for this specific button to disappear from DOM = screen transitioned
+      const transitioned = await waitForNextToChange(preClickBtn, 5000);
+      dbg(`${label} transition: ${transitioned ? 'confirmed' : 'uncertain'}`);
+      await sleep(800); // brief pause for the new screen to settle
     }
 
     // ══ STEP 4: Fill caption — now on Details screen (Share button visible) ════
@@ -570,7 +597,7 @@ function injectInstagram(photoDataUrls, caption, songName, location) {
     let captionEl = null;
     for (let att = 0; att < 10 && !captionEl; att++) {
       for (const s of captionSels) { captionEl = document.querySelector(s); if (captionEl) { dbg(`Caption found: ${s}`); break; } }
-      if (!captionEl) await sleep(600);
+      if (!captionEl) await sleep(400);
     }
     if (captionEl) {
       captionEl.scrollIntoView({ behavior: 'smooth', block: 'center' });
@@ -589,7 +616,7 @@ function injectInstagram(photoDataUrls, caption, songName, location) {
 
     // ══ STEP 5 (if location): Add location ════════════════════════════════════
     if (location) {
-      await sleep(600);
+      await sleep(400);
       step(5, total, 'Adding location…');
       const cityMatch = location.match(/\d{4}\s+([A-Za-zÀ-ÿ\s-]+),\s*Belgium/i);
       const searchTerm = (cityMatch?.[1] || location.split(',')[0] || location).trim();
@@ -603,7 +630,7 @@ function injectInstagram(photoDataUrls, caption, songName, location) {
       }
       if (locTrigger) {
         dbg(`Location trigger found: ${locTrigger.tagName}`);
-        locTrigger.click(); await sleep(700);
+        locTrigger.click(); await sleep(400);
         const locInput = await waitFor('input[placeholder*="Search" i],input[aria-label*="location" i]', 4000);
         if (locInput) {
           locInput.focus(); await sleep(200);
