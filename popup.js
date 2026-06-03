@@ -619,28 +619,36 @@ async function exportAndPost() {
     if (photoDataUrls.length > 0) {
       AppLog.info(`Sending ${photoDataUrls.length} photos to ${platforms.join(", ")}`);
 
-      // For TikTok: create the H.264 MP4 HERE in popup context (has Web APIs + chrome APIs),
-      // then download it. The injector will guide the user to manually select it —
-      // which is confirmed to work 100% reliably.
-      let tiktokVideoPath = null;
+      // For TikTok: create H.264 MP4 in popup context (has WebCodecs + chrome APIs).
+      // We pass the encoded bytes directly to the injector, which injects them via
+      // DataTransfer — exactly the same mechanism that works for Instagram.
+      // (Previous attempts failed because the VIDEO FORMAT was wrong, not the injection.)
+      let tiktokVideoDataUrl = null;
+      let tiktokVideoPath    = null;
       if (platforms.includes("tiktok")) {
         try {
           setStatus("Creating TikTok video (H.264 MP4)…");
           AppLog.info("Creating TikTok MP4", { photos: photoDataUrls.length });
+
           const mp4Blob = await createTikTokMP4(photoDataUrls, (done, total) => {
             setStatus(`Creating TikTok video… photo ${done}/${total}`);
           });
+
           const sizeMB = (mp4Blob.size / 1024 / 1024).toFixed(1);
           AppLog.info(`TikTok MP4 created: ${sizeMB}MB`);
-          // Convert to data URL for chrome.downloads
-          setStatus(`Saving TikTok video (${sizeMB}MB)…`);
-          const mp4DataUrl = await new Promise(res => {
+          setStatus(`TikTok video ready (${sizeMB}MB) — opening TikTok…`);
+
+          // Convert to data URL (JSON-serialisable, passes through executeScript args)
+          tiktokVideoDataUrl = await new Promise(res => {
             const fr = new FileReader(); fr.onload = e => res(e.target.result); fr.readAsDataURL(mp4Blob);
           });
-          const slug = new Date().toISOString().slice(0,10);
+
+          // Also download as backup so user can manually select if injection fails
+          const slug = new Date().toISOString().slice(0, 10);
           tiktokVideoPath = `FoodFluencer/tiktok-post-${slug}.mp4`;
-          chrome.runtime.sendMessage({ type: "DOWNLOAD", url: mp4DataUrl, filename: tiktokVideoPath });
-          AppLog.info("TikTok MP4 downloaded", { path: tiktokVideoPath });
+          chrome.runtime.sendMessage({ type: "DOWNLOAD", url: tiktokVideoDataUrl, filename: tiktokVideoPath });
+          AppLog.info("TikTok MP4 also saved to Downloads", { path: tiktokVideoPath });
+
         } catch (e) {
           AppLog.error("TikTok MP4 creation failed", String(e));
           setStatus("⚠️ TikTok video creation failed: " + e.message, "error");
@@ -653,7 +661,8 @@ async function exportAndPost() {
           type: "OPEN_SOCIAL", platform, photoDataUrls, caption, songName,
           location:         currentRestaurant.address || "",
           restaurantName:   currentRestaurant.name    || "",
-          tiktokVideoPath:  platform === "tiktok" ? (tiktokVideoPath || null) : null,
+          tiktokVideoDataUrl: platform === "tiktok" ? (tiktokVideoDataUrl || null) : null,
+          tiktokVideoPath:    platform === "tiktok" ? (tiktokVideoPath    || null) : null,
         });
         await new Promise(r => setTimeout(r, 900));
       }

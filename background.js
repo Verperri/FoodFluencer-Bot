@@ -42,8 +42,8 @@ const INJECTORS = {
   tiktok:    injectTikTok,
 };
 
-async function handleSocialPost({ platform, photoDataUrls, caption, songName, location, restaurantName, tiktokVideoPath }) {
-  bgLog('info', `Opening ${platform}`, { photos: photoDataUrls.length, song: songName, location, tiktokVideoPath });
+async function handleSocialPost({ platform, photoDataUrls, caption, songName, location, restaurantName, tiktokVideoDataUrl, tiktokVideoPath }) {
+  bgLog('info', `Opening ${platform}`, { photos: photoDataUrls.length, song: songName, location, tiktokVideoDataUrl, tiktokVideoPath });
   const tab = await chrome.tabs.create({ url: PLATFORM_URLS[platform], active: true });
 
   await new Promise(resolve => {
@@ -62,7 +62,7 @@ async function handleSocialPost({ platform, photoDataUrls, caption, songName, lo
     await chrome.scripting.executeScript({
       target: { tabId: tab.id },
       func:   INJECTORS[platform],
-      args:   [photoDataUrls, caption, songName || "", location || "", { restaurantName: restaurantName || "", tiktokVideoPath: tiktokVideoPath || null }],
+      args:   [photoDataUrls, caption, songName || "", location || "", { restaurantName: restaurantName || "", tiktokVideoDataUrl: tiktokVideoDataUrl || null, tiktokVideoPath: tiktokVideoPath || null }],
       world:  "MAIN",
     });
     bgLog('info', `Injected script on ${platform}`);
@@ -804,8 +804,16 @@ function injectInstagram(photoDataUrls, caption, songName, location, opts) {
 // Tries 3 upload approaches in sequence until TikTok accepts one.
 
 function injectTikTok(photoDataUrls, caption, songName, location, opts) {
-  const { tiktokVideoPath = null } = opts || {};
+  const { tiktokVideoDataUrl = null, tiktokVideoPath = null } = opts || {};
   const sleep = ms => new Promise(r => setTimeout(r, ms));
+  const waitFor = (sel, ms = 10000) => new Promise(res => {
+    const el = document.querySelector(sel); if (el) return res(el);
+    const t = Date.now(); const iv = setInterval(() => {
+      const e = document.querySelector(sel);
+      if (e) { clearInterval(iv); return res(e); }
+      if (Date.now() - t > ms) { clearInterval(iv); return res(null); }
+    }, 300);
+  });
 
   const TOTAL = 4;
   function banner(n, html, type = 'info') {
@@ -816,16 +824,14 @@ function injectTikTok(photoDataUrls, caption, songName, location, opts) {
       background:${bg};color:#fff;font-family:-apple-system,sans-serif;font-size:13px;
       font-weight:500;padding:12px 16px;box-shadow:0 4px 16px rgba(0,0,0,.3);`;
     b.innerHTML = `
-      <div style="display:flex;align-items:center;gap:8px;margin-bottom:5px">
-        <strong style="white-space:nowrap">🍽️ FoodFluencer</strong>
-        <span style="background:rgba(255,255,255,.22);border-radius:20px;padding:1px 8px;
-          font-size:.72rem;white-space:nowrap">${n}/${TOTAL}</span>
+      <div style="display:flex;align-items:center;gap:8px;margin-bottom:4px">
+        <strong>🍽️ FoodFluencer</strong>
+        <span style="background:rgba(255,255,255,.22);border-radius:20px;padding:1px 8px;font-size:.72rem">${n}/${TOTAL}</span>
+        <span style="font-weight:400;flex:1">${html}</span>
         <button onclick="document.getElementById('ffbot-banner').remove()"
-          style="margin-left:auto;background:rgba(255,255,255,.22);border:none;color:#fff;
-          border-radius:5px;padding:3px 9px;cursor:pointer;flex-shrink:0">✕</button>
+          style="background:rgba(255,255,255,.22);border:none;color:#fff;border-radius:5px;padding:3px 9px;cursor:pointer">✕</button>
       </div>
-      <div style="font-weight:400;line-height:1.6">${html}</div>
-      <div id="ffbot-log" style="font-size:.68rem;opacity:.75;margin-top:4px;max-height:32px;overflow:hidden"></div>`;
+      <div id="ffbot-log" style="font-size:.68rem;opacity:.78;max-height:32px;overflow:hidden"></div>`;
     document.body.prepend(b);
   }
   function dbg(msg) {
@@ -834,109 +840,169 @@ function injectTikTok(photoDataUrls, caption, songName, location, opts) {
     console.log(`[FoodFluencer TikTok] ${msg}`);
   }
 
-  // ── Wait for TikTok to accept the upload ──────────────────────────────────
-  // Returns true when the caption/edit screen appears
-  async function waitForUpload(timeoutMs = 120000) {
-    const start = Date.now();
-    while (Date.now() - start < timeoutMs) {
-      await sleep(800);
-
-      // Accepted: caption textarea / DraftEditor visible
-      if (document.querySelector(
-        '[class*="DraftEditor"], [data-placeholder*="description" i], ' +
-        '[data-placeholder*="caption" i], div[contenteditable][class*="editor"]'
-      )) { return true; }
-
-      // Dismissed errors so TikTok goes back to upload state
-      const errBtn = [...document.querySelectorAll('button,[role="button"]')]
-        .find(el => /confirm|ok|close|dismiss|got it/i.test(el.textContent || ''));
-      if (errBtn) { errBtn.click(); dbg('Dismissed error dialog'); }
-    }
-    return false;
+  // ── Convert data URL → File ────────────────────────────────────────────────
+  function dataUrlToFile(url, name) {
+    const [hdr, b64] = url.split(',');
+    const mime = hdr.match(/:(.*?);/)[1];
+    const raw  = atob(b64);
+    const arr  = new Uint8Array(raw.length);
+    for (let i = 0; i < raw.length; i++) arr[i] = raw.charCodeAt(i);
+    return new File([arr], name, { type: mime });
   }
 
-  (async () => {
-    await sleep(1500);
-
-    const fileName = tiktokVideoPath
-      ? tiktokVideoPath.split('/').pop()
-      : 'tiktok-post.mp4';
-    const folder = tiktokVideoPath
-      ? tiktokVideoPath.replace(fileName, '').replace(/\/$/, '')
-      : 'FoodFluencer';
-
-    // ── Step 1: Instruction banner ─────────────────────────────────────────
-    banner(1,
-      `Your TikTok video is ready! To upload it:<br>
-       <strong>1.</strong> Click the <strong>upload area</strong> (the box on this page)<br>
-       <strong>2.</strong> In the file picker: go to <code>Downloads → ${folder.split('/').pop()}</code><br>
-       <strong>3.</strong> Select <strong style="color:#ffd700">${fileName}</strong><br>
-       <span style="font-size:.8em;opacity:.85">📁 Full path: Downloads/${folder}/${fileName}</span>`,
-      'warn'
+  // ── Inject file into an <input type="file"> via DataTransfer ──────────────
+  function injectFile(input, file) {
+    const dt = new DataTransfer();
+    dt.items.add(file);
+    const setter = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'files')?.set;
+    if (setter) setter.call(input, dt.files); else input.files = dt.files;
+    // Fire all events that React/TikTok might listen to
+    ['change', 'input'].forEach(ev =>
+      input.dispatchEvent(new Event(ev, { bubbles: true, cancelable: true }))
     );
+  }
 
-    dbg(`Waiting for user to select: ${fileName}`);
+  // ── Detect whether TikTok accepted or rejected the file ───────────────────
+  const ERROR_RE = /over.*\d+.?min|minute.*limit|size.*too|too.*large|file.*too|maximum.*size|not.*support|unsupport|invalid.*file|upload.*fail/i;
+  const SUCCESS_SEL = '[class*="DraftEditor"],[data-placeholder*="description" i],[data-placeholder*="caption" i],div[contenteditable][class*="editor"]';
 
-    // ── Step 2: Wait for upload to complete ───────────────────────────────
-    const accepted = await waitForUpload(180000); // 3-minute window
-
-    if (!accepted) {
-      banner(2, '⚠️ Upload not detected. Please select the file and try again.', 'warn');
-      return;
+  async function checkUpload(timeoutMs = 15000) {
+    const start = Date.now();
+    while (Date.now() - start < timeoutMs) {
+      await sleep(600);
+      const text = document.body.innerText || '';
+      if (ERROR_RE.test(text)) {
+        const m = text.match(ERROR_RE);
+        dbg(`TikTok rejected: "${m?.[0]}"`);
+        return 'rejected';
+      }
+      if (document.querySelector(SUCCESS_SEL)) {
+        dbg('Upload accepted — editor visible');
+        return 'accepted';
+      }
     }
+    // Final check
+    if (ERROR_RE.test(document.body.innerText)) return 'rejected';
+    if (document.querySelector(SUCCESS_SEL)) return 'accepted';
+    return 'timeout';
+  }
 
-    dbg('Upload accepted — proceeding to fill details');
-
-    // ── Step 3: Fill caption / description ────────────────────────────────
-    banner(3, 'Filling description…');
-    await sleep(1500);
-
-    const descSels = [
+  // ── Fill caption ──────────────────────────────────────────────────────────
+  async function fillCaption() {
+    const sels = [
       '[class*="DraftEditor-content"]',
       '[contenteditable="true"][class*="editor" i]',
       '[data-placeholder*="description" i]',
       'div[contenteditable="true"]',
     ];
-    let descBox = null;
-    for (let att = 0; att < 6 && !descBox; att++) {
-      for (const s of descSels) { descBox = document.querySelector(s); if (descBox) break; }
-      if (!descBox) await sleep(600);
+    let box = null;
+    for (let att = 0; att < 8 && !box; att++) {
+      for (const s of sels) { box = document.querySelector(s); if (box) break; }
+      if (!box) await sleep(500);
     }
-    if (descBox) {
-      descBox.focus(); await sleep(300);
+    if (box) {
+      box.focus(); await sleep(300);
       document.execCommand('selectAll', false, null);
       document.execCommand('insertText', false, caption);
-      dbg('Description filled');
-    } else {
-      dbg('Description box not found — user must fill manually');
+      dbg('Caption filled');
+      return true;
+    }
+    dbg('Caption box not found');
+    return false;
+  }
+
+  // ── Add sound ─────────────────────────────────────────────────────────────
+  async function addSound() {
+    if (!songName) return;
+    await sleep(600);
+    const btn = [...document.querySelectorAll('button,[role="button"]')]
+      .find(el => /add\s*(sound|music)/i.test(el.textContent || el.getAttribute('aria-label') || ''));
+    if (!btn) { dbg('Add Sound button not found'); return; }
+    btn.click(); await sleep(1200);
+    const input = document.querySelector('input[placeholder*="Search" i],input[type="search"]');
+    if (!input) { dbg('Music search input not found'); return; }
+    input.focus(); await sleep(200);
+    input.value = songName;
+    input.dispatchEvent(new Event('input', { bubbles: true }));
+    await sleep(2000);
+    const first = document.querySelector('[class*="music-item"]:first-child,[class*="MusicItem"]:first-child,[class*="sound-item"]:first-child');
+    if (first) { first.click(); dbg(`Sound selected: ${songName}`); }
+    else dbg('No sound results');
+  }
+
+  // ══════════════════════════════════════════════════════════════════════════
+  // MAIN FLOW
+  // ══════════════════════════════════════════════════════════════════════════
+  (async () => {
+    await sleep(2000); // let TikTok hydrate
+
+    if (!tiktokVideoDataUrl) {
+      banner(1, '⚠️ No video data available. Please retry the export.', 'warn');
+      return;
     }
 
-    // ── Step 4: Add sound via TikTok's panel ──────────────────────────────
+    const fileName = tiktokVideoPath ? tiktokVideoPath.split('/').pop() : 'tiktok-post.mp4';
+    const sizeMB = (tiktokVideoDataUrl.length * 0.75 / 1024 / 1024).toFixed(1); // approx
+
+    // ── STEP 1: Find the file input and inject the MP4 ─────────────────────
+    banner(1, `Locating TikTok upload area (${sizeMB}MB video)…`);
+    const fileInput = await waitFor('input[type="file"]', 12000);
+
+    if (!fileInput) {
+      banner(1, '⚠️ Upload area not found — please refresh TikTok and retry.', 'warn');
+      return;
+    }
+    dbg(`File input found — injecting ${sizeMB}MB MP4…`);
+
+    banner(1, `Injecting H.264 MP4 (${sizeMB}MB)…`);
+    const file = dataUrlToFile(tiktokVideoDataUrl, fileName);
+    injectFile(fileInput, file);
+    dbg('DataTransfer injection sent');
+
+    // ── STEP 2: Wait for TikTok to accept ──────────────────────────────────
+    banner(2, 'Waiting for TikTok to process the video…');
+    const result = await checkUpload(20000);
+
+    if (result === 'rejected') {
+      // TikTok rejected the injected file — fall back to manual selection
+      const folder = tiktokVideoPath ? tiktokVideoPath.replace(fileName, '').replace(/\/$/, '') : 'FoodFluencer';
+      banner(2,
+        `Automatic injection failed — please select the file manually:<br>
+         <strong>1.</strong> Click the TikTok upload area<br>
+         <strong>2.</strong> Go to <code>Downloads → ${folder.split('/').pop()}</code><br>
+         <strong>3.</strong> Select <strong style="color:#ffd700">${fileName}</strong>`,
+        'warn'
+      );
+      dbg('Waiting for manual selection (120s timeout)…');
+      // Wait for manual selection
+      const manual = await waitFor(SUCCESS_SEL, 120000);
+      if (!manual) {
+        banner(2, '⚠️ Upload not detected. Please retry.', 'warn');
+        return;
+      }
+      dbg('Manual upload accepted');
+    } else if (result === 'timeout') {
+      dbg('Timeout waiting for acceptance — proceeding anyway');
+    }
+
+    // ── STEP 3: Fill caption ───────────────────────────────────────────────
+    banner(3, 'Filling description…');
+    await sleep(2000); // wait for editor to fully render
+    await fillCaption();
+
+    // ── STEP 4: Add sound ──────────────────────────────────────────────────
     if (songName) {
-      await sleep(800);
-      const soundBtn = [...document.querySelectorAll('button,[role="button"]')]
-        .find(el => /add\s*(sound|music)/i.test(el.textContent || el.getAttribute('aria-label') || ''));
-      if (soundBtn) {
-        soundBtn.click(); await sleep(1200);
-        const musicInput = document.querySelector('input[placeholder*="Search" i],input[type="search"]');
-        if (musicInput) {
-          musicInput.focus(); await sleep(200);
-          musicInput.value = songName;
-          musicInput.dispatchEvent(new Event('input', { bubbles: true }));
-          await sleep(2000);
-          const first = document.querySelector('[class*="music-item"]:first-child,[class*="MusicItem"]:first-child');
-          if (first) { first.click(); dbg(`Sound selected: ${songName}`); }
-        }
-      } else { dbg('Add Sound button not found'); }
+      banner(3, `Adding sound: <em>"${songName}"</em>…`);
+      await addSound();
     }
 
-    // ── Done ─────────────────────────────────────────────────────────────
+    // ── Done ───────────────────────────────────────────────────────────────
     const note = songName ? ` 🎵 Verify "<em>${songName}</em>" is set.` : '';
     banner(4,
-      `✅ All set! Review description &amp; settings.${note}<br>Click <strong>Post</strong> to publish.`,
+      `✅ All ready! Review and click <strong>Post</strong> to publish.${note}`,
       'success'
     );
-    dbg('Bot complete — click Post when ready');
+    dbg('Bot complete — awaiting Post click');
   })();
 }
 
