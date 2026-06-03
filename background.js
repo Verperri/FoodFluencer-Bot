@@ -42,8 +42,8 @@ const INJECTORS = {
   tiktok:    injectTikTok,
 };
 
-async function handleSocialPost({ platform, photoDataUrls, caption, songName, location, restaurantName, audioDataUrl }) {
-  bgLog('info', `Opening ${platform}`, { photos: photoDataUrls.length, song: songName, location, restaurantName });
+async function handleSocialPost({ platform, photoDataUrls, caption, songName, location, restaurantName, tiktokVideoPath }) {
+  bgLog('info', `Opening ${platform}`, { photos: photoDataUrls.length, song: songName, location, tiktokVideoPath });
   const tab = await chrome.tabs.create({ url: PLATFORM_URLS[platform], active: true });
 
   await new Promise(resolve => {
@@ -62,7 +62,7 @@ async function handleSocialPost({ platform, photoDataUrls, caption, songName, lo
     await chrome.scripting.executeScript({
       target: { tabId: tab.id },
       func:   INJECTORS[platform],
-      args:   [photoDataUrls, caption, songName || "", location || "", { restaurantName: restaurantName || "", audioDataUrl: audioDataUrl || null }],
+      args:   [photoDataUrls, caption, songName || "", location || "", { restaurantName: restaurantName || "", tiktokVideoPath: tiktokVideoPath || null }],
       world:  "MAIN",
     });
     bgLog('info', `Injected script on ${platform}`);
@@ -804,379 +804,116 @@ function injectInstagram(photoDataUrls, caption, songName, location, opts) {
 // Tries 3 upload approaches in sequence until TikTok accepts one.
 
 function injectTikTok(photoDataUrls, caption, songName, location, opts) {
+  const { tiktokVideoPath = null } = opts || {};
   const sleep = ms => new Promise(r => setTimeout(r, ms));
-  const waitFor = (sel, ms = 12000) => new Promise(res => {
-    const el = document.querySelector(sel); if (el) return res(el);
-    const t = Date.now(); const iv = setInterval(() => {
-      const e = document.querySelector(sel);
-      if (e) { clearInterval(iv); return res(e); }
-      if (Date.now() - t > ms) { clearInterval(iv); return res(null); }
-    }, 300);
-  });
 
-  const TOTAL = 5;
-  function step(n, html, type = 'info') {
+  const TOTAL = 4;
+  function banner(n, html, type = 'info') {
     document.getElementById('ffbot-banner')?.remove();
     const b = document.createElement('div'); b.id = 'ffbot-banner';
     const bg = { info: '#e8490f', success: '#16a34a', warn: '#d97706' }[type] || '#e8490f';
     b.style.cssText = `position:fixed;top:0;left:0;right:0;z-index:2147483647;
       background:${bg};color:#fff;font-family:-apple-system,sans-serif;font-size:13px;
-      font-weight:500;padding:10px 16px;box-shadow:0 3px 14px rgba(0,0,0,.28);`;
+      font-weight:500;padding:12px 16px;box-shadow:0 4px 16px rgba(0,0,0,.3);`;
     b.innerHTML = `
-      <div style="display:flex;align-items:center;gap:8px;margin-bottom:3px">
-        <strong>🍽️ FoodFluencer</strong>
+      <div style="display:flex;align-items:center;gap:8px;margin-bottom:5px">
+        <strong style="white-space:nowrap">🍽️ FoodFluencer</strong>
         <span style="background:rgba(255,255,255,.22);border-radius:20px;padding:1px 8px;
-          font-size:.72rem">${n}/${TOTAL}</span>
-        <span style="font-weight:400;flex:1">${html}</span>
+          font-size:.72rem;white-space:nowrap">${n}/${TOTAL}</span>
         <button onclick="document.getElementById('ffbot-banner').remove()"
-          style="background:rgba(255,255,255,.22);border:none;color:#fff;
-          border-radius:5px;padding:3px 9px;cursor:pointer">✕</button>
+          style="margin-left:auto;background:rgba(255,255,255,.22);border:none;color:#fff;
+          border-radius:5px;padding:3px 9px;cursor:pointer;flex-shrink:0">✕</button>
       </div>
-      <div id="ffbot-log" style="font-size:.68rem;opacity:.8;max-height:36px;overflow:hidden"></div>`;
+      <div style="font-weight:400;line-height:1.6">${html}</div>
+      <div id="ffbot-log" style="font-size:.68rem;opacity:.75;margin-top:4px;max-height:32px;overflow:hidden"></div>`;
     document.body.prepend(b);
   }
   function dbg(msg) {
     const l = document.getElementById('ffbot-log');
-    if (l) { const d = document.createElement('div'); d.textContent = `→ ${msg}`; l.prepend(d); while(l.children.length>3) l.lastChild.remove(); }
+    if (l) { const d = document.createElement('span'); d.textContent = `→ ${msg}  `; l.prepend(d); }
     console.log(`[FoodFluencer TikTok] ${msg}`);
   }
 
-  // ── Convert data URL back to a File ───────────────────────────────────────
-  function dataUrlToFile(url, name) {
-    const [hdr, b64] = url.split(',');
-    const mime = hdr.match(/:(.*?);/)[1];
-    const raw  = atob(b64);
-    const arr  = new Uint8Array(raw.length);
-    for (let i = 0; i < raw.length; i++) arr[i] = raw.charCodeAt(i);
-    return new File([arr], name, { type: mime });
-  }
-
-  // ── Inject a file list into a file input ──────────────────────────────────
-  function injectFiles(input, files) {
-    const dt = new DataTransfer();
-    files.forEach(f => dt.items.add(f));
-    const setter = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'files')?.set;
-    if (setter) setter.call(input, dt.files); else input.files = dt.files;
-    input.dispatchEvent(new Event('change', { bubbles: true }));
-    input.dispatchEvent(new Event('input',  { bubbles: true }));
-  }
-
-  // ── Error detection: did TikTok reject the upload? ────────────────────────
-  const ERROR_RE = /over.*\d+.?min|minute.*limit|size.*too|too.*large|file.*too|maximum.*size|not.*support|unsupport|invalid.*file|upload.*fail|fail.*upload/i;
-
-  async function checkUpload(waitMs = 10000) {
+  // ── Wait for TikTok to accept the upload ──────────────────────────────────
+  // Returns true when the caption/edit screen appears
+  async function waitForUpload(timeoutMs = 120000) {
     const start = Date.now();
-    while (Date.now() - start < waitMs) {
-      await sleep(700);
-      const pageText = document.body.innerText || '';
-      const err = pageText.match(ERROR_RE);
-      if (err) { dbg(`TikTok error: "${err[0]}"`); return `rejected:${err[0]}`; }
-      // Success: caption editor or description input visible
-      if (document.querySelector('[class*="caption" i] div[contenteditable], [data-placeholder*="caption" i], [class*="DraftEditor"]')) {
-        dbg('Upload accepted ✓'); return 'accepted';
-      }
+    while (Date.now() - start < timeoutMs) {
+      await sleep(800);
+
+      // Accepted: caption textarea / DraftEditor visible
+      if (document.querySelector(
+        '[class*="DraftEditor"], [data-placeholder*="description" i], ' +
+        '[data-placeholder*="caption" i], div[contenteditable][class*="editor"]'
+      )) { return true; }
+
+      // Dismissed errors so TikTok goes back to upload state
+      const errBtn = [...document.querySelectorAll('button,[role="button"]')]
+        .find(el => /confirm|ok|close|dismiss|got it/i.test(el.textContent || ''));
+      if (errBtn) { errBtn.click(); dbg('Dismissed error dialog'); }
     }
-    return ERROR_RE.test(document.body.innerText) ? 'rejected:timeout' : 'timeout';
+    return false;
   }
 
-  // ════════════════════════════════════════════════════════════════════════════
-  // APPROACH A — TikTok PHOTO POST MODE (primary, no video needed)
-  // This matches exactly the format of /photo/ posts like the reference URL.
-  // ════════════════════════════════════════════════════════════════════════════
-  async function tryPhotoMode() {
-    dbg('Looking for TikTok Photo mode tab…');
-
-    // Find the "Photo" tab/button — TikTok's upload page has Video | Photo tabs
-    const photoTab = [...document.querySelectorAll('[role="tab"], button, [role="button"], a, div[tabindex]')]
-      .find(el => {
-        const txt = (el.innerText || el.textContent || '').trim();
-        const lbl = el.getAttribute('aria-label') || '';
-        return /^(photo|photos|image)s?$/i.test(txt) || /^(photo|photos)s?$/i.test(lbl);
-      });
-
-    if (!photoTab) {
-      dbg('No Photo tab found on this page');
-      return false;
-    }
-
-    dbg(`Photo tab found: "${photoTab.innerText?.trim()}" — clicking…`);
-    photoTab.click();
-    await sleep(1200);
-
-    // After switching to photo mode, find the photo file input
-    let photoInput = document.querySelector('input[type="file"][accept*="image"], input[type="file"][accept*="IMAGE"]');
-    if (!photoInput) {
-      // Sometimes TikTok uses the same file input but switches the accept type
-      photoInput = document.querySelector('input[type="file"]');
-    }
-    if (!photoInput) {
-      dbg('Photo file input not found after switching to photo mode');
-      return false;
-    }
-
-    const files = photoDataUrls.map((url, i) => dataUrlToFile(url, `photo${i+1}.jpg`));
-    const totalKB = files.reduce((a, f) => a + f.size, 0) / 1024;
-    dbg(`Uploading ${files.length} JPEGs (${totalKB.toFixed(0)}KB total) in Photo mode…`);
-    injectFiles(photoInput, files);
-    return true;
-  }
-
-  // ════════════════════════════════════════════════════════════════════════════
-  // APPROACH B — H.264 MP4 matching TikTok's own format (1080×1920 portrait)
-  // Based on the reference MP4: isom/avc1/mp41, libx264, ~2.8Mbps
-  // Uses WebCodecs VideoEncoder for proper H.264 output.
-  // ════════════════════════════════════════════════════════════════════════════
-  async function tryH264MP4(imgs, secPerSlide) {
-    if (!window.VideoEncoder) throw new Error('WebCodecs not available');
-    // Portrait 9:16 to match TikTok's native format
-    const W = 576, H = 1024; // 9:16, manageable encode time
-    const fps = 15, kbps = 1_200_000;
-    dbg(`H.264 MP4 ${W}×${H} ${fps}fps ${kbps/1000}kbps…`);
-
-    const framesPerSlide = Math.ceil(secPerSlide * fps);
-    const totalFrames    = imgs.length * framesPerSlide;
-    const canvas = document.createElement('canvas');
-    canvas.width = W; canvas.height = H;
-    const ctx = canvas.getContext('2d');
-
-    const chunks = []; let decoderConfig = null;
-    const encoder = new VideoEncoder({
-      output: (chunk, meta) => {
-        if (meta?.decoderConfig) decoderConfig = meta.decoderConfig;
-        const buf = new ArrayBuffer(chunk.byteLength);
-        chunk.copyTo(buf);
-        chunks.push({ data: new Uint8Array(buf), isKey: chunk.type === 'key' });
-      },
-      error: e => { throw e; },
-    });
-    encoder.configure({ codec: 'avc1.4d001f', width: W, height: H, bitrate: kbps, framerate: fps, avc: { format: 'avcC' } });
-
-    let fi = 0;
-    for (let i = 0; i < imgs.length; i++) {
-      // Draw image centered with black letterbox/pillarbox
-      ctx.fillStyle = '#000'; ctx.fillRect(0, 0, W, H);
-      const img = imgs[i];
-      const s = Math.min(W / img.naturalWidth, H / img.naturalHeight);
-      ctx.drawImage(img, (W - img.naturalWidth * s) / 2, (H - img.naturalHeight * s) / 2, img.naturalWidth * s, img.naturalHeight * s);
-      for (let f = 0; f < framesPerSlide; f++) {
-        const ts = Math.round(fi * 1_000_000 / fps);
-        const frame = new VideoFrame(canvas, { timestamp: ts, duration: Math.round(1_000_000 / fps) });
-        encoder.encode(frame, { keyFrame: fi === 0 || f === 0 });
-        frame.close(); fi++;
-      }
-      dbg(`Encoded slide ${i+1}/${imgs.length}`);
-    }
-    await encoder.flush(); encoder.close();
-    dbg(`${chunks.length} chunks — muxing…`);
-    return buildMP4(chunks, decoderConfig, W, H, fps, totalFrames, secPerSlide * imgs.length);
-  }
-
-  function buildMP4(chunks, dcfg, W, H, fps, totalFrames, totalSec) {
-    const u8  = v => [v & 0xFF];
-    const u16 = v => [(v >> 8) & 0xFF, v & 0xFF];
-    const u32 = v => [(v >>> 24) & 0xFF, (v >>> 16) & 0xFF, (v >>> 8) & 0xFF, v & 0xFF];
-    const str = s => [...new TextEncoder().encode(s).slice(0, 4)];
-    const z   = n => Array(n).fill(0);
-    function box(t, ...c) { const d = c.flat(Infinity); return [...u32(8+d.length), ...str(t.padEnd(4,' ')), ...d]; }
-    function fb(t, v, f, ...c) { return box(t, u8(v), [(f>>16)&0xFF,(f>>8)&0xFF,f&0xFF], ...c); }
-
-    let sps = new Uint8Array([0x67,0x4d,0x00,0x1f,0xda,0x0d,0x0a]);
-    let pps = new Uint8Array([0x68,0xee,0x38,0x80]);
-    if (dcfg?.description) {
-      const d = new Uint8Array(dcfg.description); let i = 5;
-      const ns = d[i++] & 0x1F;
-      for (let j=0; j<ns; j++) { const l=(d[i]<<8)|d[i+1]; i+=2; sps=d.slice(i,i+l); i+=l; }
-      const np = d[i++];
-      for (let j=0; j<np; j++) { const l=(d[i]<<8)|d[i+1]; i+=2; pps=d.slice(i,i+l); i+=l; }
-    }
-
-    const avcC = box('avcC', u8(1), [sps[1],sps[2],sps[3]], [0xFF],[0xE1], u16(sps.length), [...sps], u8(1), u16(pps.length), [...pps]);
-    const avc1 = box('avc1', z(6),u16(1),z(16), u16(W),u16(H), [0,72,0,0,0,72,0,0],u32(0),u16(1),z(32),u16(0x18),u16(0xFFFF), avcC);
-
-    const ts  = fps;
-    const dur = totalFrames;
-    const mat = [0x00,0x01,0x00,0x00, 0,0,0,0,0,0,0,0, 0,0,0,0, 0x00,0x01,0x00,0x00, 0,0,0,0,0,0,0,0, 0,0,0,0, 0x40,0x00,0x00,0x00];
-
-    const stsd = fb('stsd',0,0, u32(1), avc1);
-    const stts = fb('stts',0,0, u32(1), u32(chunks.length), u32(1));
-    const keyIs = chunks.map((c,i)=>c.isKey?i+1:null).filter(Boolean);
-    const stss = fb('stss',0,0, u32(keyIs.length), ...keyIs.flatMap(i=>u32(i)));
-    const stsz = fb('stsz',0,0, u32(0),u32(chunks.length), ...chunks.flatMap(c=>u32(c.data.length)));
-    const stsc = fb('stsc',0,0, u32(1),u32(1),u32(1),u32(1));
-    const stco_ph = fb('stco',0,0, u32(chunks.length), ...chunks.flatMap(()=>u32(0)));
-    const stbl_ph = box('stbl', stsd,stts,stss,stsc,stsz,stco_ph);
-    const vmhd = fb('vmhd',0,1, u16(0),z(6));
-    const dinf = box('dinf', fb('dref',0,0, u32(1), fb('url ',0,1)));
-    const minf_ph = box('minf', vmhd, dinf, stbl_ph);
-    const mdhd = fb('mdhd',0,0, u32(0),u32(0),u32(ts),u32(dur), u16(0x55C4),u16(0));
-    const hdlr = fb('hdlr',0,0, u32(0), str('vide'), z(12), [...str('Vide'),0]);
-    const mdia_ph = box('mdia', mdhd, hdlr, minf_ph);
-    const tkhd = fb('tkhd',0,3, u32(0),u32(0),u32(1),u32(0),u32(dur),z(8),u16(0),u16(0),u16(0),u16(0), mat, u32(W<<16),u32(H<<16));
-    const trak_ph = box('trak', tkhd, mdia_ph);
-    const mvhd = fb('mvhd',0,0, u32(0),u32(0),u32(ts),u32(dur), u32(0x10000),u16(0x100),z(10), mat, z(24), u32(2));
-    const moov_ph = box('moov', mvhd, trak_ph);
-    const ftyp = box('ftyp', str('isom'),u32(0x200), str('isom'),str('iso2'),str('avc1'),str('mp41'));
-
-    // Compute real chunk offsets
-    const mdatOff = ftyp.length + moov_ph.length + 8;
-    let off = mdatOff;
-    const realOff = chunks.map(c => { const o=off; off+=c.data.length; return o; });
-
-    const stco_r  = fb('stco',0,0, u32(chunks.length), ...realOff.flatMap(o=>u32(o)));
-    const stbl_r  = box('stbl', stsd,stts,stss,stsc,stsz,stco_r);
-    const minf_r  = box('minf', vmhd, dinf, stbl_r);
-    const mdia_r  = box('mdia', mdhd, hdlr, minf_r);
-    const trak_r  = box('trak', tkhd, mdia_r);
-    const moov_r  = box('moov', mvhd, trak_r);
-
-    // Build output efficiently
-    const ftypArr = new Uint8Array(ftyp);
-    const moovArr = new Uint8Array(moov_r);
-    const mdatHdr = new Uint8Array([...u32(8 + chunks.reduce((a,c)=>a+c.data.length,0)), ...str('mdat')]);
-    const total   = ftypArr.length + moovArr.length + mdatHdr.length + chunks.reduce((a,c)=>a+c.data.length,0);
-    const out     = new Uint8Array(total);
-    let pos = 0;
-    for (const part of [ftypArr, moovArr, mdatHdr, ...chunks.map(c=>c.data)]) { out.set(part, pos); pos += part.length; }
-    return out;
-  }
-
-  // ════════════════════════════════════════════════════════════════════════════
-  // APPROACH C — WebM via MediaRecorder, portrait 9:16, low bitrate
-  // ════════════════════════════════════════════════════════════════════════════
-  async function tryWebM(imgs, secPerSlide) {
-    const W=576, H=1024, fps=15, kbps=800_000;
-    dbg(`WebM ${W}×${H} ${fps}fps ${kbps/1000}kbps…`);
-    const canvas=document.createElement('canvas'); canvas.width=W; canvas.height=H;
-    const ctx=canvas.getContext('2d');
-    const mt=['video/webm;codecs=vp9','video/webm;codecs=vp8','video/webm'].find(t=>MediaRecorder.isTypeSupported(t))||'video/webm';
-    const rec=new MediaRecorder(canvas.captureStream(fps),{mimeType:mt,videoBitsPerSecond:kbps});
-    const ch=[];
-    rec.ondataavailable=e=>{if(e.data.size>0)ch.push(e.data);};
-    rec.start(100);
-    for(let i=0;i<imgs.length;i++){
-      ctx.fillStyle='#000';ctx.fillRect(0,0,W,H);
-      const img=imgs[i];
-      const s=Math.min(W/img.naturalWidth,H/img.naturalHeight);
-      ctx.drawImage(img,(W-img.naturalWidth*s)/2,(H-img.naturalHeight*s)/2,img.naturalWidth*s,img.naturalHeight*s);
-      await sleep(secPerSlide*1000);
-    }
-    rec.stop();
-    const rawBlob=await new Promise(res=>{rec.onstop=()=>res(new Blob(ch,{type:'video/webm'}));});
-    const totalMs=imgs.length*secPerSlide*1000;
-    dbg(`Raw WebM ${(rawBlob.size/1024).toFixed(0)}KB — patching duration…`);
-    return patchWebMDuration(rawBlob, totalMs);
-  }
-
-  async function patchWebMDuration(blob, totalMs) {
-    const buf=await blob.arrayBuffer(); const data=new Uint8Array(buf); const view=new DataView(buf);
-    let patched=false;
-    for(let i=0;i<data.length-12&&!patched;i++){
-      if(data[i]!==0x44||data[i+1]!==0x89)continue;
-      const sc=data[i+2]; let dOff,dLen;
-      if(sc>=0x80){dLen=sc&0x7F;dOff=i+3;}
-      else if(sc>=0x40){dLen=((sc&0x3F)<<8)|data[i+3];dOff=i+4;}
-      else if(sc>=0x20){dLen=((sc&0x1F)<<16)|(data[i+3]<<8)|data[i+4];dOff=i+5;}
-      else continue;
-      if(dLen===8){view.setFloat64(dOff,totalMs,false);patched=true;dbg(`WebM duration patched @${i}`);}
-      else if(dLen===4){view.setFloat32(dOff,totalMs,false);patched=true;}
-    }
-    return new Blob([buf],{type:blob.type});
-  }
-
-  // ════════════════════════════════════════════════════════════════════════════
-  // MAIN FLOW
-  // ════════════════════════════════════════════════════════════════════════════
   (async () => {
-    const SEC_PER_SLIDE = 1.2;
+    await sleep(1500);
 
-    step(1, 'Loading TikTok upload page…');
-    await sleep(2000);
+    const fileName = tiktokVideoPath
+      ? tiktokVideoPath.split('/').pop()
+      : 'tiktok-post.mp4';
+    const folder = tiktokVideoPath
+      ? tiktokVideoPath.replace(fileName, '').replace(/\/$/, '')
+      : 'FoodFluencer';
 
-    // Pre-load images for video approaches
-    const imgs = [];
-    for (const src of photoDataUrls) {
-      await new Promise(res => {
-        const img = new Image();
-        img.onload = () => { imgs.push(img); res(); };
-        img.onerror = res;
-        img.src = src;
-      });
-    }
-    dbg(`Loaded ${imgs.length} images`);
+    // ── Step 1: Instruction banner ─────────────────────────────────────────
+    banner(1,
+      `Your TikTok video is ready! To upload it:<br>
+       <strong>1.</strong> Click the <strong>upload area</strong> (the box on this page)<br>
+       <strong>2.</strong> In the file picker: go to <code>Downloads → ${folder.split('/').pop()}</code><br>
+       <strong>3.</strong> Select <strong style="color:#ffd700">${fileName}</strong><br>
+       <span style="font-size:.8em;opacity:.85">📁 Full path: Downloads/${folder}/${fileName}</span>`,
+      'warn'
+    );
 
-    let uploadedAs = null;
+    dbg(`Waiting for user to select: ${fileName}`);
 
-    // ── Approach A: Photo Post mode (primary — no video needed) ──────────────
-    step(2, 'Approach A — TikTok Photo Post mode (JPEGs direct)…');
-    const photoModeWorked = await tryPhotoMode();
-    if (photoModeWorked) {
-      const rA = await checkUpload(10000);
-      if (rA === 'accepted' || rA === 'timeout') {
-        uploadedAs = 'Photo Post';
-        dbg('Approach A accepted ✓');
-      } else {
-        dbg(`Approach A result: ${rA}`);
-      }
-    }
+    // ── Step 2: Wait for upload to complete ───────────────────────────────
+    const accepted = await waitForUpload(180000); // 3-minute window
 
-    // ── Approach B: H.264 MP4 portrait (same format as TikTok's own exports) ─
-    if (!uploadedAs) {
-      step(2, 'Approach B — H.264 MP4 portrait 576×1024 (WebCodecs)…');
-      try {
-        const data = await tryH264MP4(imgs, SEC_PER_SLIDE);
-        const file = new File([data], 'tiktok-post.mp4', { type: 'video/mp4' });
-        dbg(`MP4: ${(file.size/1024).toFixed(0)}KB — injecting…`);
-        const fileInput = document.querySelector('input[type="file"]');
-        if (fileInput) {
-          injectFiles(fileInput, [file]);
-          const rB = await checkUpload(12000);
-          if (rB === 'accepted') { uploadedAs = 'H.264 MP4'; dbg('Approach B accepted ✓'); }
-          else dbg(`Approach B result: ${rB}`);
-        }
-      } catch(e) { dbg(`Approach B error: ${e.message}`); }
-    }
-
-    // ── Approach C: WebM portrait (fallback) ──────────────────────────────────
-    if (!uploadedAs) {
-      step(2, 'Approach C — WebM portrait 576×1024 (MediaRecorder)…');
-      try {
-        const blob = await tryWebM(imgs, SEC_PER_SLIDE);
-        const file = new File([blob], 'tiktok-post.webm', { type: 'video/webm' });
-        dbg(`WebM: ${(file.size/1024).toFixed(0)}KB — injecting…`);
-        const fileInput = document.querySelector('input[type="file"]');
-        if (fileInput) {
-          injectFiles(fileInput, [file]);
-          const rC = await checkUpload(12000);
-          if (rC === 'accepted' || rC === 'timeout') { uploadedAs = 'WebM'; dbg('Approach C accepted ✓'); }
-          else dbg(`Approach C result: ${rC}`);
-        }
-      } catch(e) { dbg(`Approach C error: ${e.message}`); }
-    }
-
-    if (!uploadedAs) {
-      step(2, '⚠️ All approaches failed. Please upload manually from <strong>Downloads/FoodFluencer</strong>.', 'warn');
+    if (!accepted) {
+      banner(2, '⚠️ Upload not detected. Please select the file and try again.', 'warn');
       return;
     }
 
-    step(3, `Uploaded as <strong>${uploadedAs}</strong> ✓ — filling caption…`);
-    await sleep(3000);
+    dbg('Upload accepted — proceeding to fill details');
 
-    // ── Fill description ──────────────────────────────────────────────────────
-    const descSels = ['.public-DraftEditor-content','[contenteditable="true"][data-text]',
-      '[class*="editor"][contenteditable="true"]','div[contenteditable="true"]'];
+    // ── Step 3: Fill caption / description ────────────────────────────────
+    banner(3, 'Filling description…');
+    await sleep(1500);
+
+    const descSels = [
+      '[class*="DraftEditor-content"]',
+      '[contenteditable="true"][class*="editor" i]',
+      '[data-placeholder*="description" i]',
+      'div[contenteditable="true"]',
+    ];
     let descBox = null;
-    for (const s of descSels) { descBox = document.querySelector(s); if (descBox) break; }
+    for (let att = 0; att < 6 && !descBox; att++) {
+      for (const s of descSels) { descBox = document.querySelector(s); if (descBox) break; }
+      if (!descBox) await sleep(600);
+    }
     if (descBox) {
-      descBox.focus(); await sleep(200);
+      descBox.focus(); await sleep(300);
       document.execCommand('selectAll', false, null);
       document.execCommand('insertText', false, caption);
-      dbg('Caption filled');
+      dbg('Description filled');
+    } else {
+      dbg('Description box not found — user must fill manually');
     }
 
-    // ── Add sound via TikTok's native panel ───────────────────────────────────
+    // ── Step 4: Add sound via TikTok's panel ──────────────────────────────
     if (songName) {
       await sleep(800);
-      step(4, `Finding TikTok sound: <em>"${songName}"</em>…`);
       const soundBtn = [...document.querySelectorAll('button,[role="button"]')]
         .find(el => /add\s*(sound|music)/i.test(el.textContent || el.getAttribute('aria-label') || ''));
       if (soundBtn) {
@@ -1187,15 +924,19 @@ function injectTikTok(photoDataUrls, caption, songName, location, opts) {
           musicInput.value = songName;
           musicInput.dispatchEvent(new Event('input', { bubbles: true }));
           await sleep(2000);
-          const first = document.querySelector('[class*="music-item"]:first-child,[class*="MusicItem"]:first-child,[class*="sound-item"]:first-child');
-          if (first) { first.click(); dbg('Sound selected'); }
+          const first = document.querySelector('[class*="music-item"]:first-child,[class*="MusicItem"]:first-child');
+          if (first) { first.click(); dbg(`Sound selected: ${songName}`); }
         }
-      }
+      } else { dbg('Add Sound button not found'); }
     }
 
-    const note = songName ? ` 🎵 Verify "<em>${songName}</em>" is added.` : '';
-    step(5, `✅ Ready! Review &amp; click <strong>Post</strong>.${note}`, 'success');
-    dbg('Bot complete — awaiting Post click');
+    // ── Done ─────────────────────────────────────────────────────────────
+    const note = songName ? ` 🎵 Verify "<em>${songName}</em>" is set.` : '';
+    banner(4,
+      `✅ All set! Review description &amp; settings.${note}<br>Click <strong>Post</strong> to publish.`,
+      'success'
+    );
+    dbg('Bot complete — click Post when ready');
   })();
 }
 

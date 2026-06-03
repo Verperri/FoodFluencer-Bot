@@ -619,21 +619,31 @@ async function exportAndPost() {
     if (photoDataUrls.length > 0) {
       AppLog.info(`Sending ${photoDataUrls.length} photos to ${platforms.join(", ")}`);
 
-      // Pre-fetch song audio as data URL for TikTok video slideshow
-      let audioDataUrl = null;
-      if (platforms.includes("tiktok") && selectedSong?.previewUrl) {
+      // For TikTok: create the H.264 MP4 HERE in popup context (has Web APIs + chrome APIs),
+      // then download it. The injector will guide the user to manually select it —
+      // which is confirmed to work 100% reliably.
+      let tiktokVideoPath = null;
+      if (platforms.includes("tiktok")) {
         try {
-          setStatus("Fetching song preview for TikTok video…");
-          const ar = await fetch(selectedSong.previewUrl);
-          const ab = await ar.blob();
-          audioDataUrl = await new Promise(res => {
-            const fr = new FileReader();
-            fr.onload = e => res(e.target.result);
-            fr.readAsDataURL(ab);
+          setStatus("Creating TikTok video (H.264 MP4)…");
+          AppLog.info("Creating TikTok MP4", { photos: photoDataUrls.length });
+          const mp4Blob = await createTikTokMP4(photoDataUrls, (done, total) => {
+            setStatus(`Creating TikTok video… photo ${done}/${total}`);
           });
-          AppLog.info("Audio preview fetched for TikTok", { song: selectedSong.name });
+          const sizeMB = (mp4Blob.size / 1024 / 1024).toFixed(1);
+          AppLog.info(`TikTok MP4 created: ${sizeMB}MB`);
+          // Convert to data URL for chrome.downloads
+          setStatus(`Saving TikTok video (${sizeMB}MB)…`);
+          const mp4DataUrl = await new Promise(res => {
+            const fr = new FileReader(); fr.onload = e => res(e.target.result); fr.readAsDataURL(mp4Blob);
+          });
+          const slug = new Date().toISOString().slice(0,10);
+          tiktokVideoPath = `FoodFluencer/tiktok-post-${slug}.mp4`;
+          chrome.runtime.sendMessage({ type: "DOWNLOAD", url: mp4DataUrl, filename: tiktokVideoPath });
+          AppLog.info("TikTok MP4 downloaded", { path: tiktokVideoPath });
         } catch (e) {
-          AppLog.warn("Could not fetch audio preview", String(e));
+          AppLog.error("TikTok MP4 creation failed", String(e));
+          setStatus("⚠️ TikTok video creation failed: " + e.message, "error");
         }
       }
 
@@ -641,9 +651,9 @@ async function exportAndPost() {
         setStatus(`Opening ${platform}…`);
         chrome.runtime.sendMessage({
           type: "OPEN_SOCIAL", platform, photoDataUrls, caption, songName,
-          location:       currentRestaurant.address || "",
-          restaurantName: currentRestaurant.name    || "",
-          audioDataUrl:   platform === "tiktok" ? (audioDataUrl || null) : null,
+          location:         currentRestaurant.address || "",
+          restaurantName:   currentRestaurant.name    || "",
+          tiktokVideoPath:  platform === "tiktok" ? (tiktokVideoPath || null) : null,
         });
         await new Promise(r => setTimeout(r, 900));
       }
@@ -662,6 +672,168 @@ async function exportAndPost() {
   }
 
   $("exportBtn").disabled = false;
+}
+
+// ── TikTok MP4 builder (runs in popup context — has full Web API + chrome APIs) ─
+// Creates a proper H.264 MP4 using the WebCodecs VideoEncoder API.
+// Falls back to MediaRecorder WebM if WebCodecs unavailable.
+
+async function createTikTokMP4(photoDataUrls, onProgress) {
+  const W = 720, H = 1280; // 9:16 portrait — TikTok's native format
+  const FPS = 25;
+  const BITRATE = 2_500_000;
+  const SEC_PER_SLIDE = 1.2;
+
+  // Load images
+  const images = [];
+  for (const src of photoDataUrls) {
+    const img = new Image();
+    await new Promise((res, rej) => { img.onload = res; img.onerror = rej; img.src = src; });
+    images.push(img);
+  }
+
+  const canvas = document.createElement('canvas');
+  canvas.width = W; canvas.height = H;
+  const ctx = canvas.getContext('2d');
+
+  function drawSlide(img) {
+    ctx.fillStyle = '#000';
+    ctx.fillRect(0, 0, W, H);
+    const s = Math.min(W / img.naturalWidth, H / img.naturalHeight);
+    ctx.drawImage(img, (W - img.naturalWidth * s) / 2, (H - img.naturalHeight * s) / 2, img.naturalWidth * s, img.naturalHeight * s);
+  }
+
+  // ── WebCodecs path ──────────────────────────────────────────────────────
+  if (window.VideoEncoder) {
+    const TIMESCALE = 90000;
+    const SAMPLE_DUR = Math.round(TIMESCALE / FPS); // 3600 at 25fps
+    const framesPerSlide = Math.ceil(SEC_PER_SLIDE * FPS);
+    const totalFrames = images.length * framesPerSlide;
+
+    const chunks = []; let decoderConfig = null;
+    const encoder = new VideoEncoder({
+      output: (chunk, meta) => {
+        if (meta?.decoderConfig) decoderConfig = meta.decoderConfig;
+        const buf = new ArrayBuffer(chunk.byteLength);
+        chunk.copyTo(buf);
+        chunks.push({ data: new Uint8Array(buf), isKey: chunk.type === 'key' });
+      },
+      error: e => { throw new Error(`VideoEncoder: ${e.message}`); },
+    });
+
+    encoder.configure({
+      codec:     'avc1.4d0028', // H.264 Main profile Level 4.0
+      width: W, height: H,
+      bitrate:   BITRATE,
+      framerate: FPS,
+      avc: { format: 'avcC' },
+    });
+
+    let fi = 0;
+    for (let i = 0; i < images.length; i++) {
+      drawSlide(images[i]);
+      for (let f = 0; f < framesPerSlide; f++) {
+        const ts = Math.round(fi * 1_000_000 / FPS);
+        const frame = new VideoFrame(canvas, { timestamp: ts, duration: Math.round(1_000_000 / FPS) });
+        encoder.encode(frame, { keyFrame: fi === 0 || f === 0 });
+        frame.close(); fi++;
+      }
+      if (onProgress) onProgress(i + 1, images.length);
+      // Yield to keep popup responsive
+      await new Promise(r => setTimeout(r, 0));
+    }
+
+    await encoder.flush();
+    encoder.close();
+
+    return buildMP4Blob(chunks, decoderConfig, W, H, FPS, TIMESCALE, SAMPLE_DUR, totalFrames);
+  }
+
+  // ── MediaRecorder fallback (WebM) ───────────────────────────────────────
+  const mimeType = ['video/webm;codecs=vp9', 'video/webm;codecs=vp8', 'video/webm']
+    .find(t => MediaRecorder.isTypeSupported(t)) || 'video/webm';
+  const stream = canvas.captureStream(FPS);
+  const rec = new MediaRecorder(stream, { mimeType, videoBitsPerSecond: BITRATE });
+  const ch = [];
+  rec.ondataavailable = e => { if (e.data.size > 0) ch.push(e.data); };
+  rec.start(100);
+
+  for (let i = 0; i < images.length; i++) {
+    drawSlide(images[i]);
+    if (onProgress) onProgress(i + 1, images.length);
+    await new Promise(r => setTimeout(r, SEC_PER_SLIDE * 1000));
+  }
+  rec.stop();
+  return new Promise(res => { rec.onstop = () => res(new Blob(ch, { type: mimeType })); });
+}
+
+function buildMP4Blob(chunks, dcfg, W, H, fps, ts, sampleDur, totalFrames) {
+  const u8  = v => [v & 0xFF];
+  const u16 = v => [(v >> 8) & 0xFF, v & 0xFF];
+  const u32 = v => [(v >>> 24) & 0xFF, (v >>> 16) & 0xFF, (v >>> 8) & 0xFF, v & 0xFF];
+  const s4  = s => [...new TextEncoder().encode(s).slice(0, 4)];
+  const z   = n => Array(n).fill(0);
+  function box(t, ...c) { const d = c.flat(Infinity); return [...u32(8 + d.length), ...s4(t.padEnd(4,' ')), ...d]; }
+  function fb(t, v, f, ...c) { return box(t, u8(v), [(f>>16)&0xFF,(f>>8)&0xFF,f&0xFF], ...c); }
+
+  // SPS/PPS from encoder's decoderConfig
+  let sps = new Uint8Array([0x67,0x4d,0x00,0x28,0xda,0x01,0xe0,0x08,0x9f,0x96,0x60,0x00,0x00,0x03,0x00,0x40,0x00,0x00,0x0c,0x83,0xc5,0x0a,0x44,0x80]);
+  let pps = new Uint8Array([0x68,0xee,0x31,0xb2,0x8b]);
+  if (dcfg?.description) {
+    const d = new Uint8Array(dcfg.description); let i = 5;
+    const ns = d[i++] & 0x1F;
+    for (let j=0;j<ns;j++) { const l=(d[i]<<8)|d[i+1];i+=2; sps=d.slice(i,i+l);i+=l; }
+    const np = d[i++];
+    for (let j=0;j<np;j++) { const l=(d[i]<<8)|d[i+1];i+=2; pps=d.slice(i,i+l);i+=l; }
+  }
+
+  const avcC = box('avcC', u8(1),[sps[1],sps[2],sps[3]],[0xFF],[0xE1],u16(sps.length),[...sps],u8(1),u16(pps.length),[...pps]);
+  const avc1 = box('avc1', z(6),u16(1),z(16),u16(W),u16(H),[0,72,0,0,0,72,0,0],u32(0),u16(1),z(32),u16(0x18),u16(0xFFFF),avcC);
+
+  const dur  = totalFrames * sampleDur;
+  const mat  = [0x00,0x01,0x00,0x00,0,0,0,0,0,0,0,0, 0,0,0,0,0x00,0x01,0x00,0x00,0,0,0,0,0,0,0,0, 0,0,0,0,0x40,0x00,0x00,0x00];
+
+  const stsd = fb('stsd',0,0, u32(1), avc1);
+  const stts = fb('stts',0,0, u32(1),u32(chunks.length),u32(sampleDur));
+  const keys = chunks.map((c,i)=>c.isKey?i+1:null).filter(Boolean);
+  const stss = fb('stss',0,0, u32(keys.length),...keys.flatMap(i=>u32(i)));
+  const stsz = fb('stsz',0,0, u32(0),u32(chunks.length),...chunks.flatMap(c=>u32(c.data.length)));
+  const stsc = fb('stsc',0,0, u32(1),u32(1),u32(1),u32(1));
+  const stco_ph = fb('stco',0,0, u32(chunks.length),...chunks.flatMap(()=>u32(0)));
+  const stbl_ph = box('stbl',stsd,stts,stss,stsc,stsz,stco_ph);
+  const vmhd = fb('vmhd',0,1, u16(0),z(6));
+  const dinf = box('dinf',fb('dref',0,0,u32(1),fb('url ',0,1)));
+  const minf_ph = box('minf',vmhd,dinf,stbl_ph);
+  const mdhd = fb('mdhd',0,0, u32(0),u32(0),u32(ts),u32(dur),u16(0x55C4),u16(0));
+  const hdlr = fb('hdlr',0,0, u32(0),s4('vide'),z(12),[...s4('Vide'),0]);
+  const mdia_ph = box('mdia',mdhd,hdlr,minf_ph);
+  const tkhd = fb('tkhd',0,3, u32(0),u32(0),u32(1),u32(0),u32(dur),z(8),u16(0),u16(0),u16(0),u16(0),mat,u32(W<<16),u32(H<<16));
+  const trak_ph = box('trak',tkhd,mdia_ph);
+  const mvhd = fb('mvhd',0,0, u32(0),u32(0),u32(ts),u32(dur),u32(0x10000),u16(0x100),z(10),mat,z(24),u32(2));
+  const moov_ph = box('moov',mvhd,trak_ph);
+  const ftyp = box('ftyp',s4('isom'),u32(0x200),s4('isom'),s4('iso2'),s4('avc1'),s4('mp41'));
+
+  // Compute real chunk offsets (moov first → fast-start)
+  const mdatStart = ftyp.length + moov_ph.length + 8;
+  let off = mdatStart;
+  const realOff = chunks.map(c => { const o=off; off+=c.data.length; return o; });
+
+  const stco_r  = fb('stco',0,0, u32(chunks.length),...realOff.flatMap(o=>u32(o)));
+  const stbl_r  = box('stbl',stsd,stts,stss,stsc,stsz,stco_r);
+  const minf_r  = box('minf',vmhd,dinf,stbl_r);
+  const mdia_r  = box('mdia',mdhd,hdlr,minf_r);
+  const trak_r  = box('trak',tkhd,mdia_r);
+  const moov_r  = box('moov',mvhd,trak_r);
+
+  const mdatSize = chunks.reduce((a,c)=>a+c.data.length,0);
+  const mdatHdr  = new Uint8Array([...u32(mdatSize+8),...s4('mdat')]);
+  const total    = ftyp.length + moov_r.length + mdatHdr.length + mdatSize;
+  const out      = new Uint8Array(total);
+  let p = 0;
+  for (const part of [new Uint8Array(ftyp), new Uint8Array(moov_r), mdatHdr, ...chunks.map(c=>c.data)]) {
+    out.set(part, p); p += part.length;
+  }
+  return new Blob([out], { type: 'video/mp4' });
 }
 
 // Boot
