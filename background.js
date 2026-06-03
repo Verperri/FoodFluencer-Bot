@@ -1,3 +1,17 @@
+﻿// ── Background logger ─────────────────────────────────────────────────────────
+
+function bgLog(level, message, data) {
+  const entry = {
+    ts: new Date().toISOString(), source: 'background', level, message,
+    data: data !== undefined ? (typeof data === 'string' ? data : JSON.stringify(data)) : null,
+  };
+  chrome.storage.local.get({ appLog: [] }, ({ appLog }) => {
+    appLog.push(entry);
+    if (appLog.length > 800) appLog = appLog.slice(-600);
+    chrome.storage.local.set({ appLog });
+  });
+}
+
 // ── Message router ────────────────────────────────────────────────────────────
 
 chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
@@ -17,7 +31,7 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
 // ── Social post handler ───────────────────────────────────────────────────────
 
 const PLATFORM_URLS = {
-  instagram: "https://www.instagram.com/create/select/",
+  instagram: "https://www.instagram.com/",
   facebook:  "https://www.facebook.com/",
   tiktok:    "https://www.tiktok.com/upload",
 };
@@ -28,7 +42,8 @@ const INJECTORS = {
   tiktok:    injectTikTok,
 };
 
-async function handleSocialPost({ platform, photoDataUrls, caption, songName }) {
+async function handleSocialPost({ platform, photoDataUrls, caption, songName, location, restaurantName, tiktokAudioDataUrl }) {
+  bgLog('info', `Opening ${platform}`, { photos: photoDataUrls.length, song: songName, location, tiktokAudioKB: tiktokAudioDataUrl ? Math.round(tiktokAudioDataUrl.length * 0.75 / 1024) : 0 });
   const tab = await chrome.tabs.create({ url: PLATFORM_URLS[platform], active: true });
 
   await new Promise(resolve => {
@@ -47,10 +62,12 @@ async function handleSocialPost({ platform, photoDataUrls, caption, songName }) 
     await chrome.scripting.executeScript({
       target: { tabId: tab.id },
       func:   INJECTORS[platform],
-      args:   [photoDataUrls, caption, songName || ""],
+      args:   [photoDataUrls, caption, songName || "", location || "", { restaurantName: restaurantName || "", tiktokAudioDataUrl: tiktokAudioDataUrl || null }],
       world:  "MAIN",
     });
+    bgLog('info', `Injected script on ${platform}`);
   } catch (err) {
+    bgLog('error', `Inject failed on ${platform}`, String(err));
     console.error(`[FoodFluencer] Inject failed on ${platform}:`, err);
   }
 }
@@ -61,7 +78,7 @@ async function handleSocialPost({ platform, photoDataUrls, caption, songName }) 
 
 // ─── Facebook ─────────────────────────────────────────────────────────────────
 
-function injectFacebook(photoDataUrls, caption, songName) {
+function injectFacebook(photoDataUrls, caption, songName, location, opts) {
   /* ── helpers ── */
   const sleep = ms => new Promise(r => setTimeout(r, ms));
 
@@ -230,140 +247,34 @@ function injectFacebook(photoDataUrls, caption, songName) {
 
 // ─── Instagram ────────────────────────────────────────────────────────────────
 
-function injectInstagram(photoDataUrls, caption, songName) {
+function injectInstagram(photoDataUrls, caption, songName, location, opts) {
+  const { restaurantName = '' } = opts || {};
   const sleep = ms => new Promise(r => setTimeout(r, ms));
 
-  const waitFor = (sel, ms = 8000) => new Promise(res => {
-    if (document.querySelector(sel)) return res(document.querySelector(sel));
+  const waitFor = (sel, ms = 12000) => new Promise(res => {
+    const el = document.querySelector(sel); if (el) return res(el);
     const t = Date.now(); const iv = setInterval(() => {
-      const el = document.querySelector(sel);
-      if (el) { clearInterval(iv); return res(el); }
+      const e = document.querySelector(sel);
+      if (e) { clearInterval(iv); return res(e); }
       if (Date.now() - t > ms) { clearInterval(iv); return res(null); }
-    }, 250);
+    }, 300);
   });
 
-  function dataUrlToFile(url, name) {
-    const [hdr, b64] = url.split(',');
-    const mime = hdr.match(/:(.*?);/)[1];
-    const bin = atob(b64); const arr = new Uint8Array(bin.length);
-    for (let i = 0; i < bin.length; i++) arr[i] = bin.charCodeAt(i);
-    return new File([arr], name, { type: mime });
-  }
-
-  function setFilesOnInput(input, files) {
-    const dt = new DataTransfer();
-    files.forEach(f => dt.items.add(f));
-    const setter = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'files')?.set;
-    if (setter) setter.call(input, dt.files); else input.files = dt.files;
-    input.dispatchEvent(new Event('change', { bubbles: true }));
-    input.dispatchEvent(new Event('input',  { bubbles: true }));
-  }
-
-  function step(n, total, html, type = 'info') {
-    const existing = document.getElementById('ffbot-banner');
-    if (existing) existing.remove();
-    const b = document.createElement('div'); b.id = 'ffbot-banner';
-    const bg = { info: '#e8490f', success: '#16a34a', warn: '#d97706' }[type] || '#e8490f';
-    b.style.cssText = `position:fixed;top:0;left:0;right:0;z-index:2147483647;
-      background:${bg};color:#fff;font-family:-apple-system,sans-serif;font-size:13px;
-      font-weight:500;padding:10px 16px;display:flex;align-items:center;gap:10px;
-      box-shadow:0 3px 14px rgba(0,0,0,.28);`;
-    b.innerHTML = `
-      <strong style="white-space:nowrap">🍽️ FoodFluencer</strong>
-      <span style="background:rgba(255,255,255,.22);border-radius:20px;padding:1px 8px;font-size:.75rem;white-space:nowrap">${n}/${total}</span>
-      <span style="font-weight:400;flex:1">${html}</span>
-      <button onclick="document.getElementById('ffbot-banner').remove()"
-        style="background:rgba(255,255,255,.22);border:none;color:#fff;border-radius:5px;
-        padding:3px 9px;cursor:pointer;white-space:nowrap;flex-shrink:0">✕ Close</button>`;
-    document.body.prepend(b);
-  }
-
-  function clickNext() {
-    const btn = [...document.querySelectorAll('[role="button"]')]
-      .find(el => el.textContent.trim() === 'Next');
-    if (btn) { btn.click(); return true; } return false;
-  }
-
-  (async () => {
-    const total = songName ? 6 : 5;
-
-    // ①  Wait for create page
-    step(1, total, 'Loading create page…');
-    await sleep(1800);
-
-    // ②  Select photos via file input
-    step(2, total, `Selecting <strong>${photoDataUrls.length} photo${photoDataUrls.length > 1 ? 's' : ''}</strong>…`);
-    let fileInput = document.querySelector('input[type="file"]');
-    if (!fileInput) {
-      const selBtn = [...document.querySelectorAll('[role="button"]')]
-        .find(el => /select.*computer|from computer/i.test(el.textContent));
-      if (selBtn) { selBtn.click(); await sleep(600); }
-      fileInput = document.querySelector('input[type="file"]');
-    }
-    if (!fileInput) {
-      step(2, total, 'Select your photos from <strong>Downloads/FoodFluencer</strong> in the dialog.', 'warn');
-      return;
-    }
-    const files = photoDataUrls.map((url, i) => dataUrlToFile(url, `restaurant-${i + 1}.jpg`));
-    setFilesOnInput(fileInput, files);
-    await sleep(2500);
-
-    // ③  Next through Crop
-    step(3, total, 'Advancing through crop step…');
-    clickNext(); await sleep(1600);
-
-    // ④  Next through Filters
-    step(4, total, 'Advancing through filters step…');
-    clickNext(); await sleep(1600);
-
-    // ⑤  Fill caption on Details screen
-    step(5, total, 'Filling caption…');
-    const captionArea = await waitFor(
-      'textarea[aria-label="Write a caption..."], textarea[placeholder*="caption" i], textarea[placeholder*="Caption" i]',
-      5000
-    );
-    if (captionArea) {
-      captionArea.focus(); await sleep(200);
-      const setter = Object.getOwnPropertyDescriptor(HTMLTextAreaElement.prototype, 'value')?.set;
-      if (setter) setter.call(captionArea, caption); else captionArea.value = caption;
-      captionArea.dispatchEvent(new Event('input', { bubbles: true }));
-    }
-
-    // ⑥  Try to add music
-    if (songName) {
-      await sleep(600);
-      const musicBtn = [...document.querySelectorAll('[role="button"]')]
-        .find(el => /add music|music/i.test(el.getAttribute('aria-label') || el.textContent));
-      if (musicBtn) {
-        musicBtn.click(); await sleep(1000);
-        const searchInput = document.querySelector('input[placeholder*="Search" i], input[type="search"]');
-        if (searchInput) {
-          searchInput.focus(); searchInput.value = songName;
-          searchInput.dispatchEvent(new Event('input', { bubbles: true }));
-          await sleep(1500);
-          const firstTrack = document.querySelector('[class*="MusicItem"], [class*="music_item"], [class*="track"]');
-          if (firstTrack) firstTrack.click();
-        }
-        step(6, total, `🎵 <em>"${songName}"</em> searched — select it, then click <strong>Share</strong>.`, 'success');
-      } else {
-        step(6, total, `Caption filled — search for <em>"${songName}"</em> in Add Music, then click <strong>Share</strong>.`, 'success');
-      }
-    } else {
-      step(5, total, `✅ ${files.length} photo${files.length > 1 ? 's' : ''} &amp; caption ready — click <strong>Share</strong> to publish.`, 'success');
-    }
-  })();
-}
-
-// ─── TikTok ───────────────────────────────────────────────────────────────────
-
-function injectTikTok(photoDataUrls, caption, songName) {
-  const sleep = ms => new Promise(r => setTimeout(r, ms));
-
-  const waitFor = (sel, ms = 10000) => new Promise(res => {
-    if (document.querySelector(sel)) return res(document.querySelector(sel));
+  // Wait for an interactive element whose innerText / aria-label matches
+  const waitForBtn = (match, ms = 12000) => new Promise(res => {
+    const find = () => [...document.querySelectorAll(
+      '[role="button"], button, a, [tabindex="0"]'
+    )].find(el => {
+      const txt = (el.innerText || el.textContent || '').trim();
+      const lbl = el.getAttribute('aria-label') || '';
+      return typeof match === 'string'
+        ? txt === match || lbl === match
+        : match.test(txt) || match.test(lbl);
+    });
+    const el = find(); if (el) return res(el);
     const t = Date.now(); const iv = setInterval(() => {
-      const el = document.querySelector(sel);
-      if (el) { clearInterval(iv); return res(el); }
+      const e = find();
+      if (e) { clearInterval(iv); return res(e); }
       if (Date.now() - t > ms) { clearInterval(iv); return res(null); }
     }, 300);
   });
@@ -376,93 +287,960 @@ function injectTikTok(photoDataUrls, caption, songName) {
     return new File([arr], name, { type: mime });
   }
 
-  function setFilesOnInput(input, files) {
+  function dropFilesOn(zone, files) {
     const dt = new DataTransfer();
     files.forEach(f => dt.items.add(f));
-    const setter = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'files')?.set;
-    if (setter) setter.call(input, dt.files); else input.files = dt.files;
-    input.dispatchEvent(new Event('change', { bubbles: true }));
-    input.dispatchEvent(new Event('input',  { bubbles: true }));
+    ['dragenter', 'dragover'].forEach(ev =>
+      zone.dispatchEvent(new DragEvent(ev, { bubbles: true, cancelable: true, dataTransfer: dt })));
+    zone.dispatchEvent(new DragEvent('drop', { bubbles: true, cancelable: true, dataTransfer: dt }));
+  }
+
+  // ── Banner with inline debug log ─────────────────────────────────────────────
+  // The banner always stays visible; a small log area below the main message
+  // shows the last few actions so you can see exactly what the bot did.
+
+  function ensureBanner(n, total, html, type = 'info') {
+    let b = document.getElementById('ffbot-banner');
+    if (!b) {
+      b = document.createElement('div'); b.id = 'ffbot-banner';
+      const bg = { info: '#e8490f', success: '#16a34a', warn: '#d97706' }[type] || '#e8490f';
+      b.style.cssText = `position:fixed;top:0;left:0;right:0;z-index:2147483647;
+        background:${bg};color:#fff;font-family:-apple-system,sans-serif;
+        font-size:13px;font-weight:500;padding:10px 16px;
+        box-shadow:0 3px 14px rgba(0,0,0,.28);`;
+      b.innerHTML = `
+        <div style="display:flex;align-items:center;gap:8px;margin-bottom:4px">
+          <strong>🍽️ FoodFluencer</strong>
+          <span id="ffbot-step" style="background:rgba(255,255,255,.22);border-radius:20px;
+            padding:1px 8px;font-size:.72rem"></span>
+          <span id="ffbot-msg" style="font-weight:400;flex:1"></span>
+          <button onclick="document.getElementById('ffbot-banner').remove()"
+            style="background:rgba(255,255,255,.22);border:none;color:#fff;
+            border-radius:5px;padding:3px 9px;cursor:pointer;flex-shrink:0">✕</button>
+        </div>
+        <div id="ffbot-log" style="font-size:.7rem;opacity:.8;line-height:1.5;
+          max-height:60px;overflow:hidden"></div>`;
+      document.body.prepend(b);
+    }
+    const bg = { info: '#e8490f', success: '#16a34a', warn: '#d97706' }[type] || '#e8490f';
+    b.style.background = bg;
+    document.getElementById('ffbot-step').textContent = `${n}/${total}`;
+    document.getElementById('ffbot-msg').innerHTML = html;
+  }
+
+  function dbg(msg) {
+    ensureBanner.__last_n = ensureBanner.__last_n || 1;
+    ensureBanner.__last_total = ensureBanner.__last_total || 5;
+    const logEl = document.getElementById('ffbot-log');
+    if (!logEl) return;
+    const ts = new Date().toTimeString().slice(0, 8);
+    const row = document.createElement('div');
+    row.innerHTML = `<span style="opacity:.6">${ts}</span> ${msg}`;
+    logEl.prepend(row);
+    // Keep last 4 entries
+    while (logEl.children.length > 4) logEl.lastChild.remove();
+    console.log(`[FoodFluencer] ${msg}`); // also log to DevTools console
   }
 
   function step(n, total, html, type = 'info') {
-    const existing = document.getElementById('ffbot-banner');
-    if (existing) existing.remove();
+    ensureBanner.__last_n = n;
+    ensureBanner.__last_total = total;
+    ensureBanner(n, total, html, type);
+    dbg(`Step ${n}/${total}: ${html.replace(/<[^>]+>/g, '')}`);
+  }
+
+  (async () => {
+    // Steps: create+post(1) upload(2) crop-Next(3) edit-Next(4) caption(5) location(6) collab(7) [+1 if song]
+    const total = songName ? 8 : 7;
+    step(1, total, 'Loading Instagram…');
+    await sleep(1500); // wait for SPA hydration
+
+    // ══ STEP 1a: Find and click the Create "+" button ══════════════════════════
+    step(1, total, 'Looking for Create (+) button…');
+
+    function findCreateBtn() {
+      // Check explicit aria-labels first
+      for (const sel of ['[aria-label="New post"]', '[aria-label="Create"]']) {
+        const el = document.querySelector(sel);
+        if (el) { dbg(`Found create btn via aria-label: ${sel}`); return el.closest('a,[role="button"],button') || el; }
+      }
+      // SVG with aria-label
+      const svg = [...document.querySelectorAll('svg[aria-label]')]
+        .find(s => /new post|create/i.test(s.getAttribute('aria-label')));
+      if (svg) { dbg(`Found create btn via SVG: ${svg.getAttribute('aria-label')}`); return svg.closest('a,[role="button"],button') || svg; }
+      // Nav anchor/button with text "Create"
+      const byText = [...document.querySelectorAll('a,[role="button"],button')]
+        .find(el => /^create$/i.test((el.innerText || '').trim()));
+      if (byText) { dbg('Found create btn by text "Create"'); return byText; }
+      dbg('Create button not found yet…');
+      return null;
+    }
+
+    let createBtn = null;
+    for (let i = 0; i < 8 && !createBtn; i++) {
+      createBtn = findCreateBtn();
+      if (!createBtn) await sleep(600);
+    }
+
+    if (!createBtn) {
+      step(1, total, 'Could not find the <strong>+</strong> Create button. Please click it manually.', 'warn');
+      dbg('FAILED: create button not found after 8s');
+    } else {
+      dbg(`Clicking create button: ${createBtn.tagName} aria="${createBtn.getAttribute('aria-label')}"`);
+      createBtn.click();
+    }
+
+    // ══ STEP 1b: Snapshot pre-existing "Post" elements, then find the NEW one ═══
+    // Snapshot BEFORE the panel animates in
+    const prePostEls = new Set(
+      [...document.querySelectorAll('*')]
+        .filter(el => (el.innerText || el.textContent || '').trim() === 'Post')
+    );
+    dbg(`Snapshot: ${prePostEls.size} existing elements with text "Post"`);
+
+    step(1, total, 'Waiting for Post/Story/Reel menu to appear…');
+    await sleep(700);
+
+    async function findAndClickPostOption() {
+      // Find elements with text "Post" that did NOT exist before we clicked Create
+      const newPostEls = [...document.querySelectorAll('*')]
+        .filter(el => (el.innerText || el.textContent || '').trim() === 'Post' && !prePostEls.has(el));
+
+      dbg(`Found ${newPostEls.length} new "Post" element(s) after clicking Create`);
+
+      if (newPostEls.length > 0) {
+        // Pick the first one and find its clickable ancestor
+        const target = newPostEls[0].closest('a,[role="button"],button,[tabindex]') || newPostEls[0];
+        dbg(`Clicking: ${target.tagName} class="${target.className.toString().slice(0,40)}"`);
+        target.click();
+        return true;
+      }
+      return false;
+    }
+
+    let postClicked = false;
+    for (let i = 0; i < 10 && !postClicked; i++) {
+      postClicked = await findAndClickPostOption();
+      if (!postClicked) { dbg(`Retry ${i + 1}/10 — post option not visible yet`); await sleep(350); }
+    }
+
+    if (!postClicked) {
+      step(1, total, 'Please click <strong>Post</strong> from the menu — bot will continue when the upload dialog appears.', 'warn');
+      dbg('FAILED: Post option not found — waiting for dialog manually');
+    } else {
+      step(1, total, '"Post" clicked — waiting for upload dialog…');
+    }
+
+    // Wait for the upload dialog to appear (has a file input or drag-drop area)
+    await waitFor('[role="dialog"]', 10000);
+    await sleep(500);
+    dbg('Upload dialog appeared');
+
+    // ══ STEP 2: Inject photos ═════════════════════════════════════════════════
+    const files = photoDataUrls.map((url, i) => dataUrlToFile(url, `restaurant-${i + 1}.jpg`));
+    step(2, total, `Uploading ${files.length} photo${files.length > 1 ? 's' : ''}…`);
+
+    let fileInput = null;
+    for (let attempt = 0; attempt < 10 && !fileInput; attempt++) {
+      fileInput = document.querySelector('input[type="file"]');
+      if (fileInput) { dbg(`File input found on attempt ${attempt + 1}`); break; }
+      const selBtn = [...document.querySelectorAll('[role="button"], button')]
+        .find(el => /select.*computer|from.*computer/i.test(el.innerText || el.textContent || ''));
+      if (selBtn) { selBtn.click(); dbg('Clicked "Select from computer"'); }
+      await sleep(500);
+    }
+
+    if (fileInput) {
+      const dt = new DataTransfer();
+      files.forEach(f => dt.items.add(f));
+      const setter = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'files')?.set;
+      if (setter) setter.call(fileInput, dt.files); else fileInput.files = dt.files;
+      fileInput.dispatchEvent(new Event('change', { bubbles: true }));
+      fileInput.dispatchEvent(new Event('input',  { bubbles: true }));
+      dbg('Files injected into input');
+    } else {
+      dbg('File input not found — trying drag-and-drop fallback');
+      const zone = document.querySelector('[role="dialog"] *') || document.querySelector('[role="dialog"]');
+      if (zone) dropFilesOn(zone, files);
+    }
+
+    // Wait for the crop/arrange screen — editor ready when "Next" appears in the dialog
+    step(2, total, 'Waiting for Instagram to process photos…');
+
+    // ── Visibility check using getBoundingClientRect (works through animations) ─
+    function isVisible(el) {
+      if (!el || !document.contains(el)) return false;
+      const s = window.getComputedStyle(el);
+      if (s.display === 'none' || s.visibility === 'hidden') return false;
+      const r = el.getBoundingClientRect();
+      // Accept if element has size and is somewhere in the viewport
+      return r.width > 0 && r.height > 0;
+    }
+
+    const NEXT_RE = /^(next|volgende|suivant|weiter|siguiente|næste|neste|seuraava)$/i;
+
+    // Find the STEP "Next" button (header, top-right) — NOT the carousel arrow.
+    // The header Next has visible TEXT "Next"; the carousel arrow is icon-only (empty text).
+    // Priority: text match first, then aria-label match sorted by position in dialog.
+    function findVisibleNextBtn() {
+      const dialog = document.querySelector('[role="dialog"]');
+      const roots  = [dialog, document.body].filter(Boolean);
+
+      // ① Prefer elements whose visible text IS "Next" (header step button)
+      for (const root of roots) {
+        const btn = [...root.querySelectorAll('[role="button"],button,[tabindex="0"],a')]
+          .find(el => {
+            const txt = (el.innerText || el.textContent || '').trim();
+            return NEXT_RE.test(txt) && isVisible(el);
+          });
+        if (btn) {
+          dbg(`Next by text: "${(btn.innerText||btn.textContent||'').trim()}" top=${Math.round(btn.getBoundingClientRect().top)}`);
+          return btn;
+        }
+      }
+
+      // ② Fall back to aria-label — but pick the TOPMOST one inside the dialog
+      //    (header Next is at the top; carousel arrows are mid-screen)
+      if (dialog) {
+        const dlgTop = dialog.getBoundingClientRect().top;
+        const ariaNexts = [...dialog.querySelectorAll('[role="button"],button,[tabindex="0"],a')]
+          .filter(el => NEXT_RE.test(el.getAttribute('aria-label') || '') && isVisible(el))
+          .sort((a, b) => a.getBoundingClientRect().top - b.getBoundingClientRect().top);
+
+        if (ariaNexts.length > 0) {
+          const picked = ariaNexts[0];
+          dbg(`Next by aria-label (topmost, rel-top=${Math.round(picked.getBoundingClientRect().top - dlgTop)}px): aria="${picked.getAttribute('aria-label')}"`);
+          return picked;
+        }
+      }
+
+      return null;
+    }
+
+    // Fire mouse + keyboard events — keyboard (Enter) bypasses pointer-events:none
+    // and React's synthetic event delegation handles both equally well.
+    function reactClick(el) {
+      el.focus();
+      // Mouse sequence
+      ['mouseenter', 'mouseover', 'mousedown', 'mouseup', 'click'].forEach(type =>
+        el.dispatchEvent(new MouseEvent(type, {
+          bubbles: true, cancelable: true, view: window,
+          buttons: 1, detail: type === 'click' ? 1 : 0,
+        }))
+      );
+      // Also native click (sometimes React needs this too)
+      el.click();
+      // Keyboard Enter — works even if pointer-events:none is set on the element
+      ['keydown', 'keypress', 'keyup'].forEach(type =>
+        el.dispatchEvent(new KeyboardEvent(type, {
+          key: 'Enter', code: 'Enter', keyCode: 13,
+          bubbles: true, cancelable: true, view: window,
+        }))
+      );
+    }
+
+    // Check if we're on the caption/details screen (final step before Share).
+    // IMPORTANT: must be specific and require visibility — the filter screen also
+    // has contenteditable/textbox elements that cause false positives.
+    function onCaptionScreen() {
+      const specific = [
+        'textarea[aria-label="Write a caption..."]',
+        'div[aria-label="Write a caption..."]',
+        'textarea[placeholder*="Write a caption" i]',
+      ];
+      return specific.some(sel => {
+        const el = document.querySelector(sel);
+        return el && isVisible(el);
+      });
+    }
+
+    // Wait until a specific button is no longer visible OR removed from DOM.
+    // Instagram often hides (CSS) rather than removes buttons during transitions.
+    async function waitForBtnToDisappear(btn, ms = 6000) {
+      const start = Date.now();
+      while (Date.now() - start < ms) {
+        await sleep(150);
+        if (!document.contains(btn) || !isVisible(btn)) {
+          dbg('Previous Next hidden/removed — transition confirmed');
+          return true;
+        }
+      }
+      dbg('waitForBtnToDisappear: timed out (button still visible)');
+      return false;
+    }
+
+    // ══ STEP 2 → 3: Two "Next" clicks to reach the caption/Share screen ════════
+    step(2, total, 'Waiting for editor to load…');
+
+    for (let clickNum = 1; clickNum <= 2; clickNum++) {
+      const label = clickNum === 1 ? 'crop' : 'filter/edit';
+      step(clickNum + 1, total, `Advancing past ${label} step…`);
+
+      // Wait for a VISIBLE Next button — 18s for first (photo processing), 12s for second
+      const timeout = clickNum === 1 ? 18000 : 12000;
+      let preClickBtn = null;
+      const pollStart = Date.now();
+      while (Date.now() - pollStart < timeout && !preClickBtn) {
+        preClickBtn = findVisibleNextBtn();
+        if (!preClickBtn) await sleep(200);
+      }
+
+      if (!preClickBtn) {
+        // Fallback: log ALL elements with "Next" text (visible or not) and try each
+        const allNext = [...document.querySelectorAll('[role="button"],button,[tabindex="0"],a')]
+          .filter(el => NEXT_RE.test((el.innerText || el.textContent || '').trim()) ||
+                        NEXT_RE.test(el.getAttribute('aria-label') || ''));
+        dbg(`No visible Next found. All Next candidates (${allNext.length}):`);
+        allNext.forEach((el, i) => {
+          const r = el.getBoundingClientRect();
+          const s = window.getComputedStyle(el);
+          dbg(`  [${i}] <${el.tagName}> display=${s.display} vis=${s.visibility} op=${s.opacity} size=${Math.round(r.width)}x${Math.round(r.height)} top=${Math.round(r.top)}`);
+        });
+
+        // Try clicking all candidates, starting with any that have non-zero size
+        let triedAny = false;
+        for (const candidate of allNext) {
+          const r = candidate.getBoundingClientRect();
+          if (r.width > 0 || r.height > 0) {
+            dbg(`Trying fallback click on candidate`);
+            reactClick(candidate);
+            candidate.click();
+            triedAny = true;
+            await sleep(1500);
+            // Check if we advanced (caption area should now be visible)
+            if (document.querySelector('textarea[aria-label*="caption" i], div[aria-label*="caption" i]')) {
+              dbg('Caption screen detected — fallback click worked!');
+              break;
+            }
+          }
+        }
+
+        if (!triedAny) {
+          step(clickNum + 1, total,
+            `Please click <strong>Next</strong> at the top-right of the popup (step ${clickNum}/2).`, 'warn');
+          dbg(`All fallbacks failed — waiting 12s for manual click`);
+          await sleep(12000);
+        }
+        continue;
+      }
+
+      const btnTxt  = (preClickBtn.innerText || preClickBtn.textContent || '').trim();
+      const btnRect  = preClickBtn.getBoundingClientRect();
+      const btnPtr   = window.getComputedStyle(preClickBtn).pointerEvents;
+      dbg(`Click ${clickNum}/2 (${label}): <${preClickBtn.tagName}> "${btnTxt}" ${Math.round(btnRect.width)}x${Math.round(btnRect.height)}@top${Math.round(btnRect.top)} pointer-events=${btnPtr}`);
+
+      // Try up to 4 times — exit only when the BUTTON IS GONE (not a caption check,
+      // which gives false positives on the filter screen).
+      let btnGone = false;
+      for (let attempt = 1; attempt <= 4 && !btnGone; attempt++) {
+        await sleep(attempt === 1 ? 200 : 700);
+        reactClick(preClickBtn);
+        dbg(`Attempt ${attempt}/4: fired mouse+keyboard on "${btnTxt}"`);
+
+        // Wait up to 4s for this specific button to disappear/hide
+        const t0 = Date.now();
+        while (Date.now() - t0 < 4000) {
+          await sleep(200);
+          if (!document.contains(preClickBtn) || !isVisible(preClickBtn)) {
+            dbg(`Button gone on attempt ${attempt} — transition confirmed`);
+            btnGone = true;
+            break;
+          }
+        }
+        if (!btnGone) dbg(`Attempt ${attempt} — button still visible after 4s`);
+      }
+
+      if (!btnGone) {
+        dbg(`4 attempts exhausted for ${label} Next — waiting up to 20s for manual click`);
+        step(clickNum + 1, total,
+          `Please click <strong>Next</strong> at the top-right to continue past the ${label} step.`, 'warn');
+        const t1 = Date.now();
+        while (Date.now() - t1 < 20000) {
+          await sleep(500);
+          if (!document.contains(preClickBtn) || !isVisible(preClickBtn)) {
+            dbg('Manual advance detected (button gone)'); break;
+          }
+        }
+      }
+
+      await sleep(1000); // let the next screen fully render
+    }
+
+    // Wait for the caption screen to actually appear before proceeding
+    dbg('Both Next clicks done — waiting for caption screen…');
+    step(4, total, 'Waiting for caption screen…');
+    const captionWait = Date.now();
+    while (Date.now() - captionWait < 10000 && !onCaptionScreen()) {
+      await sleep(300);
+    }
+    if (onCaptionScreen()) { dbg('Caption screen confirmed'); }
+    else { dbg('Caption screen not detected after 10s — proceeding anyway'); }
+
+    // ══ STEP 4: Fill caption ══════════════════════════════════════════════════════
+    step(4, total, 'Filling caption…');
+    const captionSels = [
+      'textarea[aria-label="Write a caption..."]',
+      'div[aria-label="Write a caption..."]',
+      'textarea[placeholder*="caption" i]',
+      '[contenteditable="true"][aria-multiline="true"]',
+      '[contenteditable="true"][aria-required]',
+      '[role="textbox"]',
+    ];
+    let captionEl = null;
+    for (let att = 0; att < 10 && !captionEl; att++) {
+      for (const s of captionSels) { captionEl = document.querySelector(s); if (captionEl) { dbg(`Caption found: ${s}`); break; } }
+      if (!captionEl) await sleep(400);
+    }
+    if (captionEl) {
+      captionEl.scrollIntoView({ behavior: 'smooth', block: 'center' });
+      captionEl.click(); await sleep(400);
+      if (captionEl.tagName === 'TEXTAREA') {
+        const s = Object.getOwnPropertyDescriptor(HTMLTextAreaElement.prototype, 'value')?.set;
+        if (s) s.call(captionEl, caption); else captionEl.value = caption;
+        captionEl.dispatchEvent(new Event('input', { bubbles: true }));
+      } else {
+        captionEl.focus(); await sleep(200);
+        document.execCommand('selectAll', false, null);
+        document.execCommand('insertText', false, caption);
+      }
+      dbg('Caption filled');
+    } else { dbg('WARNING: caption field not found'); }
+
+    // ══ STEP 5 (if location): Add location ════════════════════════════════════
+    if (location) {
+      await sleep(400);
+      step(5, total, 'Adding location…');
+      const cityMatch = location.match(/\d{4}\s+([A-Za-zÀ-ÿ\s-]+),\s*Belgium/i);
+      const searchTerm = (cityMatch?.[1] || location.split(',')[0] || location).trim();
+      dbg(`Location search term: "${searchTerm}"`);
+
+      let locTrigger = document.querySelector('[aria-label="Add location"],[placeholder*="location" i]');
+      if (!locTrigger) {
+        locTrigger = [...document.querySelectorAll('[role="button"],button,a,input')]
+          .find(el => /add.*(a\s+)?location/i.test(
+            el.getAttribute('aria-label') || el.getAttribute('placeholder') || el.innerText || el.textContent || ''));
+      }
+      if (locTrigger) {
+        dbg(`Location trigger found: ${locTrigger.tagName}`);
+        locTrigger.click(); await sleep(400);
+        const locInput = await waitFor('input[placeholder*="Search" i],input[aria-label*="location" i]', 4000);
+        if (locInput) {
+          locInput.focus(); await sleep(200);
+          for (const ch of searchTerm) { document.execCommand('insertText', false, ch); await sleep(55); }
+          dbg(`Typed "${searchTerm}" in location field`);
+          await sleep(2000);
+          const firstResult = document.querySelector('[role="option"]:first-child,[role="listitem"]:first-child');
+          if (firstResult) { firstResult.click(); dbg('Selected first location result'); await sleep(500); }
+          else dbg('No location results appeared');
+        }
+      } else { dbg('Location trigger not found'); }
+    }
+
+    // ══ STEP 7: Search for restaurant as collaborator ════════════════════════
+    const collabStep = total - (songName ? 1 : 0);
+    step(collabStep, total, 'Searching for restaurant collaborator…');
+    await sleep(500);
+
+    if (restaurantName) {
+      const collabTrigger = [...document.querySelectorAll('[role="button"],button,div[tabindex="0"]')]
+        .find(el => /invite.*collab|add.*collab|collab/i.test(
+          el.innerText || el.textContent || el.getAttribute('aria-label') || ''));
+
+      if (collabTrigger) {
+        dbg(`Collab trigger found: "${collabTrigger.innerText?.trim()}"`);
+        collabTrigger.click(); await sleep(1000);
+
+        const searchInput = await waitFor('input[placeholder*="Search" i],input[type="text"]', 3000);
+        if (searchInput) {
+          searchInput.focus(); await sleep(200);
+          const searchTerm = restaurantName.replace(/[^\w\s]/g, ' ').trim().slice(0, 25);
+          for (const ch of searchTerm) { document.execCommand('insertText', false, ch); await sleep(45); }
+          dbg(`Searching collaborator: "${searchTerm}"`);
+          await sleep(2000);
+
+          const results = [...document.querySelectorAll('[role="option"], [class*="user"], [class*="account"]')]
+            .filter(el => isVisible(el));
+          if (results.length > 0) {
+            const firstResult = results[0];
+            const resultText = (firstResult.innerText || firstResult.textContent || '').toLowerCase();
+            const searchLower = searchTerm.toLowerCase().replace(/\s+/g, '');
+            const resultNorm  = resultText.replace(/\s+/g, '');
+            const isMatch = resultNorm.includes(searchLower.slice(0, 5)) ||
+                            searchLower.includes(resultNorm.slice(0, 5));
+
+            if (isMatch) {
+              firstResult.click(); await sleep(500);
+              dbg(`Collaborator added: ${firstResult.innerText?.trim()}`);
+              step(collabStep, total, `✅ Collaborator <strong>${firstResult.innerText?.trim()}</strong> added.`);
+            } else {
+              dbg(`No close match for "${restaurantName}" — top result: "${firstResult.innerText?.trim()}" — skipping`);
+              step(collabStep, total, `No matching collaborator found for <em>"${restaurantName}"</em> — skipping.`);
+              const backBtn = document.querySelector('[aria-label="Back"],[aria-label="Close"]');
+              if (backBtn) { backBtn.click(); await sleep(400); }
+            }
+          } else {
+            dbg('No collaborator search results');
+            step(collabStep, total, `No Instagram account found for <em>"${restaurantName}"</em> — skipping.`);
+            const backBtn = document.querySelector('[aria-label="Back"],[aria-label="Close"]');
+            if (backBtn) { backBtn.click(); await sleep(400); }
+          }
+        }
+      } else {
+        dbg('Collab button not found on page');
+        step(collabStep, total, 'Collaborator section not found — skipping.');
+      }
+    }
+
+    // ══ Final: stop here, user clicks Share ══════════════════════════════════
+    const songHint = songName ? ` &nbsp;🎵 Tap <strong>Add music</strong> → <em>"${songName}"</em>.` : '';
+    step(total, total,
+      `✅ All ready! Review caption, location &amp; collaborator.${songHint} Click <strong>Share</strong> to publish.`,
+      'success');
+    dbg('Bot stopped — waiting for user to click Share');
+  })();
+}
+
+// ─── TikTok ───────────────────────────────────────────────────────────────────
+// Tries 3 upload approaches in sequence until TikTok accepts one.
+
+function injectTikTok(photoDataUrls, caption, songName, location, opts) {
+  const { tiktokAudioDataUrl = null } = opts || {};
+  const sleep = ms => new Promise(r => setTimeout(r, ms));
+  const waitFor = (sel, ms = 12000) => new Promise(res => {
+    const el = document.querySelector(sel); if (el) return res(el);
+    const t = Date.now(); const iv = setInterval(() => {
+      const e = document.querySelector(sel);
+      if (e) { clearInterval(iv); return res(e); }
+      if (Date.now() - t > ms) { clearInterval(iv); return res(null); }
+    }, 300);
+  });
+
+  const TOTAL = 5;
+  function banner(n, html, type = 'info') {
+    document.getElementById('ffbot-banner')?.remove();
     const b = document.createElement('div'); b.id = 'ffbot-banner';
     const bg = { info: '#e8490f', success: '#16a34a', warn: '#d97706' }[type] || '#e8490f';
     b.style.cssText = `position:fixed;top:0;left:0;right:0;z-index:2147483647;
       background:${bg};color:#fff;font-family:-apple-system,sans-serif;font-size:13px;
-      font-weight:500;padding:10px 16px;display:flex;align-items:center;gap:10px;
-      box-shadow:0 3px 14px rgba(0,0,0,.28);`;
+      font-weight:500;padding:12px 16px;box-shadow:0 4px 16px rgba(0,0,0,.3);`;
     b.innerHTML = `
-      <strong style="white-space:nowrap">🍽️ FoodFluencer</strong>
-      <span style="background:rgba(255,255,255,.22);border-radius:20px;padding:1px 8px;font-size:.75rem;white-space:nowrap">${n}/${total}</span>
-      <span style="font-weight:400;flex:1">${html}</span>
-      <button onclick="document.getElementById('ffbot-banner').remove()"
-        style="background:rgba(255,255,255,.22);border:none;color:#fff;border-radius:5px;
-        padding:3px 9px;cursor:pointer;white-space:nowrap;flex-shrink:0">✕ Close</button>`;
+      <div style="display:flex;align-items:center;gap:8px;margin-bottom:4px">
+        <strong>🍽️ FoodFluencer</strong>
+        <span style="background:rgba(255,255,255,.22);border-radius:20px;padding:1px 8px;font-size:.72rem">${n}/${TOTAL}</span>
+        <span style="font-weight:400;flex:1">${html}</span>
+        <button onclick="document.getElementById('ffbot-banner').remove()"
+          style="background:rgba(255,255,255,.22);border:none;color:#fff;border-radius:5px;padding:3px 9px;cursor:pointer">✕</button>
+      </div>
+      <div id="ffbot-log" style="font-size:.68rem;opacity:.78;max-height:30px;overflow:hidden"></div>`;
     document.body.prepend(b);
   }
+  function dbg(msg) {
+    const l = document.getElementById('ffbot-log');
+    if (l) { const d = document.createElement('span'); d.textContent = `→ ${msg}  `; l.prepend(d); }
+    console.log(`[FoodFluencer TikTok] ${msg}`);
+  }
 
+  // ═══════════════════════════════════════════════════════════════════════════
+  // Build H.264 MP4 (+ optional AAC audio) entirely inside TikTok's page context
+  // ═══════════════════════════════════════════════════════════════════════════
+  async function buildH264MP4(imgDataUrls, audioDataUrl) {
+    const W = 720, H = 1280, FPS = 25, BITRATE = 2_000_000, SEC = 1.2;
+
+    const images = [];
+    for (const src of imgDataUrls) {
+      await new Promise(res => {
+        const img = new Image();
+        img.onload = () => { images.push(img); res(); };
+        img.onerror = res;
+        img.src = src;
+      });
+    }
+    if (!images.length) throw new Error('No images loaded');
+
+    const canvas = document.createElement('canvas');
+    canvas.width = W; canvas.height = H;
+    const ctx = canvas.getContext('2d');
+
+    function drawSlide(img) {
+      ctx.fillStyle = '#000'; ctx.fillRect(0, 0, W, H);
+      const s = Math.min(W / img.naturalWidth, H / img.naturalHeight);
+      ctx.drawImage(img, (W - img.naturalWidth * s) / 2, (H - img.naturalHeight * s) / 2, img.naturalWidth * s, img.naturalHeight * s);
+    }
+
+    // ── Encode video with WebCodecs ──────────────────────────────────────────
+    if (!window.VideoEncoder) throw new Error('VideoEncoder not available');
+
+    const codecs = ['avc1.4d0028','avc1.42001f','avc1.42001e','avc1.420014'];
+    let codec = null;
+    for (const c of codecs) {
+      try {
+        const s = await VideoEncoder.isConfigSupported({ codec: c, width: W, height: H, bitrate: BITRATE, framerate: FPS });
+        if (s.supported) { codec = c; break; }
+      } catch(_) {}
+    }
+    if (!codec) throw new Error('No H.264 codec supported');
+    dbg(`Video codec: ${codec}`);
+
+    const vChunks = []; let vDcfg = null; let vErr = null;
+    const vEnc = new VideoEncoder({
+      output: (chunk, meta) => {
+        if (meta?.decoderConfig) vDcfg = meta.decoderConfig;
+        const buf = new ArrayBuffer(chunk.byteLength); chunk.copyTo(buf);
+        vChunks.push({ data: new Uint8Array(buf), isKey: chunk.type === 'key' });
+      },
+      error: e => { vErr = e; },
+    });
+    vEnc.configure({ codec, width: W, height: H, bitrate: BITRATE, framerate: FPS, avc: { format: 'avc' } });
+
+    const framesPerSlide = Math.ceil(SEC * FPS);
+    let fi = 0;
+    for (let i = 0; i < images.length; i++) {
+      drawSlide(images[i]);
+      for (let f = 0; f < framesPerSlide; f++) {
+        if (vErr) throw new Error('VideoEncoder: ' + vErr.message);
+        const ts = Math.round(fi * 1_000_000 / FPS);
+        const frame = new VideoFrame(canvas, { timestamp: ts, duration: Math.round(1_000_000 / FPS) });
+        vEnc.encode(frame, { keyFrame: fi === 0 || f === 0 });
+        frame.close(); fi++;
+      }
+      banner(1, `Encoding video: slide ${i+1}/${images.length}${audioDataUrl ? ' + 🎵' : ''}…`);
+    }
+    await vEnc.flush(); vEnc.close();
+    if (vErr) throw new Error('VideoEncoder: ' + vErr.message);
+    dbg(`Video: ${vChunks.length} chunks`);
+
+    // ── Encode audio with WebCodecs (AAC-LC) ────────────────────────────────
+    let aChunks = [];
+    const AUDIO_SAMPLE_RATE = 44100;
+    const AUDIO_CHANNELS    = 2;
+    const videoSec = images.length * SEC;
+
+    if (audioDataUrl && window.AudioEncoder && window.AudioData) {
+      try {
+        banner(1, `Encoding audio (${Math.round(videoSec)}s)…`);
+        // Decode audio data URL → AudioBuffer
+        const b64   = audioDataUrl.split(',')[1];
+        const bytes = Uint8Array.from(atob(b64), c => c.charCodeAt(0));
+        const tmpCtx = new (window.AudioContext || window.webkitAudioContext)({ sampleRate: AUDIO_SAMPLE_RATE });
+        const audioBuf = await tmpCtx.decodeAudioData(bytes.buffer.slice(0));
+        await tmpCtx.close();
+
+        const totalAudioFrames = Math.min(
+          Math.ceil(videoSec * AUDIO_SAMPLE_RATE),
+          audioBuf.length
+        );
+        const numCh = Math.min(audioBuf.numberOfChannels, AUDIO_CHANNELS);
+
+        const aSupport = await AudioEncoder.isConfigSupported({
+          codec: 'mp4a.40.2', sampleRate: AUDIO_SAMPLE_RATE,
+          numberOfChannels: numCh, bitrate: 128000,
+        });
+
+        if (aSupport.supported) {
+          let aErr = null;
+          const aEnc = new AudioEncoder({
+            output: (chunk) => {
+              const buf = new ArrayBuffer(chunk.byteLength); chunk.copyTo(buf);
+              aChunks.push({ data: new Uint8Array(buf), timestamp: chunk.timestamp });
+            },
+            error: e => { aErr = e; },
+          });
+          aEnc.configure({ codec: 'mp4a.40.2', sampleRate: AUDIO_SAMPLE_RATE, numberOfChannels: numCh, bitrate: 128000 });
+
+          const FRAME_SIZE = 1024;
+          const ch = [];
+          for (let c = 0; c < numCh; c++) ch.push(audioBuf.getChannelData(c));
+
+          let processed = 0;
+          while (processed < totalAudioFrames) {
+            const frames = Math.min(FRAME_SIZE, totalAudioFrames - processed);
+            const planar  = new Float32Array(frames * numCh);
+            for (let c = 0; c < numCh; c++)
+              planar.set(ch[c].slice(processed, processed + frames), c * frames);
+
+            const ad = new AudioData({
+              format: 'f32-planar',
+              sampleRate: AUDIO_SAMPLE_RATE,
+              numberOfFrames: frames,
+              numberOfChannels: numCh,
+              timestamp: Math.round(processed * 1_000_000 / AUDIO_SAMPLE_RATE),
+              data: planar,
+            });
+            aEnc.encode(ad); ad.close();
+            processed += frames;
+          }
+          await aEnc.flush(); aEnc.close();
+          if (aErr) throw new Error('AudioEncoder: ' + aErr.message);
+          dbg(`Audio: ${aChunks.length} AAC chunks (${numCh}ch)`);
+        } else {
+          dbg('AAC not supported — video-only');
+        }
+      } catch(e) {
+        dbg(`Audio encoding failed: ${e.message} — video-only`);
+        aChunks = [];
+      }
+    }
+
+    const blob = muxMP4(vChunks, vDcfg, aChunks, W, H, FPS, fi, AUDIO_SAMPLE_RATE);
+    dbg(`MP4 ready: ${(blob.size/1024/1024).toFixed(1)}MB`);
+    return blob;
+  }
+
+  // ═══════════════════════════════════════════════════════════════════════════
+  // MP4 muxer — video track + optional AAC audio track
+  // ═══════════════════════════════════════════════════════════════════════════
+  function muxMP4(vChunks, vDcfg, aChunks, W, H, fps, totalVideoFrames, aSampleRate) {
+    const u8  = v => [v & 0xFF];
+    const u16 = v => [(v >> 8) & 0xFF, v & 0xFF];
+    const u32 = v => [(v >>> 24) & 0xFF, (v >>> 16) & 0xFF, (v >>> 8) & 0xFF, v & 0xFF];
+    const s4  = s => [...new TextEncoder().encode(s).slice(0, 4)];
+    const z   = n => Array(n).fill(0);
+    function box(t, ...c) { const d = c.flat(Infinity); return [...u32(8+d.length), ...s4(t.padEnd(4,' ')), ...d]; }
+    function fb(t, v, f, ...c) { return box(t, u8(v), [(f>>16)&0xFF,(f>>8)&0xFF,f&0xFF], ...c); }
+
+    // ── Video track ────────────────────────────────────────────────────────
+    const VTS = 90000, VSD = Math.round(VTS / fps), VDUR = totalVideoFrames * VSD;
+    let sps = new Uint8Array([0x67,0x4d,0x00,0x28]); let pps = new Uint8Array([0x68,0xee,0x31,0xb2]);
+    if (vDcfg?.description) {
+      const d = new Uint8Array(vDcfg.description); let i = 5;
+      const ns = d[i++] & 0x1F;
+      for (let j=0;j<ns;j++) { const l=(d[i]<<8)|d[i+1];i+=2; sps=d.slice(i,i+l);i+=l; }
+      const np = d[i++];
+      for (let j=0;j<np;j++) { const l=(d[i]<<8)|d[i+1];i+=2; pps=d.slice(i,i+l);i+=l; }
+    }
+    const avcC = box('avcC', u8(1),[sps[1]||0x4d,sps[2]||0,sps[3]||0x28],[0xFF],[0xE1],u16(sps.length),[...sps],u8(1),u16(pps.length),[...pps]);
+    const avc1 = box('avc1', z(6),u16(1),z(16),u16(W),u16(H),[0,72,0,0,0,72,0,0],u32(0),u16(1),z(32),u16(0x18),u16(0xFFFF),avcC);
+    const mat  = [0x00,0x01,0x00,0x00,0,0,0,0,0,0,0,0,0,0,0,0,0x00,0x01,0x00,0x00,0,0,0,0,0,0,0,0,0,0,0,0,0x40,0x00,0x00,0x00];
+
+    const vstsd = fb('stsd',0,0,u32(1),avc1);
+    const vstts = fb('stts',0,0,u32(1),u32(vChunks.length),u32(VSD));
+    const vkeys = vChunks.map((c,i)=>c.isKey?i+1:null).filter(Boolean);
+    const vstss = fb('stss',0,0,u32(vkeys.length),...vkeys.flatMap(i=>u32(i)));
+    const vstsz = fb('stsz',0,0,u32(0),u32(vChunks.length),...vChunks.flatMap(c=>u32(c.data.length)));
+    const vstsc = fb('stsc',0,0,u32(1),u32(1),u32(1),u32(1));
+    const vstco_ph = fb('stco',0,0,u32(vChunks.length),...vChunks.flatMap(()=>u32(0)));
+    const vstbl_ph = box('stbl',vstsd,vstts,vstss,vstsc,vstsz,vstco_ph);
+    const vmhd   = fb('vmhd',0,1,u16(0),z(6));
+    const dinf   = box('dinf',fb('dref',0,0,u32(1),fb('url ',0,1)));
+    const vminf_ph = box('minf',vmhd,dinf,vstbl_ph);
+    const vmdhd  = fb('mdhd',0,0,u32(0),u32(0),u32(VTS),u32(VDUR),u16(0x55C4),u16(0));
+    const vhdlr  = fb('hdlr',0,0,u32(0),s4('vide'),z(12),[...s4('Vide'),0]);
+    const vmdia_ph = box('mdia',vmdhd,vhdlr,vminf_ph);
+    const vtkhd  = fb('tkhd',0,3,u32(0),u32(0),u32(1),u32(0),u32(VDUR),z(8),u16(0),u16(0),u16(0),u16(0),mat,u32(W<<16),u32(H<<16));
+    const vtrak_ph = box('trak',vtkhd,vmdia_ph);
+
+    // ── Audio track (AAC-LC) ────────────────────────────────────────────────
+    const hasAudio = aChunks.length > 0;
+    let atrak_ph = [];
+    if (hasAudio) {
+      const ATS  = aSampleRate;
+      const AFPF = 1024; // AAC frames per chunk
+      const ADUR = aChunks.length * AFPF;
+
+      // AAC-LC AudioSpecificConfig for 44100Hz stereo
+      // audioObjectType=2 (5 bits), freqIndex=4 (4 bits), channels=2 (4 bits)
+      // = 00010 0100 0010 → 0001 0010 0001 0000 = 0x12, 0x10
+      const asc = [0x12, 0x10];
+      const esdsData = [
+        0x03, 0x19, 0x00, 0x01, 0x00,                // ES_Descriptor (tag, size, ES_ID, flags)
+        0x04, 0x11, 0x40, 0x15,                       // DecoderConfig (tag, size, objectType, streamType)
+        0x00, 0x00, 0x00,                             // bufferSizeDB
+        0x00, 0x01, 0xF4, 0x00,                       // maxBitrate = 128000
+        0x00, 0x01, 0xF4, 0x00,                       // avgBitrate = 128000
+        0x05, 0x02, ...asc,                           // DecoderSpecificInfo
+        0x06, 0x01, 0x02,                             // SLConfig predefined
+      ];
+      const esds = fb('esds', 0, 0, esdsData);
+      const mp4a = box('mp4a', z(6),u16(1), z(8), u16(2),u16(16),u16(0),u16(0),
+        u32(ATS * 65536), // samplerate as 16.16 fixed point
+        esds);
+
+      const astsd = fb('stsd',0,0,u32(1),mp4a);
+      const astts = fb('stts',0,0,u32(1),u32(aChunks.length),u32(AFPF));
+      const astsz = fb('stsz',0,0,u32(0),u32(aChunks.length),...aChunks.flatMap(c=>u32(c.data.length)));
+      const astsc = fb('stsc',0,0,u32(1),u32(1),u32(1),u32(1));
+      const astco_ph = fb('stco',0,0,u32(aChunks.length),...aChunks.flatMap(()=>u32(0)));
+      const astbl_ph = box('stbl',astsd,astts,astsc,astsz,astco_ph);
+      const smhd   = fb('smhd',0,0,u16(0),u16(0));
+      const aminf_ph = box('minf',smhd,dinf,astbl_ph);
+      const amdhd  = fb('mdhd',0,0,u32(0),u32(0),u32(ATS),u32(ADUR),u16(0x55C4),u16(0));
+      const ahdlr  = fb('hdlr',0,0,u32(0),s4('soun'),z(12),[...s4('Soun'),0]);
+      const amdia_ph = box('mdia',amdhd,ahdlr,aminf_ph);
+      const atkhd  = fb('tkhd',0,3,u32(0),u32(0),u32(2),u32(0),u32(ADUR),z(8),u16(0),u16(0),u16(0x0100),u16(0),mat,u32(0),u32(0));
+      atrak_ph = box('trak',atkhd,amdia_ph);
+    }
+
+    const mvhd = fb('mvhd',0,0,u32(0),u32(0),u32(VTS),u32(VDUR),u32(0x10000),u16(0x100),z(10),mat,z(24),u32(hasAudio?3:2));
+    const moov_ph = box('moov', mvhd, vtrak_ph, ...(hasAudio ? [atrak_ph] : []));
+    const ftyp    = box('ftyp',s4('isom'),u32(0x200),s4('isom'),s4('iso2'),s4('avc1'),s4('mp41'));
+
+    // Compute real chunk offsets (video then audio in mdat)
+    const mdatStart = ftyp.length + moov_ph.length + 8;
+    let off = mdatStart;
+    const vRealOff = vChunks.map(c => { const o=off; off+=c.data.length; return o; });
+    const aRealOff = aChunks.map(c => { const o=off; off+=c.data.length; return o; });
+
+    // Rebuild with real offsets
+    const vstco_r  = fb('stco',0,0,u32(vChunks.length),...vRealOff.flatMap(o=>u32(o)));
+    const vstbl_r  = box('stbl',vstsd,vstts,vstss,vstsc,vstsz,vstco_r);
+    const vminf_r  = box('minf',vmhd,dinf,vstbl_r);
+    const vmdia_r  = box('mdia',vmdhd,vhdlr,vminf_r);
+    const vtrak_r  = box('trak',vtkhd,vmdia_r);
+
+    let atrak_r = [];
+    if (hasAudio) {
+      const ATS  = aSampleRate, AFPF = 1024, ADUR = aChunks.length * AFPF;
+      const asc  = [0x12, 0x10];
+      const esdsData = [0x03,0x19,0x00,0x01,0x00,0x04,0x11,0x40,0x15,0x00,0x00,0x00,0x00,0x01,0xF4,0x00,0x00,0x01,0xF4,0x00,0x05,0x02,...asc,0x06,0x01,0x02];
+      const esds  = fb('esds',0,0,esdsData);
+      const mp4a  = box('mp4a',z(6),u16(1),z(8),u16(2),u16(16),u16(0),u16(0),u32(ATS*65536),esds);
+      const astsd = fb('stsd',0,0,u32(1),mp4a);
+      const astts = fb('stts',0,0,u32(1),u32(aChunks.length),u32(AFPF));
+      const astsz = fb('stsz',0,0,u32(0),u32(aChunks.length),...aChunks.flatMap(c=>u32(c.data.length)));
+      const astsc = fb('stsc',0,0,u32(1),u32(1),u32(1),u32(1));
+      const astco_r = fb('stco',0,0,u32(aChunks.length),...aRealOff.flatMap(o=>u32(o)));
+      const astbl_r = box('stbl',astsd,astts,astsc,astsz,astco_r);
+      const smhd   = fb('smhd',0,0,u16(0),u16(0));
+      const aminf_r = box('minf',smhd,dinf,astbl_r);
+      const amdhd  = fb('mdhd',0,0,u32(0),u32(0),u32(ATS),u32(ADUR),u16(0x55C4),u16(0));
+      const ahdlr  = fb('hdlr',0,0,u32(0),s4('soun'),z(12),[...s4('Soun'),0]);
+      const amdia_r = box('mdia',amdhd,ahdlr,aminf_r);
+      const atkhd  = fb('tkhd',0,3,u32(0),u32(0),u32(2),u32(0),u32(ADUR),z(8),u16(0),u16(0),u16(0x0100),u16(0),mat,u32(0),u32(0));
+      atrak_r = box('trak',atkhd,amdia_r);
+    }
+
+    const moov_r = box('moov', mvhd, vtrak_r, ...(hasAudio ? [atrak_r] : []));
+    const mdatBodySize = [...vChunks, ...aChunks].reduce((a,c)=>a+c.data.length, 0);
+    const mdatHdr = new Uint8Array([...u32(mdatBodySize+8), ...s4('mdat')]);
+
+    const total = ftyp.length + moov_r.length + mdatHdr.length + mdatBodySize;
+    const out   = new Uint8Array(total);
+    let p = 0;
+    for (const part of [new Uint8Array(ftyp), new Uint8Array(moov_r), mdatHdr,
+                        ...vChunks.map(c=>c.data), ...aChunks.map(c=>c.data)]) {
+      out.set(part, p); p += part.length;
+    }
+    return new Blob([out], { type: 'video/mp4' });
+  }
+
+  // ── Inject file ───────────────────────────────────────────────────────────
+  function injectFile(input, file) {
+    const dt = new DataTransfer(); dt.items.add(file);
+    const setter = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'files')?.set;
+    if (setter) setter.call(input, dt.files); else input.files = dt.files;
+    ['change','input'].forEach(ev => input.dispatchEvent(new Event(ev, { bubbles: true })));
+  }
+
+  // ── Upload detection ──────────────────────────────────────────────────────
+  const ERR_RE = /over.*\d+.?min|minute.*limit|size.*too|too.*large|file.*too|maximum.*size|not.*support|unsupport|invalid.*file|upload.*fail/i;
+  async function checkUpload(ms = 25000) {
+    const start = Date.now();
+    while (Date.now() - start < ms) {
+      await sleep(700);
+      const text = document.body.innerText || '';
+      if (ERR_RE.test(text)) { dbg(`Rejected: "${text.match(ERR_RE)?.[0]}"`); return 'rejected'; }
+      if (document.querySelector('[class*="DraftEditor"],[data-placeholder*="description" i],[data-placeholder*="caption" i]')) return 'accepted';
+    }
+    return ERR_RE.test(document.body.innerText) ? 'rejected' : 'timeout';
+  }
+
+  // ═══════════════════════════════════════════════════════════════════════════
+  // MAIN FLOW
+  // ═══════════════════════════════════════════════════════════════════════════
   (async () => {
-    const total = songName ? 4 : 3;
+    await sleep(2000);
 
-    // ①  Find file input on upload page
-    step(1, total, 'Locating upload area…');
-    const fileInput = await waitFor('input[type="file"]', 10000);
-    if (!fileInput) {
-      step(1, total, 'Upload area not found — refresh TikTok and try again.', 'warn');
+    // ── Step 1: Build the MP4 ────────────────────────────────────────────
+    const hasAudio = !!tiktokAudioDataUrl;
+    banner(1, `Building ${photoDataUrls.length}-photo slideshow${hasAudio ? ' 🎵 with song' : ''}…`);
+
+    let videoFile = null;
+    try {
+      const blob = await buildH264MP4(photoDataUrls, tiktokAudioDataUrl);
+      const sizeMB = (blob.size / 1024 / 1024).toFixed(1);
+      videoFile = new File([blob], 'tiktok-post.mp4', { type: 'video/mp4' });
+      banner(1, `Video ready: ${sizeMB}MB H.264${hasAudio ? ' + AAC 🎵' : ''} — uploading…`);
+      dbg(`Video: ${sizeMB}MB`);
+    } catch(e) {
+      dbg(`Build failed: ${e.message}`);
+      banner(1, `⚠️ Build failed: ${e.message}`, 'warn');
       return;
     }
 
-    // ②  Upload all photos (TikTok creates a photo slideshow)
-    const files = photoDataUrls.map((url, i) => dataUrlToFile(url, `restaurant-${i + 1}.jpg`));
-    step(2, total, `Uploading <strong>${files.length} photo${files.length > 1 ? 's' : ''}</strong> as slideshow…`);
-    setFilesOnInput(fileInput, files);
-    await sleep(3500);
+    // ── Step 2: Inject into TikTok file input ────────────────────────────
+    banner(2, 'Finding upload area…');
+    const fileInput = await waitFor('input[type="file"]', 12000);
+    if (!fileInput) { banner(2, '⚠️ Upload area not found. Refresh and retry.', 'warn'); return; }
 
-    // ③  Fill description
-    step(3, total, 'Filling description…');
+    dbg(`Injecting ${(videoFile.size/1024/1024).toFixed(1)}MB MP4…`);
+    injectFile(fileInput, videoFile);
+
+    // ── Step 3: Wait for TikTok to process ──────────────────────────────
+    banner(3, 'Processing video…');
+    const result = await checkUpload(30000);
+    if (result === 'rejected') {
+      banner(3, '⚠️ TikTok rejected the video. Check error on page.', 'warn');
+      return;
+    }
+    dbg('Upload accepted');
+    await sleep(2000);
+
+    // ── Step 4: Fill Description ─────────────────────────────────────────
+    banner(4, 'Filling description…');
     const descSels = [
       '.public-DraftEditor-content',
-      '[contenteditable="true"][data-text]',
-      '[class*="editor"][contenteditable="true"]',
+      '[contenteditable="true"][class*="editor" i]',
+      '[data-placeholder*="description" i]',
       'div[contenteditable="true"]',
     ];
     let descBox = null;
-    for (const s of descSels) { descBox = document.querySelector(s); if (descBox) break; }
-    if (descBox) {
-      descBox.focus(); await sleep(200);
+    for (let att = 0; att < 8 && !descBox; att++) {
+      for (const s of descSels) { descBox = document.querySelector(s); if (descBox) break; }
+      if (!descBox) await sleep(500);
+    }
+    if (descBox && caption) {
+      descBox.focus(); await sleep(300);
       document.execCommand('selectAll', false, null);
       document.execCommand('insertText', false, caption);
-    }
+      dbg('Description filled');
+    } else { dbg('Description box not found'); }
 
-    // ④  Add sound
-    if (songName) {
-      await sleep(800);
-      let soundBtn = null;
-      const soundSels = ['button[class*="sound"]', '[class*="add-sound"]',
-        'button[aria-label*="sound" i]', 'button[aria-label*="music" i]'];
-      for (const s of soundSels) { soundBtn = document.querySelector(s); if (soundBtn) break; }
-      if (!soundBtn) soundBtn = [...document.querySelectorAll('button,[role="button"]')]
-        .find(el => /add sound|add music/i.test(el.textContent || el.getAttribute('aria-label') || ''));
+    // ── Step 5: Add Location ─────────────────────────────────────────────
+    if (location) {
+      await sleep(600);
+      banner(4, 'Adding location…');
 
-      if (soundBtn) {
-        soundBtn.click(); await sleep(1200);
-        const musicInput = document.querySelector('input[placeholder*="Search" i], input[type="search"]');
-        if (musicInput) {
-          musicInput.focus(); musicInput.value = songName;
-          musicInput.dispatchEvent(new Event('input', { bubbles: true }));
-          await sleep(1800);
-          const first = document.querySelector('[class*="music-item"]:first-child, [class*="sound-item"]:first-child, [class*="MusicItem"]:first-child');
-          if (first) { first.click(); await sleep(500); }
-        }
-        step(4, total, `🎵 <em>"${songName}"</em> searched — confirm selection, then click <strong>Post</strong>.`, 'success');
-      } else {
-        step(4, total, `Description filled — add <em>"${songName}"</em> via Add Sound, then click <strong>Post</strong>.`, 'success');
+      const cityMatch  = location.match(/\d{4}\s+([A-Za-zÀ-ÿ\s-]+),\s*Belgium/i);
+      const searchTerm = (cityMatch?.[1] || location.split(',')[0] || location).trim();
+      dbg(`Location search: "${searchTerm}"`);
+
+      // Find the "Location" button/field
+      let locTrigger = document.querySelector('[aria-label*="location" i],[placeholder*="location" i]');
+      if (!locTrigger) {
+        locTrigger = [...document.querySelectorAll('[role="button"],button,div[tabindex]')]
+          .find(el => /add\s*(a\s+)?location|^location$/i.test(el.innerText || el.getAttribute('aria-label') || ''));
       }
-    } else {
-      step(3, total, `✅ ${files.length} photo${files.length > 1 ? 's' : ''} &amp; description ready — click <strong>Post</strong> to publish.`, 'success');
+      if (locTrigger) {
+        locTrigger.click(); await sleep(700);
+        const locInput = await waitFor('input[placeholder*="Search" i],input[placeholder*="Location" i]', 4000);
+        if (locInput) {
+          locInput.focus(); await sleep(200);
+          for (const ch of searchTerm) { document.execCommand('insertText', false, ch); await sleep(55); }
+          await sleep(2000);
+          const first = document.querySelector('[role="option"]:first-child,[class*="location-item"]:first-child,[class*="LocationItem"]:first-child');
+          if (first) { first.click(); dbg(`Location selected: ${first.innerText?.trim()}`); }
+          else dbg('No location results');
+        }
+      } else { dbg('Location button not found'); }
     }
+
+    // ── Done ─────────────────────────────────────────────────────────────
+    const note = hasAudio ? ` 🎵 Song baked in.` : '';
+    banner(5,
+      `✅ All set!${note} Review &amp; click <strong>Post</strong>.`,
+      'success'
+    );
+    dbg('Bot complete');
   })();
 }
+
