@@ -841,8 +841,51 @@ function injectTikTok(photoDataUrls, caption, songName, location, opts) {
     console.log(`[FoodFluencer TikTok] ${msg}`);
   }
 
-  // ── Build a WebM/MP4 slideshow from images + optional audio ────────────────
-  async function buildSlideshow(imgUrls, audDataUrl, secPerSlide = 3.5) {
+  // ── Fix WebM duration metadata (MediaRecorder leaves it as undefined/0) ────
+  // TikTok reads duration from the EBML container header and rejects files
+  // where the Duration element is missing or 0.
+  // The Duration element has ID 0x4489 and is a float64 in milliseconds.
+  async function fixWebMDuration(blob, totalMs) {
+    return new Promise(resolve => {
+      const reader = new FileReader();
+      reader.onload = e => {
+        const buf  = e.target.result;
+        const data = new Uint8Array(buf);
+        const view = new DataView(buf);
+
+        for (let i = 0; i < data.length - 12; i++) {
+          // Duration element ID: 0x44 0x89
+          if (data[i] !== 0x44 || data[i + 1] !== 0x89) continue;
+
+          const sizeCode = data[i + 2];
+          let dataOffset, dataSize;
+
+          if (sizeCode >= 0x80) {
+            // 1-byte VINT
+            dataSize   = sizeCode & 0x7F;
+            dataOffset = i + 3;
+          } else if (sizeCode >= 0x40) {
+            // 2-byte VINT
+            dataSize   = ((sizeCode & 0x3F) << 8) | data[i + 3];
+            dataOffset = i + 4;
+          } else {
+            continue;
+          }
+
+          if (dataSize === 8) {
+            // Write correct duration as big-endian float64
+            view.setFloat64(dataOffset, totalMs, false);
+            break;
+          }
+        }
+        resolve(new Blob([buf], { type: blob.type }));
+      };
+      reader.readAsArrayBuffer(blob);
+    });
+  }
+
+  // ── Build a WebM slideshow from images + optional audio ───────────────────
+  async function buildSlideshow(imgUrls, audDataUrl, secPerSlide = 1.2) {
     const W = 1080, H = 1080;
     const canvas = document.createElement('canvas');
     canvas.width = W; canvas.height = H;
@@ -917,19 +960,25 @@ function injectTikTok(photoDataUrls, caption, songName, location, opts) {
     try { if (audSrc) audSrc.stop(); } catch(_) {}
     try { if (audCtx) audCtx.close(); } catch(_) {}
 
-    return new Promise((res, rej) => {
+    const rawBlob = await new Promise((res, rej) => {
       recorder.onstop = () => res(new Blob(chunks, { type: 'video/webm' }));
       setTimeout(() => rej(new Error('Video creation timed out')), 120000);
     });
+
+    // Fix the WebM duration metadata so TikTok reads the correct length
+    const totalMs = imgs.length * secPerSlide * 1000;
+    dbg(`Raw blob: ${(rawBlob.size / 1024 / 1024).toFixed(1)} MB — fixing WebM duration (${totalMs}ms)…`);
+    const fixedBlob = await fixWebMDuration(rawBlob, totalMs);
+    return fixedBlob;
   }
 
   (async () => {
     const total = 4;
 
     // ①  Build the slideshow video
-    const secPerSlide = 3.5;
+    const secPerSlide  = 1.2; // 1.2s per photo → 5 photos = 6s total
     const videoDuration = photoDataUrls.length * secPerSlide;
-    step(1, total, `Creating ${Math.round(videoDuration)}s slideshow${audioDataUrl ? ' with song' : ''}… (please wait)`);
+    step(1, total, `Creating ${videoDuration.toFixed(0)}s slideshow${audioDataUrl ? ' 🎵 with song' : ''}… (please wait)`);
     await sleep(500);
 
     let videoBlob;
