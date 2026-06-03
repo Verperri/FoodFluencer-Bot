@@ -492,14 +492,35 @@ function injectInstagram(photoDataUrls, caption, songName, location) {
       return null;
     }
 
-    // Fire the full React-compatible mouse event sequence on an element
+    // Fire mouse + keyboard events — keyboard (Enter) bypasses pointer-events:none
+    // and React's synthetic event delegation handles both equally well.
     function reactClick(el) {
       el.focus();
+      // Mouse sequence
       ['mouseenter', 'mouseover', 'mousedown', 'mouseup', 'click'].forEach(type =>
         el.dispatchEvent(new MouseEvent(type, {
           bubbles: true, cancelable: true, view: window,
           buttons: 1, detail: type === 'click' ? 1 : 0,
         }))
+      );
+      // Also native click (sometimes React needs this too)
+      el.click();
+      // Keyboard Enter — works even if pointer-events:none is set on the element
+      ['keydown', 'keypress', 'keyup'].forEach(type =>
+        el.dispatchEvent(new KeyboardEvent(type, {
+          key: 'Enter', code: 'Enter', keyCode: 13,
+          bubbles: true, cancelable: true, view: window,
+        }))
+      );
+    }
+
+    // Check if we're on the caption/details screen (final step before Share)
+    function onCaptionScreen() {
+      return !!(
+        document.querySelector('textarea[aria-label*="caption" i]') ||
+        document.querySelector('div[aria-label*="caption" i]') ||
+        document.querySelector('textarea[placeholder*="caption" i]') ||
+        document.querySelector('[role="textbox"]')
       );
     }
 
@@ -573,27 +594,47 @@ function injectInstagram(photoDataUrls, caption, songName, location) {
         continue;
       }
 
-      const btnTxt = (preClickBtn.innerText || preClickBtn.textContent || '').trim();
-      dbg(`Click ${clickNum}/2 (${label}): <${preClickBtn.tagName}> visible=${isVisible(preClickBtn)} "${btnTxt}"`);
+      const btnTxt  = (preClickBtn.innerText || preClickBtn.textContent || '').trim();
+      const btnRect  = preClickBtn.getBoundingClientRect();
+      const btnPtr   = window.getComputedStyle(preClickBtn).pointerEvents;
+      dbg(`Click ${clickNum}/2 (${label}): <${preClickBtn.tagName}> "${btnTxt}" ${Math.round(btnRect.width)}x${Math.round(btnRect.height)}@top${Math.round(btnRect.top)} pointer-events=${btnPtr}`);
 
-      await sleep(150);
-      reactClick(preClickBtn);
-      dbg(`Fired mouse events on ${label} Next — waiting for it to hide/disappear`);
-
-      // Wait until THIS SPECIFIC BUTTON is no longer visible (CSS hidden or removed).
-      // Instagram often hides buttons via CSS during transitions — must check isVisible().
-      const transitioned = await waitForBtnToDisappear(preClickBtn, 6000);
-      dbg(`${label} transition: ${transitioned ? 'confirmed (button gone)' : 'uncertain — proceeding anyway'}`);
-
-      // If transition not confirmed, retry the click once more
-      if (!transitioned) {
-        dbg('Button still visible after 6s — retrying click');
+      // Try up to 4 times — checks after each attempt whether we actually advanced
+      let advanced = false;
+      for (let attempt = 1; attempt <= 4 && !advanced; attempt++) {
+        await sleep(attempt === 1 ? 200 : 600);
         reactClick(preClickBtn);
-        await sleep(1000);
+        dbg(`Attempt ${attempt}: fired mouse+keyboard on "${btnTxt}"`);
+
+        // Wait up to 3s per attempt for evidence the screen advanced
+        const t0 = Date.now();
+        while (Date.now() - t0 < 3000) {
+          await sleep(200);
+          const gone    = !document.contains(preClickBtn) || !isVisible(preClickBtn);
+          const caption = onCaptionScreen();
+          if (gone || caption) {
+            dbg(`Advance confirmed on attempt ${attempt}: gone=${gone} caption=${caption}`);
+            advanced = true;
+            break;
+          }
+        }
+        if (!advanced) dbg(`Attempt ${attempt} — screen did not advance within 3s`);
       }
 
-      // Give the next screen time to animate in before we search for its Next button
-      await sleep(1200);
+      if (!advanced) {
+        dbg(`4 attempts exhausted for ${label} Next — waiting for manual action`);
+        step(clickNum + 1, total,
+          `Please click <strong>Next</strong> at the top-right to continue past the ${label} step.`, 'warn');
+        const t1 = Date.now();
+        while (Date.now() - t1 < 20000) {
+          await sleep(500);
+          if (onCaptionScreen()) { dbg('Caption screen appeared (manual)'); break; }
+          const newNext = findVisibleNextBtn();
+          if (newNext && newNext !== preClickBtn) { dbg('New Next visible (manual advance)'); break; }
+        }
+      }
+
+      await sleep(800);
     }
 
     // ══ STEP 4: Fill caption — now on Details screen (Share button visible) ════
