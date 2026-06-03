@@ -140,17 +140,16 @@ async function createCoverOverlay(imgUri, restaurantName, address) {
       // ── Sizes ─────────────────────────────────────────────────────────────
       const nameSize   = Math.max(32, Math.round(W * 0.072));
       const tagSize    = Math.max(16, Math.round(W * 0.028));
-      const citySize   = Math.max(13, Math.round(W * 0.024));
       const cornerSize = Math.max(10, Math.round(W * 0.016));
-      const gap        = Math.round(nameSize * 0.38);
+      const gap        = Math.round(nameSize * 0.42);
 
-      // Extract city
+      // Extract city (for tagline + corner label only)
       const cityM = address.match(/\d{4}\s+([A-Za-zÀ-ÿ\s-]+),\s*Belgium/i);
       const city  = (cityM?.[1] || address.split(',')[0] || '').trim();
       const tagline = getCoverTagline(restaurantName, city);
 
-      // Total text block height: tagline + gap + name + (gap + city)?
-      const blockH = tagSize + gap + nameSize + (city ? gap + citySize : 0);
+      // Two-line block: tagline + restaurant name
+      const blockH = tagSize + gap + nameSize;
       let y = best.centerY - blockH / 2;
 
       ctx.fillStyle    = '#FFFFFF';
@@ -159,7 +158,7 @@ async function createCoverOverlay(imgUri, restaurantName, address) {
       ctx.shadowColor  = 'rgba(0,0,0,0.72)';
       ctx.shadowOffsetX = 0;
 
-      // ── Tagline (small, italic) ───────────────────────────────────────────
+      // ── Tagline (small, italic — already contains city) ───────────────────
       ctx.font       = `300 italic ${tagSize}px "Cormorant Garamond", Georgia, serif`;
       ctx.shadowBlur = Math.round(tagSize * 0.55);
       ctx.shadowOffsetY = 1;
@@ -171,15 +170,6 @@ async function createCoverOverlay(imgUri, restaurantName, address) {
       ctx.shadowBlur = Math.round(nameSize * 0.26);
       ctx.shadowOffsetY = 2;
       ctx.fillText(restaurantName, W / 2, y);
-      y += nameSize + gap;
-
-      // ── City subtitle ─────────────────────────────────────────────────────
-      if (city) {
-        ctx.font       = `300 italic ${citySize}px "Cormorant Garamond", Georgia, serif`;
-        ctx.shadowBlur = Math.round(citySize * 0.4);
-        ctx.shadowOffsetY = 1;
-        ctx.fillText(city, W / 2, y);
-      }
 
       // ── Bottom-right corner micro-label ───────────────────────────────────
       if (city) {
