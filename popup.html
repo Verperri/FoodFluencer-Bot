@@ -309,6 +309,15 @@
           <p class="ab-preview-hint">See what a generated post will look like based on your settings above</p>
         </div>
 
+        <!-- Preview result panel (hidden until button is clicked) -->
+        <div id="autoPreview" class="auto-preview-panel hidden">
+          <div class="auto-preview-hdr">
+            <span class="auto-preview-hdr-title">👁 Example Post Preview</span>
+            <button class="btn-icon" id="autoPreviewClose" title="Close preview">✕</button>
+          </div>
+          <div id="autoPreviewContent"></div>
+        </div>
+
         <!-- ── Schedule ─────────────────────────────────────────── -->
         <div class="ab-group ab-schedule-section">
           <label class="ab-label">⏰ Schedule</label>

@@ -1038,6 +1038,163 @@ function buildMP4Blob(chunks, dcfg, W, H, fps, ts, sampleDur, totalFrames) {
   return new Blob([out], { type: 'video/mp4' });
 }
 
+// ── Auto Bot: type / country data ────────────────────────────────────────────
+
+// Maps UI type value → plain-language search term for Places API
+const AB_TYPE_QUERY = {
+  restaurant: "restaurant",
+  hotel:      "hotel",
+  bar:        "bar",
+};
+
+const AB_COUNTRY_NAMES = {
+  BE: "Belgium",
+  FR: "France",
+  DE: "Germany",
+  LU: "Luxembourg",
+  NL: "The Netherlands",
+};
+
+// Bounding boxes used as locationRestriction for each country
+const AB_COUNTRY_BOUNDS = {
+  BE: { low: { latitude: 49.5,  longitude:  2.5 }, high: { latitude: 51.5,  longitude:  6.4 } },
+  FR: { low: { latitude: 41.3,  longitude: -5.1 }, high: { latitude: 51.1,  longitude:  9.6 } },
+  DE: { low: { latitude: 47.2,  longitude:  5.9 }, high: { latitude: 55.1,  longitude: 15.0 } },
+  LU: { low: { latitude: 49.4,  longitude:  5.7 }, high: { latitude: 50.2,  longitude:  6.5 } },
+  NL: { low: { latitude: 50.7,  longitude:  3.3 }, high: { latitude: 53.6,  longitude:  7.2 } },
+};
+
+// Read current Auto Bot form values
+function getAutoBotSettings() {
+  const country = document.getElementById("abCountry")?.value || "BE";
+  const type    = document.querySelector("#abType .ab-pill.active")?.dataset?.val || "restaurant";
+
+  // Selected regions (empty string = All)
+  const allChip      = document.querySelector("#abRegionWrap .all-chip");
+  const activeChips  = [...document.querySelectorAll("#abRegionWrap .ab-region-chip:not(.all-chip)")]
+                         .filter(c => c.classList.contains("active"));
+
+  let region = "";
+  if (!allChip?.classList.contains("active") && activeChips.length > 0) {
+    // Pick a random active region each time for variety
+    region = activeChips[Math.floor(Math.random() * activeChips.length)].textContent.trim();
+  }
+
+  return { country, type, region };
+}
+
+// Search Places API for a random entity matching type + location
+async function searchAutoPlace(type, country, region) {
+  const typeQuery   = AB_TYPE_QUERY[type] || "restaurant";
+  const countryName = AB_COUNTRY_NAMES[country] || "Belgium";
+  const bounds      = AB_COUNTRY_BOUNDS[country] || AB_COUNTRY_BOUNDS.BE;
+
+  const locationPart = region ? `${region}, ${countryName}` : countryName;
+  const q = `${typeQuery} in ${locationPart}`;
+
+  trackApiCall("search", q);
+  AppLog.info("Auto Bot search", { type, country, region, query: q });
+
+  const res = await fetch(PLACES_SEARCH, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      "X-Goog-Api-Key": API_KEY,
+      "X-Goog-FieldMask": "places.id,places.displayName,places.formattedAddress,places.rating,places.userRatingCount,places.googleMapsUri,places.photos",
+    },
+    body: JSON.stringify({
+      textQuery: q,
+      maxResultCount: 5,           // fetch several so we can pick randomly
+      locationRestriction: { rectangle: bounds },
+    }),
+  });
+
+  if (!res.ok) {
+    const err = await res.json().catch(() => ({}));
+    throw new Error(err?.error?.message || `API error ${res.status}`);
+  }
+  const data = await res.json();
+  if (!data.places?.length)
+    throw new Error(`No ${type}s found in "${locationPart}"`);
+
+  // Pick a random result for variety
+  return data.places[Math.floor(Math.random() * data.places.length)];
+}
+
+// Preview Example Post — runs a real search and renders the result
+async function previewExamplePost() {
+  if (!API_KEY) { setStatus("Please save your API key first.", "error"); return; }
+
+  const panel   = document.getElementById("autoPreview");
+  const content = document.getElementById("autoPreviewContent");
+  if (!panel || !content) return;
+
+  const settings = getAutoBotSettings();
+
+  // Show panel with loading state
+  panel.classList.remove("hidden");
+  content.innerHTML = `<div class="auto-preview-loading">🔍 Searching for ${settings.type}s in ${settings.region || AB_COUNTRY_NAMES[settings.country]}…</div>`;
+
+  // Scroll panel into view
+  panel.scrollIntoView({ behavior: "smooth", block: "nearest" });
+
+  try {
+    const place = await searchAutoPlace(settings.type, settings.country, settings.region);
+
+    const name    = place.displayName?.text || "Unknown";
+    const address = place.formattedAddress  || "";
+    const rating  = place.rating;
+    const photos  = (place.photos || [])
+      .sort((a, b) => (b.width || 0) - (a.width || 0))
+      .slice(0, 5)
+      .map(p => ({ name: p.name }));
+
+    const typeLabel = settings.type.charAt(0).toUpperCase() + settings.type.slice(1);
+    const regionLabel = settings.region || AB_COUNTRY_NAMES[settings.country] || "Belgium";
+
+    content.innerHTML = `
+      <div class="auto-preview-meta">
+        <span class="auto-preview-type-badge ${settings.type}">${typeLabel}</span>
+        <span class="auto-preview-region">📍 ${regionLabel}</span>
+      </div>
+      <div class="auto-preview-card">
+        <span class="auto-preview-name">${name}</span>
+        <span class="auto-preview-addr">${address}</span>
+        ${rating ? `<span class="auto-preview-rating">⭐ ${rating}</span>` : ""}
+      </div>
+      <div class="auto-preview-photos" id="autoPreviewPhotos"></div>
+      <p class="auto-preview-note">The Auto Bot would generate and post this ${settings.type}.</p>
+    `;
+
+    // Load photos async
+    const photoGrid = document.getElementById("autoPreviewPhotos");
+    if (photoGrid && photos.length) {
+      for (let i = 0; i < photos.length; i++) {
+        const div = document.createElement("div");
+        div.className = "auto-preview-photo";
+        div.innerHTML = `<div class="loading-thumb">…</div>`;
+        photoGrid.appendChild(div);
+
+        resolvePhotoUri(photos[i].name, 400).then(uri => {
+          if (i === 0) {
+            // Apply cover overlay to the first photo
+            createCoverOverlay(uri, name, address).then(overlay => {
+              div.innerHTML = `<img src="${overlay || uri}" alt="Cover" />`;
+            });
+          } else {
+            div.innerHTML = `<img src="${uri}" alt="Photo ${i + 1}" />`;
+          }
+        }).catch(() => { div.innerHTML = `<div class="loading-thumb">—</div>`; });
+      }
+    }
+
+    AppLog.info("Auto Bot preview rendered", { name, type: settings.type });
+  } catch(err) {
+    content.innerHTML = `<div class="auto-preview-error">⚠️ ${err.message}</div>`;
+    AppLog.error("Auto Bot preview failed", err.message);
+  }
+}
+
 // ── Mode selector ────────────────────────────────────────────────────────────
 
 function showMode(mode) {
@@ -1180,6 +1337,12 @@ buildHourSelect("abToH",   10);  // 10:00 PM
     row.classList.toggle("is-random", active);
     btn.textContent = active ? "🎲 Random ✓" : "🎲 Random";
   });
+});
+
+// ── Preview Example Post button ───────────────────────────────────────────────
+document.getElementById("abPreviewBtn")?.addEventListener("click", previewExamplePost);
+document.getElementById("autoPreviewClose")?.addEventListener("click", () => {
+  document.getElementById("autoPreview")?.classList.add("hidden");
 });
 
 // ── Ratings slider live value ─────────────────────────────────────────────────
