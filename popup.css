@@ -329,10 +329,10 @@ h1 { font-size: 0.95rem; font-weight: 700; line-height: 1.2; }
   display: flex; flex-direction: column; gap: 18px;
   padding-bottom: 16px;
 }
-/* Extra breathing room between logical section groups */
-.ab-group + .ab-group { margin-top: 2px; }
-.ab-schedule-section,
-.ab-group:has(#abCapCatchy) { margin-top: 6px; }
+/* Spacing between config groups inside the collapsible body */
+#abConfigBody { display: flex; flex-direction: column; gap: 14px; padding-top: 6px; }
+/* Extra separation before logical section boundaries */
+.ab-schedule-section { margin-top: 4px; }
 
 /* ── Group (label + control) ── */
 .ab-group { display: flex; flex-direction: column; gap: 6px; }
