@@ -24,6 +24,65 @@ const BELGIAN_RESTAURANTS = [
   "Braserie Appelmans Antwerp",     "De Troubadour Bruges",
 ];
 
+// ══════════════════════════════════════════════════════════════════════════════
+// TECHNICAL LOGGER — structured action log for debugging and audit
+// ══════════════════════════════════════════════════════════════════════════════
+
+const TechLog = {
+  _sessionId: `s-${Date.now()}`,
+  _buf: [],
+  _MAX_BUF: 25,
+
+  _entry(level, category, action, details = {}) {
+    const e = {
+      id:        `${Date.now()}-${Math.random().toString(36).slice(2, 6)}`,
+      ts:        new Date().toISOString(),
+      session:   this._sessionId,
+      level,
+      source:    "popup",
+      category,
+      action,
+      ...details,
+    };
+    this._buf.push(e);
+    console.log(`[TechLog] ${level.toUpperCase()} ${category}/${action}`, details);
+    if (this._buf.length >= this._MAX_BUF || level === "error") this._flush();
+    return e;
+  },
+
+  info:  (cat, action, d) => TechLog._entry("info",  cat, action, d),
+  warn:  (cat, action, d) => TechLog._entry("warn",  cat, action, d),
+  error: (cat, action, d) => TechLog._entry("error", cat, action, d),
+
+  _flush() {
+    if (!this._buf.length) return;
+    const toFlush = [...this._buf]; this._buf = [];
+    chrome.storage.local.get({ techLog: [] }, ({ techLog }) => {
+      const updated = [...techLog, ...toFlush].slice(-1000); // keep last 1000 entries
+      chrome.storage.local.set({ techLog: updated });
+    });
+  },
+
+  exportCSV() {
+    chrome.storage.local.get({ techLog: [] }, ({ techLog }) => {
+      const cols = ["id","ts","session","level","source","category","action","platform","status","details","error"];
+      const rows = techLog.map(e => cols.map(c => {
+        const v = e[c];
+        if (v === undefined || v === null) return "";
+        if (typeof v === "object") return `"${JSON.stringify(v).replace(/"/g,'""')}"`;
+        return `"${String(v).replace(/"/g,'""')}"`;
+      }).join(","));
+      const csv  = [cols.join(","), ...rows].join("\n");
+      const slug = new Date().toISOString().slice(0, 10);
+      chrome.runtime.sendMessage({
+        type:     "DOWNLOAD",
+        url:      "data:text/csv;charset=utf-8," + encodeURIComponent(csv),
+        filename: `FoodFluencer/tech_log_${slug}.csv`,
+      });
+    });
+  },
+};
+
 // ── App logger ────────────────────────────────────────────────────────────────
 
 const AppLog = {
@@ -267,12 +326,23 @@ function restoreState(saved) {
 // ── Init ──────────────────────────────────────────────────────────────────────
 
 chrome.storage.local.get(
-  { googleApiKey: "", lastState: null },
-  ({ googleApiKey, lastState }) => {
+  { googleApiKey: "", lastState: null, autoBotActive: false },
+  ({ googleApiKey, lastState, autoBotActive: botActive }) => {
     API_KEY = googleApiKey;
-    showKeySetup(!API_KEY);
-    checkUsageWarning();
-    if (API_KEY && lastState) restoreState(lastState);
+
+    if (botActive) {
+      // Bot is running — skip mode selector, go directly to Auto Bot panel
+      TechLog.info("NAV", "auto_navigate", { reason: "bot_active" });
+      showMode("auto");
+      setTimeout(() => {
+        loadAutoBotConfig();
+        setTimeout(restoreBotActiveState, 80);
+      }, 50);
+    } else {
+      showKeySetup(!API_KEY);
+      checkUsageWarning();
+      if (API_KEY && lastState) restoreState(lastState);
+    }
   }
 );
 
@@ -336,6 +406,8 @@ $("usageStatsBtn").addEventListener("click", () => {
 
 $("exportLogsBtn").addEventListener("click", () => {
   AppLog.info("Export logs requested by user");
+  TechLog._flush(); // flush any pending entries before export
+  TechLog.exportCSV(); // export tech log as CSV
   chrome.storage.local.get(
     { appLog: [], apiLog: [], exportLog: [], totalCost: 0 },
     (data) => {
@@ -1796,6 +1868,7 @@ function activateBot() {
   updateConfigSummary();
 
   AppLog.info("Auto Bot activated", { totalPosts: schedule.totalPosts, platforms });
+  TechLog.info("SCHEDULE", "bot_activated", { totalPosts: schedule.totalPosts, platforms, period: settings.frequency?.period });
 }
 
 function deactivateBot() {
@@ -1804,6 +1877,7 @@ function deactivateBot() {
   chrome.alarms.clearAll();
   updateBotUI(false);
   AppLog.info("Auto Bot deactivated");
+  TechLog.info("SCHEDULE", "bot_deactivated", {});
 }
 
 function updateBotUI(active) {

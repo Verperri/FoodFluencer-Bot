@@ -196,16 +196,21 @@ async function autoPostNow(postIndex) {
   if (!apiKey) { bgLog("error","Auto Bot: no API key configured"); return; }
 
   await updateRunLogStatus(postIndex, "triggered");
+  TechLog.info("POST", "post_start", { postIndex, platforms: post.platforms });
 
   try {
-    // 1 ── Find an entity matching the config
+    // 1 ── Find an entity
+    TechLog.info("SEARCH", "search_start", { type: config.type, country: config.country, region: config.region });
     bgLog("info", `Auto Bot post ${postIndex}: searching for ${config.type||"restaurant"}…`);
-    const place   = await searchAutoPlaceBG(config, apiKey);
+    const t0    = Date.now();
+    const place = await searchAutoPlaceBG(config, apiKey);
     const name    = place.displayName?.text || "";
     const address = place.formattedAddress  || "";
+    TechLog.info("SEARCH", "search_done", { name, address, duration: Date.now()-t0 });
     bgLog("info", `Auto Bot: found "${name}"`);
 
     // 2 ── Resolve photos
+    TechLog.info("MEDIA", "photos_start", { name });
     const allPhotos = (place.photos||[]).sort((a,b)=>(b.width||0)-(a.width||0));
     const minPics   = Math.max(parseInt(config.minPics||"3",10), 3);
     const numPhotos = Math.min(allPhotos.length, 5, Math.max(minPics, 3));
@@ -213,9 +218,12 @@ async function autoPostNow(postIndex) {
       allPhotos.slice(0, numPhotos).map(p => resolvePhotoUriBG(p.name, 900, apiKey))
     );
     const photoDataUrls = await Promise.all(photoUris.map(fetchAsDataUrl));
+    TechLog.info("MEDIA", "photos_done", { count: photoDataUrls.length });
 
     // 3 ── Pick a song
+    TechLog.info("SONG", "song_start", { genre: config.songGenre });
     const songInfo = await getAutoSongBG(config.songGenre||"top100", config.country||"BE").catch(() => null);
+    TechLog.info("SONG", songInfo ? "song_found" : "song_skipped", { song: songInfo?.name, artist: songInfo?.artist });
 
     // 4 ── Build caption
     const captionOpts = {
@@ -227,15 +235,22 @@ async function autoPostNow(postIndex) {
     };
     const caption = getAutoCaptionBG(name, address, config.type||"restaurant",
                                       config.language||"nl", captionOpts, songInfo);
+    TechLog.info("CAPTION", "caption_built", { language: config.language, length: caption.length });
 
     // 5 ── Fetch audio for TikTok
     let tiktokAudioDataUrl = null;
     if (post.platforms.includes("tiktok") && songInfo?.previewUrl) {
-      tiktokAudioDataUrl = await fetchAsDataUrl(songInfo.previewUrl).catch(() => null);
+      TechLog.info("MEDIA", "audio_fetch_start", { previewUrl: songInfo.previewUrl });
+      tiktokAudioDataUrl = await fetchAsDataUrl(songInfo.previewUrl).catch(e => {
+        TechLog.warn("MEDIA", "audio_fetch_failed", { error: e.message });
+        return null;
+      });
+      if (tiktokAudioDataUrl) TechLog.info("MEDIA", "audio_fetch_done", { sizeKB: Math.round(tiktokAudioDataUrl.length * 0.75 / 1024) });
     }
 
     // 6 ── Post to each platform
     for (const platform of post.platforms) {
+      TechLog.info("POST", "platform_start", { platform, postIndex });
       bgLog("info", `Auto Bot: posting to ${platform}…`);
       await handleSocialPost({
         platform, photoDataUrls, caption,
@@ -245,18 +260,45 @@ async function autoPostNow(postIndex) {
         tiktokAudioDataUrl: platform === "tiktok" ? tiktokAudioDataUrl : null,
         autoPost:          true,
       });
+      TechLog.info("POST", "platform_injected", { platform });
       if (post.platforms.indexOf(platform) < post.platforms.length - 1)
         await new Promise(r => setTimeout(r, 4000));
     }
 
     await updateRunLogStatus(postIndex, "done");
+    TechLog.info("POST", "post_complete", { postIndex, name, platforms: post.platforms });
+    TechLog._flush();
     bgLog("info", `Auto Bot post ${postIndex} complete`, { name });
 
   } catch(err) {
+    TechLog.error("POST", "post_failed", { postIndex, error: err.message });
+    TechLog._flush();
     bgLog("error", `Auto Bot post ${postIndex} failed`, err.message);
     await updateRunLogStatus(postIndex, "failed");
   }
 }
+
+// ── Technical logger (background context) ────────────────────────────────────
+const TechLog = {
+  _buf: [],
+  _MAX: 25,
+  _entry(level, cat, action, details = {}) {
+    const e = { id:`${Date.now()}-${Math.random().toString(36).slice(2,5)}`, ts:new Date().toISOString(), level, source:"background", category:cat, action, ...details };
+    this._buf.push(e);
+    if (this._buf.length >= this._MAX || level === "error") this._flush();
+    return e;
+  },
+  info:  (c,a,d) => TechLog._entry("info",  c,a,d||{}),
+  warn:  (c,a,d) => TechLog._entry("warn",  c,a,d||{}),
+  error: (c,a,d) => TechLog._entry("error", c,a,d||{}),
+  _flush() {
+    if (!this._buf.length) return;
+    const toFlush = [...this._buf]; this._buf = [];
+    chrome.storage.local.get({ techLog:[] }, ({techLog}) => {
+      chrome.storage.local.set({ techLog:[...techLog,...toFlush].slice(-1000) });
+    });
+  },
+};
 
 // ── Background logger ─────────────────────────────────────────────────────────
 
@@ -1572,19 +1614,48 @@ function injectTikTok(photoDataUrls, caption, songName, location, opts) {
     const note = hasAudio ? ` 🎵 Song baked in.` : '';
 
     if (ttAutoPost) {
-      banner(5, '🤖 Auto-posting…');
-      await sleep(1000);
-      // Find TikTok's Post button at the bottom of the edit screen
-      const postBtn = [...document.querySelectorAll('button, [role="button"]')]
-        .find(el => /^post$/i.test((el.innerText||el.textContent||'').trim()));
+      banner(5, '🤖 Locating Post button…');
+      await sleep(2000); // TikTok may still be enabling the button
+
+      // Full React-compatible click — same sequence that works for the Next button
+      function reactClickEl(el) {
+        el.focus();
+        ['mouseenter','mouseover','mousedown','mouseup','click'].forEach(type =>
+          el.dispatchEvent(new MouseEvent(type, {
+            bubbles:true, cancelable:true, view:window, buttons:1, detail:type==='click'?1:0
+          }))
+        );
+        el.click(); // native click as backup
+      }
+
+      // Try multiple selectors with retries (TikTok may need time to enable the button)
+      let postBtn = null;
+      for (let attempt = 0; attempt < 12 && !postBtn; attempt++) {
+        // Priority: data-e2e attribute → button text → submit type
+        postBtn = document.querySelector('[data-e2e="btn-post"]') ||
+          document.querySelector('button[type="submit"]:not([disabled])') ||
+          [...document.querySelectorAll('button, [role="button"]')]
+            .filter(el => {
+              const r = el.getBoundingClientRect();
+              return r.width > 40 && r.height > 20; // must be visible
+            })
+            .find(el => /^post$/i.test((el.innerText||el.textContent||'').trim()));
+
+        if (!postBtn) {
+          dbg(`Post button not found (attempt ${attempt + 1}/12) — retrying…`);
+          await sleep(800);
+        }
+      }
+
       if (postBtn) {
-        postBtn.click();
-        dbg('Auto-clicked Post on TikTok');
-        await sleep(6000);
+        banner(5, '🤖 Auto-clicking Post…');
+        dbg(`Post button found: <${postBtn.tagName}> data-e2e="${postBtn.getAttribute('data-e2e')}" text="${(postBtn.innerText||'').trim()}"`);
+        reactClickEl(postBtn);
+        await sleep(8000); // TikTok processing + upload time
         banner(5, `✅ Posted to TikTok!${note}`, 'success');
         try { chrome.runtime.sendMessage({ type:"PLATFORM_POST_COMPLETE", platform:"tiktok" }); } catch(_) {}
       } else {
-        banner(5, '⚠️ Could not find Post button', 'warn');
+        banner(5, '⚠️ Post button not found — please click Post manually.', 'warn');
         try { chrome.runtime.sendMessage({ type:"PLATFORM_POST_FAILED", platform:"tiktok" }); } catch(_) {}
       }
     } else {
