@@ -381,8 +381,11 @@ const INJECTORS = {
 
 async function handleSocialPost({ platform, photoDataUrls, caption, songName, location, restaurantName, tiktokAudioDataUrl, autoPost = false }) {
   bgLog('info', `Opening ${platform}`, { photos: photoDataUrls.length, song: songName, location, autoPost });
-  // In auto mode open the tab in the background so it doesn't interrupt the user
-  const tab = await chrome.tabs.create({ url: PLATFORM_URLS[platform], active: !autoPost });
+  // TikTok's upload page REQUIRES an active/focused tab to initialise its upload
+  // handlers and process file input injection. Opening in the background (active:false)
+  // throttles timers and prevents TikTok from processing the injected video file.
+  // Always open as active — this was the V1.4 behaviour that worked correctly.
+  const tab = await chrome.tabs.create({ url: PLATFORM_URLS[platform], active: true });
 
   await new Promise(resolve => {
     function listener(tabId, info) {
@@ -1310,6 +1313,8 @@ function injectTikTok(photoDataUrls, caption, songName, location, opts) {
         const b64   = audioDataUrl.split(',')[1];
         const bytes = Uint8Array.from(atob(b64), c => c.charCodeAt(0));
         const tmpCtx = new (window.AudioContext || window.webkitAudioContext)({ sampleRate: AUDIO_SAMPLE_RATE });
+        // Resume in case the tab was briefly backgrounded (Chrome suspends AudioContext in background tabs)
+        if (tmpCtx.state === 'suspended') { try { await tmpCtx.resume(); } catch(_) {} }
         const audioBuf = await tmpCtx.decodeAudioData(bytes.buffer.slice(0));
         await tmpCtx.close();
 
