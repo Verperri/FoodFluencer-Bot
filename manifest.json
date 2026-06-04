@@ -27,7 +27,13 @@
     "https://itunes.apple.com/*",
     "https://www.instagram.com/*",
     "https://www.facebook.com/*",
-    "https://www.tiktok.com/*"
+    "https://www.tiktok.com/*",
+    "https://www.google.com/maps/*",
+    "https://lh3.googleusercontent.com/*",
+    "https://duckduckgo.com/*",
+    "https://external-content.duckduckgo.com/*",
+    "https://*.yelp.com/*",
+    "https://*.yelpcdn.com/*"
   ],
   "icons": {
     "16":  "icons/icon16.png",
