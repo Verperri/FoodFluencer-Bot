@@ -438,6 +438,110 @@ h1 { font-size: 0.95rem; font-weight: 700; line-height: 1.2; }
   margin-top: 4px; line-height: 1.4;
 }
 
+/* ── Schedule section ── */
+.ab-schedule-section {
+  background: var(--surface); border: 1.5px solid var(--border);
+  border-radius: var(--radius); padding: 12px 12px 10px;
+  display: flex; flex-direction: column; gap: 12px;
+}
+.ab-schedule-section > .ab-label { margin-bottom: 0; }
+
+.ab-sched-field { display: flex; flex-direction: column; gap: 6px; }
+
+.ab-field-hdr {
+  display: flex; align-items: center; justify-content: space-between;
+}
+.ab-field-name {
+  font-size: .72rem; font-weight: 600; color: var(--muted);
+  text-transform: uppercase; letter-spacing: .04em;
+}
+.ab-rand-btn {
+  background: var(--bg); border: 1px solid var(--border);
+  color: var(--muted); border-radius: 20px; cursor: pointer;
+  font-size: .65rem; font-weight: 600; padding: 2px 8px;
+  transition: all .15s; display: flex; align-items: center; gap: 3px;
+}
+.ab-rand-btn:hover { border-color: #9333ea; color: #7c3aed; }
+.ab-rand-btn.is-active {
+  background: #f5f3ff; border-color: #9333ea;
+  color: #7c3aed;
+}
+
+/* Greyed-out row when Random is active */
+.ab-freq-row.is-random,
+.ab-window-row.is-random {
+  opacity: .38; pointer-events: none; user-select: none;
+}
+
+/* Frequency row */
+.ab-freq-row {
+  display: flex; align-items: center; gap: 7px;
+  transition: opacity .2s;
+}
+.ab-num-input {
+  width: 52px; background: var(--bg); border: 1.5px solid var(--border);
+  color: var(--text); border-radius: 8px; padding: 6px 8px;
+  font-size: .82rem; text-align: center; outline: none;
+  transition: border-color .15s;
+}
+.ab-num-input:focus { border-color: var(--accent); }
+.ab-per-text { font-size: .78rem; color: var(--muted); white-space: nowrap; }
+.ab-select--sm { flex: 1; }
+
+/* Window row */
+.ab-window-row {
+  display: flex; align-items: center; gap: 5px; flex-wrap: wrap;
+  transition: opacity .2s;
+}
+.ab-wlabel {
+  font-size: .72rem; font-weight: 700; color: var(--muted);
+  white-space: nowrap;
+}
+.ab-wlabel--to { margin-left: 4px; }
+.ab-tsep { font-size: .78rem; color: var(--muted); }
+.ab-select--xs {
+  padding: 5px 4px; font-size: .76rem; min-width: 0;
+  flex-shrink: 0;
+}
+
+/* ── Activity Log ── */
+.ab-activity-log {
+  background: var(--surface); border: 1px solid var(--border);
+  border-radius: var(--radius); overflow: hidden;
+  margin-top: 4px;
+}
+.ab-log-header {
+  display: flex; align-items: center; justify-content: space-between;
+  padding: 9px 12px; border-bottom: 1px solid var(--border);
+  background: var(--bg);
+}
+.ab-log-title { font-size: .78rem; font-weight: 700; color: var(--text); }
+.ab-log-period { font-size: .68rem; color: var(--muted); }
+.ab-log-items { padding: 4px 0; }
+.ab-log-item {
+  display: flex; align-items: center; justify-content: space-between;
+  padding: 7px 12px; border-bottom: 1px solid var(--border);
+}
+.ab-log-item:last-child { border-bottom: none; }
+.ab-log-platform {
+  display: flex; align-items: center; gap: 7px;
+  font-size: .78rem; color: var(--text);
+}
+.ab-log-count {
+  font-size: .74rem; font-weight: 600; color: var(--muted);
+  background: var(--surface2); border-radius: 10px;
+  padding: 2px 8px;
+}
+.ab-log-total {
+  display: flex; align-items: center; justify-content: space-between;
+  padding: 8px 12px; background: var(--bg);
+  border-top: 1px solid var(--border);
+  font-size: .75rem; color: var(--muted);
+}
+.ab-log-total-val {
+  font-size: .78rem; font-weight: 700; color: var(--text);
+}
+
 /* ── Schedule button ── */
 .ab-actions { margin-top: 4px; }
 .btn--schedule {

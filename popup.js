@@ -1152,6 +1152,36 @@ document.getElementById("abCountry")?.addEventListener("change", e => {
   });
 });
 
+// ── Schedule: populate hour selects and set defaults ─────────────────────────
+function buildHourSelect(selectId, defaultHour) {
+  const sel = document.getElementById(selectId);
+  if (!sel) return;
+  for (let h = 1; h <= 12; h++) {
+    const opt = document.createElement("option");
+    opt.value = String(h).padStart(2, "0");
+    opt.textContent = String(h).padStart(2, "0");
+    if (h === defaultHour) opt.selected = true;
+    sel.appendChild(opt);
+  }
+}
+buildHourSelect("abFromH", 5);   // 05:00 PM
+buildHourSelect("abToH",   10);  // 10:00 PM
+
+// ── Random button toggles (greys out the field row) ───────────────────────────
+[
+  { btnId: "abFreqRand",   rowId: "abFreqRow"   },
+  { btnId: "abWindowRand", rowId: "abWindowRow" },
+].forEach(({ btnId, rowId }) => {
+  const btn = document.getElementById(btnId);
+  const row = document.getElementById(rowId);
+  if (!btn || !row) return;
+  btn.addEventListener("click", () => {
+    const active = btn.classList.toggle("is-active");
+    row.classList.toggle("is-random", active);
+    btn.textContent = active ? "🎲 Random ✓" : "🎲 Random";
+  });
+});
+
 // ── Ratings slider live value ─────────────────────────────────────────────────
 const abSlider = document.getElementById("abMinRatings");
 const abSliderVal = document.getElementById("abMinRatingsVal");

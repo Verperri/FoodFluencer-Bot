@@ -309,6 +309,61 @@
           <p class="ab-preview-hint">See what a generated post will look like based on your settings above</p>
         </div>
 
+        <!-- ── Schedule ─────────────────────────────────────────── -->
+        <div class="ab-group ab-schedule-section">
+          <label class="ab-label">⏰ Schedule</label>
+
+          <!-- Frequency -->
+          <div class="ab-sched-field">
+            <div class="ab-field-hdr">
+              <span class="ab-field-name">Frequency</span>
+              <button class="ab-rand-btn" id="abFreqRand" title="Randomise frequency">🎲 Random</button>
+            </div>
+            <div class="ab-freq-row" id="abFreqRow">
+              <input type="number" id="abFreqNum" class="ab-num-input" value="1" min="1" max="99" />
+              <span class="ab-per-text">post per</span>
+              <select id="abFreqPeriod" class="ab-select ab-select--sm">
+                <option value="day">Day</option>
+                <option value="week">Week</option>
+                <option value="month">Month</option>
+              </select>
+            </div>
+          </div>
+
+          <!-- Posting Window -->
+          <div class="ab-sched-field">
+            <div class="ab-field-hdr">
+              <span class="ab-field-name">Posting Window</span>
+              <button class="ab-rand-btn" id="abWindowRand" title="Randomise window">🎲 Random</button>
+            </div>
+            <div class="ab-window-row" id="abWindowRow">
+              <span class="ab-wlabel">From</span>
+              <select class="ab-select ab-select--xs" id="abFromH"><!-- JS --></select>
+              <span class="ab-tsep">:</span>
+              <select class="ab-select ab-select--xs" id="abFromM">
+                <option value="00" selected>00</option>
+                <option value="30">30</option>
+              </select>
+              <select class="ab-select ab-select--xs" id="abFromAP">
+                <option value="AM">AM</option>
+                <option value="PM" selected>PM</option>
+              </select>
+
+              <span class="ab-wlabel ab-wlabel--to">To</span>
+              <select class="ab-select ab-select--xs" id="abToH"><!-- JS --></select>
+              <span class="ab-tsep">:</span>
+              <select class="ab-select ab-select--xs" id="abToM">
+                <option value="00" selected>00</option>
+                <option value="30">30</option>
+              </select>
+              <select class="ab-select ab-select--xs" id="abToAP">
+                <option value="AM">AM</option>
+                <option value="PM" selected>PM</option>
+              </select>
+            </div>
+          </div>
+        </div>
+
         <!-- ── Post to Social Media ─────────────────────────────── -->
         <div class="ab-group">
           <label class="ab-label">Post to Social Media <span class="ab-label-hint">(multi-select)</span></label>
@@ -347,6 +402,53 @@
             <span class="ab-coming-soon">coming soon</span>
           </button>
         </div>
+
+      <!-- ── Activity Log ─────────────────────────────────────── -->
+      <div class="ab-activity-log">
+        <div class="ab-log-header">
+          <span class="ab-log-title">📊 Activity Log</span>
+          <span class="ab-log-period">Last 30 days</span>
+        </div>
+        <div class="ab-log-items">
+
+          <div class="ab-log-item">
+            <div class="ab-log-platform">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" width="16" height="16">
+                <rect x="2" y="2" width="20" height="20" rx="5" ry="5"/>
+                <circle cx="12" cy="12" r="4.5"/>
+                <circle cx="17.5" cy="6.5" r="1" fill="currentColor" stroke="none"/>
+              </svg>
+              Instagram
+            </div>
+            <span class="ab-log-count">0 posts</span>
+          </div>
+
+          <div class="ab-log-item">
+            <div class="ab-log-platform">
+              <svg viewBox="0 0 24 24" fill="currentColor" width="16" height="16">
+                <path d="M18 2h-3a5 5 0 0 0-5 5v3H7v4h3v8h4v-8h3l1-4h-4V7a1 1 0 0 1 1-1h3z"/>
+              </svg>
+              Facebook
+            </div>
+            <span class="ab-log-count">0 posts</span>
+          </div>
+
+          <div class="ab-log-item">
+            <div class="ab-log-platform">
+              <svg viewBox="0 0 24 24" fill="currentColor" width="16" height="16">
+                <path d="M19.59 6.69a4.83 4.83 0 0 1-3.77-4.25V2h-3.45v13.67a2.89 2.89 0 0 1-2.88 2.5 2.89 2.89 0 0 1-2.89-2.89 2.89 2.89 0 0 1 2.89-2.89c.28 0 .54.04.79.1V9.01a6.33 6.33 0 0 0-.79-.05 6.34 6.34 0 0 0-6.34 6.34 6.34 6.34 0 0 0 6.34 6.34 6.34 6.34 0 0 0 6.33-6.34V8.73a8.18 8.18 0 0 0 4.78 1.52V6.8a4.85 4.85 0 0 1-1.01-.11z"/>
+              </svg>
+              TikTok
+            </div>
+            <span class="ab-log-count">0 posts</span>
+          </div>
+
+        </div>
+        <div class="ab-log-total">
+          <span>Total published</span>
+          <strong class="ab-log-total-val">0 posts</strong>
+        </div>
+      </div>
 
       </div><!-- /autobot-body -->
     </div><!-- /autoMode -->
