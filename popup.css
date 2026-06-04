@@ -322,13 +322,17 @@ h1 { font-size: 0.95rem; font-weight: 700; line-height: 1.2; }
    ══════════════════════════════════════════════════════════════════ */
 
 .autobot-intro {
-  font-size: .78rem; color: var(--muted); margin-bottom: 6px;
+  font-size: .78rem; color: var(--muted); margin-bottom: 2px;
   line-height: 1.5;
 }
 .autobot-body {
-  display: flex; flex-direction: column; gap: 14px;
+  display: flex; flex-direction: column; gap: 18px;
   padding-bottom: 16px;
 }
+/* Extra breathing room between logical section groups */
+.ab-group + .ab-group { margin-top: 2px; }
+.ab-schedule-section,
+.ab-group:has(#abCapCatchy) { margin-top: 6px; }
 
 /* ── Group (label + control) ── */
 .ab-group { display: flex; flex-direction: column; gap: 6px; }

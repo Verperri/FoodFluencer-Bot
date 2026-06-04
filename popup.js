@@ -1775,6 +1775,12 @@ function activateBot() {
   if (document.getElementById("abSocialTT")?.classList.contains("active")) platforms.push("tiktok");
   if (!platforms.length) { alert("Please select at least one social media platform."); return; }
 
+  // Collapse config immediately so the user gets visual feedback right away
+  const cfgBody  = document.getElementById("abConfigBody");
+  const cfgArrow = document.getElementById("abConfigArrow");
+  cfgBody?.classList.add("collapsed");
+  cfgArrow?.classList.add("collapsed");
+
   const settings = getAutoBotSettings();
   const schedule = generateAutoBotSchedule(settings);
 
