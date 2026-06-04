@@ -850,22 +850,29 @@ function injectInstagram(photoDataUrls, caption, songName, location, opts) {
         const img = new Image();
         img.onload = () => {
           try {
-            // ── Canvas: cap at 1080px wide, preserve aspect ratio ──────────
+            // ── Canvas: cap at 1080px wide, render at 2× for crisp text ───
+            // Rendering at double resolution prevents blurry text on
+            // high-DPI displays — the JPEG export captures the full
+            // 2× pixels, so Instagram sees a sharp image regardless of device.
             const MAX_W = 1080;
             const srcW = img.naturalWidth  || 1080;
             const srcH = img.naturalHeight || 1080;
             const sc   = Math.min(1, MAX_W / srcW);
-            const W = Math.round(srcW * sc);
+            const W = Math.round(srcW * sc);   // logical size (used for all coordinates)
             const H = Math.round(srcH * sc);
+            const DPR = 2;                     // render at 2× for sharp text
             const cv = document.createElement('canvas');
-            cv.width = W; cv.height = H;
+            cv.width  = W * DPR;
+            cv.height = H * DPR;
             const cx = cv.getContext('2d');
+            cx.scale(DPR, DPR);               // all drawing coords stay in logical pixels
             cx.drawImage(img, 0, 0, W, H);
 
             // ── Luminance: pick darkest of 3 horizontal zones ──────────────
+            // getImageData reads physical canvas pixels, so multiply by DPR.
             function sampleLum(y0, h0) {
               try {
-                const d = cx.getImageData(0, Math.round(y0), W, Math.max(1, Math.round(h0))).data;
+                const d = cx.getImageData(0, Math.round(y0*DPR), W*DPR, Math.max(1, Math.round(h0*DPR))).data;
                 let s = 0, n = 0;
                 for (let i = 0; i < d.length; i += 16) { s += 0.299*d[i]+0.587*d[i+1]+0.114*d[i+2]; n++; }
                 return n ? s/n : 128;
