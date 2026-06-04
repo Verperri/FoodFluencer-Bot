@@ -1222,7 +1222,14 @@ function getAutoBotSettings() {
     song:     document.getElementById("abCapSong")?.checked   ?? true,
   };
 
-  return { country, type, region, minRatings, minStars, minPics, language, songGenre, captionOpts };
+  const sched = getScheduleSettings();
+
+  return {
+    country, type, region, minRatings, minStars, minPics,
+    language, songGenre, captionOpts,
+    frequency: sched.frequency,
+    window:    sched.window,
+  };
 }
 
 // Search Places API with ALL filter parameters baked in (one call)
@@ -1427,6 +1434,309 @@ async function previewExamplePost() {
   }
 }
 
+// ── Auto Bot config persistence ──────────────────────────────────────────────
+// Saves the entire Auto Bot form state to chrome.storage so it survives
+// extension closes and is restored each time the user opens Auto Bot mode.
+
+function saveAutoBotConfig() {
+  const config = {
+    // Entity
+    type:      document.querySelector("#abType .ab-pill.active")?.dataset?.val || "restaurant",
+    country:   document.getElementById("abCountry")?.value   || "BE",
+    // Regions: save which chips are active
+    allRegions:  document.querySelector("#abRegionWrap .all-chip")?.classList.contains("active") ?? true,
+    regions:     [...document.querySelectorAll("#abRegionWrap .ab-region-chip:not(.all-chip)")]
+                   .filter(c => c.classList.contains("active")).map(c => c.textContent.trim()),
+    // Thresholds
+    minRatings:  document.getElementById("abMinRatings")?.value || "100",
+    minStars:    document.querySelector("#abStars .ab-pill.active")?.dataset?.val || "4",
+    minPics:     document.querySelector("#abPics .ab-pill.active")?.dataset?.val || "5",
+    // Song
+    songGenre:   document.getElementById("abSongGenre")?.value || "top100",
+    // Caption
+    language:    document.getElementById("abLanguage")?.value  || "nl",
+    capCatchy:   document.getElementById("abCapCatchy")?.checked ?? true,
+    capName:     document.getElementById("abCapName")?.checked   ?? true,
+    capAddr:     document.getElementById("abCapAddr")?.checked   ?? true,
+    capHash:     document.getElementById("abCapHash")?.checked   ?? true,
+    capSong:     document.getElementById("abCapSong")?.checked   ?? true,
+    // Schedule — frequency
+    freqNum:     document.getElementById("abFreqNum")?.value    || "1",
+    freqPeriod:  document.getElementById("abFreqPeriod")?.value || "day",
+    freqRandom:  document.getElementById("abFreqRand")?.classList.contains("is-active") || false,
+    // Schedule — posting window
+    fromH:       document.getElementById("abFromH")?.value  || "05",
+    fromM:       document.getElementById("abFromM")?.value  || "00",
+    fromAP:      document.getElementById("abFromAP")?.value || "PM",
+    toH:         document.getElementById("abToH")?.value    || "10",
+    toM:         document.getElementById("abToM")?.value    || "00",
+    toAP:        document.getElementById("abToAP")?.value   || "PM",
+    windowRandom: document.getElementById("abWindowRand")?.classList.contains("is-active") || false,
+    // Social platforms
+    socialIG:  document.getElementById("abSocialIG")?.classList.contains("active") ?? true,
+    socialFB:  document.getElementById("abSocialFB")?.classList.contains("active") ?? true,
+    socialTT:  document.getElementById("abSocialTT")?.classList.contains("active") ?? true,
+  };
+  chrome.storage.local.set({ autoBotConfig: config });
+}
+
+function loadAutoBotConfig() {
+  chrome.storage.local.get({ autoBotConfig: null }, ({ autoBotConfig: cfg }) => {
+    if (!cfg) return;
+
+    const pill = (groupId, val) =>
+      document.querySelectorAll(`#${groupId} .ab-pill`)
+        .forEach(p => p.classList.toggle("active", p.dataset.val === val));
+    const sel = (id, val) => { const e = document.getElementById(id); if (e && val) e.value = val; };
+
+    pill("abType",  cfg.type);
+    sel("abCountry", cfg.country);
+    if (cfg.country) {
+      buildRegionChips(cfg.country);
+      setTimeout(() => {
+        if (cfg.allRegions) {
+          document.querySelector("#abRegionWrap .all-chip")?.classList.add("active");
+        } else if (cfg.regions?.length) {
+          document.querySelector("#abRegionWrap .all-chip")?.classList.remove("active");
+          document.querySelectorAll("#abRegionWrap .ab-region-chip:not(.all-chip)")
+            .forEach(c => c.classList.toggle("active", cfg.regions.includes(c.textContent.trim())));
+        }
+      }, 60);
+    }
+    sel("abMinRatings", cfg.minRatings);
+    const sliderVal = document.getElementById("abMinRatingsVal");
+    if (sliderVal && cfg.minRatings) sliderVal.textContent = cfg.minRatings;
+
+    pill("abStars", cfg.minStars);
+    pill("abPics",  cfg.minPics);
+    sel("abSongGenre", cfg.songGenre);
+    sel("abLanguage",  cfg.language);
+
+    const capMap = { abCapCatchy:"capCatchy", abCapName:"capName", abCapAddr:"capAddr", abCapHash:"capHash", abCapSong:"capSong" };
+    Object.entries(capMap).forEach(([id, key]) => {
+      const e = document.getElementById(id);
+      if (e && cfg[key] !== undefined) e.checked = cfg[key];
+    });
+
+    sel("abFreqNum",    cfg.freqNum);
+    sel("abFreqPeriod", cfg.freqPeriod);
+    if (cfg.freqRandom) {
+      document.getElementById("abFreqRand")?.classList.add("is-active");
+      document.getElementById("abFreqRow")?.classList.add("is-random");
+      document.getElementById("abFreqRandHint")?.classList.remove("hidden");
+    }
+
+    sel("abFromH",  cfg.fromH);  sel("abFromM",  cfg.fromM);  sel("abFromAP", cfg.fromAP);
+    sel("abToH",    cfg.toH);    sel("abToM",    cfg.toM);    sel("abToAP",   cfg.toAP);
+    if (cfg.windowRandom) {
+      document.getElementById("abWindowRand")?.classList.add("is-active");
+      document.getElementById("abWindowRow")?.classList.add("is-random");
+      document.getElementById("abWindowRandHint")?.classList.remove("hidden");
+    }
+
+    if (cfg.socialIG !== undefined) document.getElementById("abSocialIG")?.classList.toggle("active", cfg.socialIG);
+    if (cfg.socialFB !== undefined) document.getElementById("abSocialFB")?.classList.toggle("active", cfg.socialFB);
+    if (cfg.socialTT !== undefined) document.getElementById("abSocialTT")?.classList.toggle("active", cfg.socialTT);
+  });
+}
+
+// Debounced save — fires 600ms after last change
+let _abSaveTimer = null;
+function autoBotChanged() {
+  clearTimeout(_abSaveTimer);
+  _abSaveTimer = setTimeout(saveAutoBotConfig, 600);
+}
+
+function initAutoBotPersistence() {
+  const ids = ["abCountry","abLanguage","abSongGenre","abMinRatings","abFreqNum","abFreqPeriod",
+               "abFromH","abFromM","abFromAP","abToH","abToM","abToAP",
+               "abCapCatchy","abCapName","abCapAddr","abCapHash","abCapSong"];
+  ids.forEach(id => {
+    document.getElementById(id)?.addEventListener("change", autoBotChanged);
+    document.getElementById(id)?.addEventListener("input",  autoBotChanged);
+  });
+  ["abType","abStars","abPics"].forEach(id =>
+    document.getElementById(id)?.addEventListener("click", autoBotChanged));
+  document.getElementById("abRegionWrap")?.addEventListener("click", autoBotChanged);
+  ["abSocialIG","abSocialFB","abSocialTT","abFreqRand","abWindowRand"]
+    .forEach(id => document.getElementById(id)?.addEventListener("click", autoBotChanged));
+}
+initAutoBotPersistence();
+
+// ══════════════════════════════════════════════════════════════════════════════
+// AUTO BOT SCHEDULE LOGIC
+// ══════════════════════════════════════════════════════════════════════════════
+
+// Convert 12-hour time components to total minutes since midnight (24h)
+function abTimeTo24hMinutes(hour, minute, ampm) {
+  let h = parseInt(hour, 10) || 12;
+  const m = parseInt(minute, 10) || 0;
+  if (ampm === "AM") { if (h === 12) h = 0; }
+  else               { if (h !== 12) h += 12; }
+  return h * 60 + m;
+}
+
+// Format minutes-since-midnight as "HH:MM"
+function abMinutesToHHMM(mins) {
+  const h = Math.floor(mins / 60) % 24;
+  const m = mins % 60;
+  return `${String(h).padStart(2,"0")}:${String(m).padStart(2,"0")}`;
+}
+
+// Format a Date as "YYYY-MM-DD"
+function abFormatDate(date) {
+  return `${date.getFullYear()}-${String(date.getMonth()+1).padStart(2,"0")}-${String(date.getDate()).padStart(2,"0")}`;
+}
+
+// Pick `count` random times within a window, returned sorted
+function abRandomTimesInWindow(count, startMin, endMin) {
+  if (count <= 0) return [];
+  const range = Math.max(0, endMin - startMin);
+  return Array.from({ length: count }, () => {
+    const m = startMin + Math.floor(Math.random() * (range + 1));
+    return abMinutesToHHMM(m);
+  }).sort();
+}
+
+// Calculate window bounds from form or random
+function abGetWindowMinutes(windowCfg) {
+  if (windowCfg.isRandom) return { start: 0, end: 1439 }; // full day
+  const start = abTimeTo24hMinutes(windowCfg.fromH, windowCfg.fromM, windowCfg.fromAP);
+  const end   = abTimeTo24hMinutes(windowCfg.toH,   windowCfg.toM,   windowCfg.toAP);
+  // Handle overnight windows (e.g. 10 PM → 2 AM)
+  return { start, end: end >= start ? end : end + 1440 };
+}
+
+// Distribute `total` posts across `numDays` days respecting maxPerDay
+// Returns array of per-day counts
+function abDistributePostsAcrossDays(total, numDays, maxPerDay = 2) {
+  const perDay = new Array(numDays).fill(0);
+  let remaining = Math.min(total, maxPerDay * numDays);
+  let attempts = 0;
+  while (remaining > 0 && attempts < 10000) {
+    const d = Math.floor(Math.random() * numDays);
+    if (perDay[d] < maxPerDay) { perDay[d]++; remaining--; }
+    attempts++;
+  }
+  return perDay;
+}
+
+/**
+ * Generate the full posting schedule based on Auto Bot settings.
+ *
+ * Returns an object with:
+ *   - posts[]:  { date (YYYY-MM-DD), time (HH:MM), platforms[], dayOfWeek }
+ *   - summary:  human-readable description
+ *   - totalPosts, period, generatedAt
+ *
+ * This is PURE LOGIC — no API calls, no actual posting.
+ * Saved to chrome.storage as 'autoBotSchedule' for the scheduling engine to consume.
+ */
+function generateAutoBotSchedule(settings) {
+  const { frequency: freq, window: win, country } = settings;
+  const platforms = [];
+  if (document.getElementById("abSocialIG")?.classList.contains("active")) platforms.push("instagram");
+  if (document.getElementById("abSocialFB")?.classList.contains("active")) platforms.push("facebook");
+  if (document.getElementById("abSocialTT")?.classList.contains("active")) platforms.push("tiktok");
+
+  const winBounds = abGetWindowMinutes(win);
+
+  // Determine actual post count
+  let totalPosts;
+  if (freq.isRandom) {
+    // Random caps: max 2/day, max 20/week
+    const maxMap = { day: 2, week: 20, month: 40 };
+    const maxForPeriod = maxMap[freq.period] || 20;
+    totalPosts = Math.floor(Math.random() * maxForPeriod) + 1;
+  } else {
+    totalPosts = Math.max(1, freq.count);
+  }
+
+  const today = new Date();
+  today.setHours(0, 0, 0, 0);
+  const posts = [];
+
+  if (freq.period === "day") {
+    // Repeat `totalPosts` per day for the next 7 days
+    for (let d = 0; d < 7; d++) {
+      const date = new Date(today); date.setDate(today.getDate() + d);
+      const times = abRandomTimesInWindow(totalPosts, winBounds.start, winBounds.end);
+      times.forEach(time => posts.push({
+        date: abFormatDate(date), time, platforms,
+        dayOfWeek: date.toLocaleDateString("en-US", { weekday: "short" }),
+      }));
+    }
+  } else if (freq.period === "week") {
+    // Distribute across Mon–Sun of the current week
+    const monday = new Date(today);
+    monday.setDate(today.getDate() - ((today.getDay() + 6) % 7));
+    const perDay = abDistributePostsAcrossDays(totalPosts, 7, 2);
+    for (let d = 0; d < 7; d++) {
+      if (perDay[d] === 0) continue;
+      const date = new Date(monday); date.setDate(monday.getDate() + d);
+      const times = abRandomTimesInWindow(perDay[d], winBounds.start, winBounds.end);
+      times.forEach(time => posts.push({
+        date: abFormatDate(date), time, platforms,
+        dayOfWeek: date.toLocaleDateString("en-US", { weekday: "short" }),
+      }));
+    }
+  } else if (freq.period === "month") {
+    // Distribute across next 30 days
+    const perDay = abDistributePostsAcrossDays(totalPosts, 30, 2);
+    for (let d = 0; d < 30; d++) {
+      if (perDay[d] === 0) continue;
+      const date = new Date(today); date.setDate(today.getDate() + d);
+      const times = abRandomTimesInWindow(perDay[d], winBounds.start, winBounds.end);
+      times.forEach(time => posts.push({
+        date: abFormatDate(date), time, platforms,
+        dayOfWeek: date.toLocaleDateString("en-US", { weekday: "short" }),
+      }));
+    }
+  }
+
+  // Sort chronologically
+  posts.sort((a, b) => `${a.date}${a.time}`.localeCompare(`${b.date}${b.time}`));
+
+  const result = {
+    generatedAt: new Date().toISOString(),
+    period: freq.period,
+    frequencyIsRandom: freq.isRandom,
+    windowIsRandom: win.isRandom,
+    totalPosts: posts.length,
+    platforms,
+    posts,
+  };
+
+  // Persist the schedule
+  chrome.storage.local.set({ autoBotSchedule: result });
+  AppLog.info("Auto Bot schedule generated", {
+    totalPosts: posts.length, period: freq.period,
+    platforms, windowRandom: win.isRandom,
+  });
+
+  return result;
+}
+
+// Helper: get frequency + window settings from current form state
+function getScheduleSettings() {
+  return {
+    frequency: {
+      count:    parseInt(document.getElementById("abFreqNum")?.value    || "1",   10),
+      period:   document.getElementById("abFreqPeriod")?.value          || "day",
+      isRandom: document.getElementById("abFreqRand")?.classList.contains("is-active") || false,
+    },
+    window: {
+      fromH:    document.getElementById("abFromH")?.value  || "05",
+      fromM:    document.getElementById("abFromM")?.value  || "00",
+      fromAP:   document.getElementById("abFromAP")?.value || "PM",
+      toH:      document.getElementById("abToH")?.value    || "10",
+      toM:      document.getElementById("abToM")?.value    || "00",
+      toAP:     document.getElementById("abToAP")?.value   || "PM",
+      isRandom: document.getElementById("abWindowRand")?.classList.contains("is-active") || false,
+    },
+  };
+}
+
 // ── Mode selector ────────────────────────────────────────────────────────────
 
 function showMode(mode) {
@@ -1444,7 +1754,7 @@ function showMode(mode) {
 }
 
 document.getElementById("btnManualMode").addEventListener("click", () => showMode("manual"));
-document.getElementById("btnAutoMode").addEventListener("click",   () => showMode("auto"));
+document.getElementById("btnAutoMode").addEventListener("click",   () => { showMode("auto"); loadAutoBotConfig(); });
 document.getElementById("manualBackBtn").addEventListener("click", () => showMode("selector"));
 document.getElementById("autoBackBtn").addEventListener("click",   () => showMode("selector"));
 
@@ -1558,16 +1868,18 @@ buildHourSelect("abToH",   10);  // 10:00 PM
 
 // ── Random button toggles (greys out the field row) ───────────────────────────
 [
-  { btnId: "abFreqRand",   rowId: "abFreqRow"   },
-  { btnId: "abWindowRand", rowId: "abWindowRow" },
-].forEach(({ btnId, rowId }) => {
-  const btn = document.getElementById(btnId);
-  const row = document.getElementById(rowId);
+  { btnId: "abFreqRand",   rowId: "abFreqRow",   hintId: "abFreqRandHint"   },
+  { btnId: "abWindowRand", rowId: "abWindowRow", hintId: "abWindowRandHint" },
+].forEach(({ btnId, rowId, hintId }) => {
+  const btn  = document.getElementById(btnId);
+  const row  = document.getElementById(rowId);
+  const hint = document.getElementById(hintId);
   if (!btn || !row) return;
   btn.addEventListener("click", () => {
     const active = btn.classList.toggle("is-active");
     row.classList.toggle("is-random", active);
     btn.textContent = active ? "🎲 Random ✓" : "🎲 Random";
+    if (hint) hint.classList.toggle("hidden", !active);
   });
 });
 

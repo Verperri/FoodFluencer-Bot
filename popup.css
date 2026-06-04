@@ -427,6 +427,16 @@ h1 { font-size: 0.95rem; font-weight: 700; line-height: 1.2; }
 }
 .ab-checkbox input:checked + span { color: var(--text); font-weight: 600; }
 
+/* ── Field hint text (replaces title-tooltip) ── */
+.ab-field-hint {
+  font-size: .68rem; color: var(--muted); line-height: 1.4;
+  margin-top: 3px;
+}
+.ab-rand-hint {
+  color: #7c3aed; background: #f5f3ff; border-radius: 6px;
+  padding: 4px 8px; margin-bottom: 3px;
+}
+
 /* ── Language row inside Caption Content ── */
 .ab-caption-lang-row {
   display: flex; align-items: center; gap: 8px; margin-bottom: 8px;
