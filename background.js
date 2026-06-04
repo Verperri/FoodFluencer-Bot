@@ -513,10 +513,11 @@ function injectFacebook(photoDataUrls, caption, songName, location, opts) {
         ${n}/${total}
       </span>
       <span style="font-weight:400;flex:1">${html}</span>
-      <button onclick="document.getElementById('ffbot-banner').remove()"
+      <button id="ffbot-close-btn"
         style="background:rgba(255,255,255,.22);border:none;color:#fff;border-radius:5px;
         padding:3px 9px;cursor:pointer;white-space:nowrap;flex-shrink:0">✕ Close</button>`;
     document.body.prepend(b);
+    b.querySelector('#ffbot-close-btn')?.addEventListener('click', () => b.remove());
   }
 
   /* ── main flow ── */
@@ -718,13 +719,14 @@ function injectInstagram(photoDataUrls, caption, songName, location, opts) {
           <span id="ffbot-step" style="background:rgba(255,255,255,.22);border-radius:20px;
             padding:1px 8px;font-size:.72rem"></span>
           <span id="ffbot-msg" style="font-weight:400;flex:1"></span>
-          <button onclick="document.getElementById('ffbot-banner').remove()"
+          <button id="ffbot-close-btn"
             style="background:rgba(255,255,255,.22);border:none;color:#fff;
             border-radius:5px;padding:3px 9px;cursor:pointer;flex-shrink:0">✕</button>
         </div>
         <div id="ffbot-log" style="font-size:.7rem;opacity:.8;line-height:1.5;
           max-height:60px;overflow:hidden"></div>`;
       document.body.prepend(b);
+      b.querySelector('#ffbot-close-btn')?.addEventListener('click', () => b.remove());
     }
     const bg = { info: '#e8490f', success: '#16a34a', warn: '#d97706' }[type] || '#e8490f';
     b.style.background = bg;
@@ -841,7 +843,162 @@ function injectInstagram(photoDataUrls, caption, songName, location, opts) {
     dbg('Upload dialog appeared');
 
     // ══ STEP 2: Inject photos ═════════════════════════════════════════════════
-    const files = photoDataUrls.map((url, i) => dataUrlToFile(url, `restaurant-${i + 1}.jpg`));
+    // Apply cover overlay to the first photo (restaurant name + tagline on darkest zone)
+    // Mirrors the popup.js createCoverOverlay logic — runs here in MAIN world (Canvas access).
+    async function applyCoverOverlay(dataUrl, name, addr) {
+      return new Promise(resolve => {
+        const img = new Image();
+        img.onload = () => {
+          try {
+            // ── Canvas: cap at 1080px wide, render at 2× for crisp text ───
+            // Rendering at double resolution prevents blurry text on
+            // high-DPI displays — the JPEG export captures the full
+            // 2× pixels, so Instagram sees a sharp image regardless of device.
+            const MAX_W = 1080;
+            const srcW = img.naturalWidth  || 1080;
+            const srcH = img.naturalHeight || 1080;
+            const sc   = Math.min(1, MAX_W / srcW);
+            const W = Math.round(srcW * sc);   // logical size (used for all coordinates)
+            const H = Math.round(srcH * sc);
+            const DPR = 2;                     // render at 2× for sharp text
+            const cv = document.createElement('canvas');
+            cv.width  = W * DPR;
+            cv.height = H * DPR;
+            const cx = cv.getContext('2d');
+            cx.scale(DPR, DPR);               // all drawing coords stay in logical pixels
+            cx.drawImage(img, 0, 0, W, H);
+
+            // ── Luminance: pick darkest of 3 horizontal zones ──────────────
+            // getImageData reads physical canvas pixels, so multiply by DPR.
+            function sampleLum(y0, h0) {
+              try {
+                const d = cx.getImageData(0, Math.round(y0*DPR), W*DPR, Math.max(1, Math.round(h0*DPR))).data;
+                let s = 0, n = 0;
+                for (let i = 0; i < d.length; i += 16) { s += 0.299*d[i]+0.587*d[i+1]+0.114*d[i+2]; n++; }
+                return n ? s/n : 128;
+              } catch(_) { return 128; }
+            }
+            const zones = [
+              { lum: sampleLum(0,       H*0.37), centerY: H*0.22 },
+              { lum: sampleLum(H*0.30,  H*0.40), centerY: H*0.50 },
+              { lum: sampleLum(H*0.63,  H*0.37), centerY: H*0.80 },
+            ];
+            const best = zones.reduce((a, b) => a.lum <= b.lum ? a : b);
+
+            // ── Text sizes: use SMALLER dimension as reference ─────────────
+            // Using Math.min(W,H) keeps text proportional regardless of
+            // aspect ratio — landscape photos get smaller text than squares.
+            const ref        = Math.min(W, H);
+            const nameSize   = Math.max(24, Math.round(ref * 0.058));
+            const tagSize    = Math.max(12, Math.round(ref * 0.022));
+            const cornerSize = Math.max(9,  Math.round(ref * 0.013));
+            const gap        = Math.round(nameSize * 0.38);
+            const maxTW      = W * 0.78;  // max text width — prevents overflow
+
+            // ── City + tagline ─────────────────────────────────────────────
+            const cityM = (addr||'').match(/\d{4}\s+([A-Za-zÀ-ÿ\s-]+),\s*Belgium/i);
+            const city  = (cityM?.[1] || (addr||'').split(',')[0] || '').trim();
+            const taglines = [
+              `Discover ${city}'s hidden gem ✨`,
+              `Best kept secret in ${city} 🍽`,
+              `A must-visit in ${city} 📍`,
+              `Taste the best of ${city} 🔥`,
+            ];
+            const tagline = city
+              ? taglines[Math.abs([...(name||'')].reduce((a,c)=>a+c.charCodeAt(0),0)) % taglines.length]
+              : 'Discover this hidden gem ✨';
+
+            // ── Measure name width; split into two lines if too wide ───────
+            cx.font = `400 ${nameSize}px "Cormorant Garamond",Georgia,Palatino,serif`;
+            const nameLines = (() => {
+              if (!name) return [''];
+              if (cx.measureText(name).width <= maxTW) return [name];
+              // Split at the middle space closest to centre
+              const words = name.split(' ');
+              let best2 = [name, ''];
+              let bestDiff = Infinity;
+              for (let i = 1; i < words.length; i++) {
+                const l1 = words.slice(0, i).join(' ');
+                const l2 = words.slice(i).join(' ');
+                const diff = Math.abs(cx.measureText(l1).width - cx.measureText(l2).width);
+                if (diff < bestDiff) { bestDiff = diff; best2 = [l1, l2]; }
+              }
+              return best2;
+            })();
+
+            // ── Total text block height (for centring and vignette) ────────
+            const nameBlockH = nameLines.length > 1
+              ? nameSize * 2 + gap * 0.5
+              : nameSize;
+            const blockH = tagSize + gap + nameBlockH;
+            const padV  = nameSize * 0.9;  // vertical padding around text block
+
+            // ── Vignette: sized to exactly fit the text block + padding ────
+            const vigTop = best.centerY - blockH / 2 - padV;
+            const vigBot = best.centerY + blockH / 2 + padV;
+            const vl = cx.createLinearGradient(0, vigTop, 0, vigBot);
+            vl.addColorStop(0,   'rgba(0,0,0,0.00)');
+            vl.addColorStop(0.3, 'rgba(0,0,0,0.42)');
+            vl.addColorStop(0.7, 'rgba(0,0,0,0.42)');
+            vl.addColorStop(1,   'rgba(0,0,0,0.00)');
+            cx.fillStyle = vl; cx.fillRect(0, 0, W, H);
+
+            // Subtle edge vignette using image diagonal (works for any aspect ratio)
+            const diag = Math.sqrt(W*W + H*H) / 2;
+            const ve = cx.createRadialGradient(W/2, H/2, diag*0.40, W/2, H/2, diag*0.95);
+            ve.addColorStop(0, 'rgba(0,0,0,0.00)');
+            ve.addColorStop(1, 'rgba(0,0,0,0.20)');
+            cx.fillStyle = ve; cx.fillRect(0, 0, W, H);
+
+            // ── Draw text ──────────────────────────────────────────────────
+            cx.fillStyle = '#fff'; cx.textAlign = 'center'; cx.textBaseline = 'top';
+            cx.shadowColor = 'rgba(0,0,0,0.65)'; cx.shadowOffsetX = 0;
+
+            let ty = best.centerY - blockH / 2;
+
+            // Tagline
+            cx.font = `300 italic ${tagSize}px "Cormorant Garamond",Georgia,Palatino,serif`;
+            cx.shadowBlur = Math.round(tagSize * 0.5); cx.shadowOffsetY = 1;
+            cx.fillText(tagline, W/2, ty, maxTW);
+            ty += tagSize + gap;
+
+            // Restaurant name (one or two lines)
+            cx.font = `400 ${nameSize}px "Cormorant Garamond",Georgia,Palatino,serif`;
+            cx.shadowBlur = Math.round(nameSize * 0.22); cx.shadowOffsetY = 2;
+            if (nameLines.length > 1) {
+              cx.fillText(nameLines[0], W/2, ty, maxTW);
+              ty += nameSize + Math.round(gap * 0.5);
+              cx.fillText(nameLines[1], W/2, ty, maxTW);
+            } else {
+              cx.fillText(nameLines[0], W/2, ty, maxTW);
+            }
+
+            // Corner label
+            if (city) {
+              cx.font = `300 ${cornerSize}px "Cormorant Garamond",Georgia,Palatino,serif`;
+              cx.textAlign = 'right'; cx.textBaseline = 'bottom';
+              cx.shadowBlur = 2; cx.shadowOffsetY = 0;
+              cx.fillText(`${city}, Belgium`, W - Math.round(W*0.030), H - Math.round(H*0.022));
+            }
+
+            resolve(cv.toDataURL('image/jpeg', 0.93));
+          } catch(e) {
+            dbg(`Cover overlay failed: ${e.message} — using original`);
+            resolve(dataUrl);
+          }
+        };
+        img.onerror = () => resolve(dataUrl);
+        img.src = dataUrl;
+      });
+    }
+
+    // Build files array — apply cover overlay to first photo only
+    step(2, total, `Applying cover overlay…`);
+    const coveredFirst = (restaurantName && photoDataUrls.length > 0)
+      ? await applyCoverOverlay(photoDataUrls[0], restaurantName, location || '')
+      : photoDataUrls[0];
+    const allUrls = [coveredFirst, ...photoDataUrls.slice(1)];
+    const files = allUrls.map((url, i) => dataUrlToFile(url, `restaurant-${i + 1}.jpg`));
     step(2, total, `Uploading ${files.length} photo${files.length > 1 ? 's' : ''}…`);
 
     let fileInput = null;
@@ -1112,32 +1269,58 @@ function injectInstagram(photoDataUrls, caption, songName, location, opts) {
 
     // ══ STEP 5 (if location): Add location ════════════════════════════════════
     if (location) {
-      await sleep(400);
+      await sleep(600);
       step(5, total, 'Adding location…');
+
+      // Extract the city name from address like "1000 Brussels, Belgium" → "Brussels"
       const cityMatch = location.match(/\d{4}\s+([A-Za-zÀ-ÿ\s-]+),\s*Belgium/i);
       const searchTerm = (cityMatch?.[1] || location.split(',')[0] || location).trim();
       dbg(`Location search term: "${searchTerm}"`);
 
-      let locTrigger = document.querySelector('[aria-label="Add location"],[placeholder*="location" i]');
-      if (!locTrigger) {
-        locTrigger = [...document.querySelectorAll('[role="button"],button,a,input')]
-          .find(el => /add.*(a\s+)?location/i.test(
-            el.getAttribute('aria-label') || el.getAttribute('placeholder') || el.innerText || el.textContent || ''));
-      }
+      // Find the "Add location" trigger — Instagram renders it as a row button
+      const locTrigger = [...document.querySelectorAll('[role="button"],button,div[tabindex="0"],a')]
+        .find(el => /add\s+(a\s+)?location/i.test(
+          el.getAttribute('aria-label') || el.innerText || el.textContent || ''));
+
       if (locTrigger) {
-        dbg(`Location trigger found: ${locTrigger.tagName}`);
-        locTrigger.click(); await sleep(400);
-        const locInput = await waitFor('input[placeholder*="Search" i],input[aria-label*="location" i]', 4000);
+        dbg(`Location trigger: <${locTrigger.tagName}> "${(locTrigger.innerText||'').trim()}"`);
+        reactClick(locTrigger);
+        await sleep(800);
+
+        // Wait for the location search input to appear
+        const locInput = await waitFor(
+          'input[placeholder*="Search" i], input[aria-label*="location" i], input[name*="location" i]',
+          5000
+        );
         if (locInput) {
-          locInput.focus(); await sleep(200);
-          for (const ch of searchTerm) { document.execCommand('insertText', false, ch); await sleep(55); }
-          dbg(`Typed "${searchTerm}" in location field`);
-          await sleep(2000);
-          const firstResult = document.querySelector('[role="option"]:first-child,[role="listitem"]:first-child');
-          if (firstResult) { firstResult.click(); dbg('Selected first location result'); await sleep(500); }
-          else dbg('No location results appeared');
+          reactClick(locInput);
+          await sleep(300);
+          // Type the search term character by character (triggers Instagram's autocomplete)
+          for (const ch of searchTerm) {
+            document.execCommand('insertText', false, ch);
+            await sleep(60);
+          }
+          dbg(`Typed location: "${searchTerm}"`);
+          await sleep(2500); // wait for results to load
+
+          // Click the first result using reactClick
+          const firstResult = [...document.querySelectorAll(
+            '[role="option"], [role="listitem"], [class*="Location"] [role="button"]'
+          )].find(el => isVisible(el));
+          if (firstResult) {
+            dbg(`Location result: "${(firstResult.innerText||'').trim().slice(0,50)}"`);
+            reactClick(firstResult);
+            await sleep(700);
+            step(5, total, `📍 Location set`);
+          } else {
+            dbg('No location results — skipping');
+          }
+        } else {
+          dbg('Location input not found after trigger click');
         }
-      } else { dbg('Location trigger not found'); }
+      } else {
+        dbg('Location trigger not found on page');
+      }
     }
 
     // ══ STEP 7: Search for restaurant as collaborator ════════════════════════
@@ -1198,18 +1381,82 @@ function injectInstagram(photoDataUrls, caption, songName, location, opts) {
     // ══ Final: auto-click Share (auto mode) or wait for user (manual mode) ═══
     const { autoPost = false } = opts || {};
     if (autoPost) {
-      step(total, total, '🤖 Auto-sharing…');
-      await sleep(800);
-      // Find the Share button (Instagram's final submit)
-      const shareBtn = await waitForBtn(/^(share|delen|partager|teilen)$/i, 10000);
+      step(total, total, '🤖 Finding Share button…');
+      await sleep(600);
+
+      // Share sits in the same top-right header position as the Next buttons.
+      // Use the same strategy: text match first, then aria-label, always topmost.
+      const SHARE_RE = /^(share|delen|partager|teilen|condividi|compartir|публикувам|dela)$/i;
+
+      function findVisibleShareBtn() {
+        const dialog = document.querySelector('[role="dialog"]');
+        const roots  = [dialog, document.body].filter(Boolean);
+
+        // ① Text match — exact "Share" visible inside the dialog header
+        for (const root of roots) {
+          const btn = [...root.querySelectorAll('[role="button"],button,[tabindex="0"],a')]
+            .find(el => {
+              const txt = (el.innerText || el.textContent || '').trim();
+              return SHARE_RE.test(txt) && isVisible(el);
+            });
+          if (btn) {
+            dbg(`Share btn by text: "${(btn.innerText||btn.textContent||'').trim()}"`);
+            return btn;
+          }
+        }
+
+        // ② aria-label fallback — pick topmost inside dialog
+        if (dialog) {
+          const candidates = [...dialog.querySelectorAll('[role="button"],button,[tabindex="0"],a')]
+            .filter(el => SHARE_RE.test(el.getAttribute('aria-label') || '') && isVisible(el))
+            .sort((a, b) => a.getBoundingClientRect().top - b.getBoundingClientRect().top);
+          if (candidates.length) {
+            dbg(`Share btn by aria-label: "${candidates[0].getAttribute('aria-label')}"`);
+            return candidates[0];
+          }
+        }
+        return null;
+      }
+
+      // Poll up to 15 s — location/collab steps may still be animating
+      let shareBtn = null;
+      const shareDeadline = Date.now() + 15000;
+      while (!shareBtn && Date.now() < shareDeadline) {
+        shareBtn = findVisibleShareBtn();
+        if (!shareBtn) await sleep(400);
+      }
+
       if (shareBtn) {
-        shareBtn.click();
-        dbg('Auto-clicked Share on Instagram');
-        await sleep(5000);
-        step(total, total, '✅ Posted to Instagram!', 'success');
+        step(total, total, '🤖 Auto-clicking Share…');
+        reactClick(shareBtn);
+        dbg('Fired reactClick on Share button');
+
+        // Poll for Instagram's success confirmation message (up to 20 s).
+        // Instagram shows "Your post has been shared" in the dialog after posting.
+        // If we see it → confirmed success.  If we time out → optimistic success.
+        step(total, total, '⏳ Waiting for post confirmation…');
+        const SUCCESS_RE = /your post has been shared|post.*shared|shared.*successfully|je bericht is gedeeld|bericht.*gedeeld/i;
+        let postConfirmed = false;
+        const confirmDeadline = Date.now() + 20000;
+        while (Date.now() < confirmDeadline) {
+          await sleep(500);
+          const pageText = document.body.innerText || '';
+          if (SUCCESS_RE.test(pageText)) {
+            postConfirmed = true;
+            dbg('Instagram confirmed: "Your post has been shared"');
+            break;
+          }
+        }
+
+        if (postConfirmed) {
+          step(total, total, '✅ Instagram confirmed: post shared!', 'success');
+        } else {
+          dbg('Confirmation text not found within 20 s — assuming success');
+          step(total, total, '✅ Posted to Instagram!', 'success');
+        }
         document.dispatchEvent(new CustomEvent('__ffbot_complete', { detail:{ platform:'instagram' } }));
       } else {
-        step(total, total, '⚠️ Could not find Share button', 'warn');
+        step(total, total, '⚠️ Share button not found — click it manually.', 'warn');
         document.dispatchEvent(new CustomEvent('__ffbot_failed', { detail:{ platform:'instagram', error:'Share button not found' } }));
       }
     } else {
@@ -1250,11 +1497,12 @@ function injectTikTok(photoDataUrls, caption, songName, location, opts) {
         <strong>🍽️ FoodFluencer</strong>
         <span style="background:rgba(255,255,255,.22);border-radius:20px;padding:1px 8px;font-size:.72rem">${n}/${TOTAL}</span>
         <span style="font-weight:400;flex:1">${html}</span>
-        <button onclick="document.getElementById('ffbot-banner').remove()"
+        <button id="ffbot-close-btn"
           style="background:rgba(255,255,255,.22);border:none;color:#fff;border-radius:5px;padding:3px 9px;cursor:pointer">✕</button>
       </div>
       <div id="ffbot-log" style="font-size:.68rem;opacity:.78;max-height:30px;overflow:hidden"></div>`;
     document.body.prepend(b);
+    b.querySelector('#ffbot-close-btn')?.addEventListener('click', () => b.remove());
   }
   function dbg(msg) {
     const l = document.getElementById('ffbot-log');
