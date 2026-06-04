@@ -764,13 +764,8 @@ h1 { font-size: 0.95rem; font-weight: 700; line-height: 1.2; }
 /* ── Schedule button ── */
 .ab-actions { margin-top: 4px; }
 .btn--schedule {
-  position: relative; opacity: .6; cursor: not-allowed;
   display: flex; align-items: center; justify-content: center; gap: 8px;
-}
-.ab-coming-soon {
-  background: rgba(255,255,255,.25); border-radius: 10px;
-  padding: 1px 7px; font-size: .65rem; font-weight: 700;
-  letter-spacing: .06em; text-transform: uppercase;
+  cursor: pointer;
 }
 
 .hidden { display: none !important; }
