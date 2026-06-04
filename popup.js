@@ -1948,15 +1948,25 @@ function updateConfigSummary() {
   el.textContent = `${type.charAt(0).toUpperCase() + type.slice(1)} · ${country} · ${region}`;
 }
 
-// Listen for alarm triggers from background (status update)
+// Listen for status messages from background
 chrome.runtime.onMessage.addListener((msg) => {
-  if (msg.type !== "AUTO_BOT_TRIGGERED") return;
-  updateScheduledItemStatus(msg.logEntry.postIndex, "triggered");
-  chrome.storage.local.get({ autoBotRunLog:[], autoBotSchedule:null }, ({ autoBotRunLog, autoBotSchedule }) => {
-    refreshActivityLog(autoBotRunLog);
-    const done  = autoBotRunLog.filter(e => e.status === "done").length;
-    updateProgress(done, autoBotSchedule?.totalPosts || 0);
-  });
+  if (msg.type === "AUTO_BOT_TRIGGERED") {
+    updateScheduledItemStatus(msg.logEntry.postIndex, "triggered");
+    chrome.storage.local.get({ autoBotRunLog:[], autoBotSchedule:null }, ({ autoBotRunLog, autoBotSchedule }) => {
+      refreshActivityLog(autoBotRunLog);
+      const done = autoBotRunLog.filter(e => e.status === "done").length;
+      updateProgress(done, autoBotSchedule?.totalPosts || 0);
+    });
+  }
+  if (msg.type === "AUTO_BOT_STATUS_UPDATE") {
+    updateScheduledItemStatus(msg.postIndex, msg.status);
+    chrome.storage.local.get({ autoBotRunLog:[], autoBotSchedule:null }, ({ autoBotRunLog, autoBotSchedule }) => {
+      refreshActivityLog(autoBotRunLog);
+      const done = autoBotRunLog.filter(e => e.status === "done").length;
+      updateProgress(done, autoBotSchedule?.totalPosts || 0);
+      if (autoBotSchedule) updateNextPostLabel(autoBotSchedule);
+    });
+  }
 });
 
 // Restore active state whenever Auto Bot mode is opened

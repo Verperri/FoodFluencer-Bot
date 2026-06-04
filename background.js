@@ -35,11 +35,228 @@ chrome.alarms.onAlarm.addListener((alarm) => {
       platforms: post.platforms,
     });
 
-    // ── V1.5: Trigger actual social media posting here ──────────────────────
-    // handleSocialPost({ platform, photoDataUrls, caption, ... }) will be called here
-    // using the autoBotConfig settings to search, pick a song, and post.
+    // Trigger the full auto-posting flow
+    autoPostNow(postIndex);
   });
 });
+
+// ══════════════════════════════════════════════════════════════════════════════
+// AUTO BOT — full posting pipeline (runs in background service worker)
+// ══════════════════════════════════════════════════════════════════════════════
+
+// ── Helpers ───────────────────────────────────────────────────────────────────
+
+const AB_PLACES_SEARCH = "https://places.googleapis.com/v1/places:searchText";
+const AB_PLACES_PHOTO  = "https://places.googleapis.com/v1";
+const AB_ITUNES_SEARCH = "https://itunes.apple.com/search";
+
+const AB_TYPE_QUERY_BG = { restaurant:"restaurant", hotel:"hotel", bar:"bar" };
+const AB_COUNTRY_NAMES_BG = { BE:"Belgium", FR:"France", DE:"Germany", LU:"Luxembourg", NL:"The Netherlands" };
+const AB_BOUNDS_BG = {
+  BE: { low:{latitude:49.5,longitude:2.5},  high:{latitude:51.5,longitude:6.4}  },
+  FR: { low:{latitude:41.3,longitude:-5.1}, high:{latitude:51.1,longitude:9.6}  },
+  DE: { low:{latitude:47.2,longitude:5.9},  high:{latitude:55.1,longitude:15.0} },
+  LU: { low:{latitude:49.4,longitude:5.7},  high:{latitude:50.2,longitude:6.5}  },
+  NL: { low:{latitude:50.7,longitude:3.3},  high:{latitude:53.6,longitude:7.2}  },
+};
+const AB_ITUNES_CC_BG = { BE:"be", FR:"fr", DE:"de", LU:"be", NL:"nl" };
+
+async function getApiKey() {
+  return new Promise(res => chrome.storage.local.get({ googleApiKey:"" }, d => res(d.googleApiKey)));
+}
+
+async function searchAutoPlaceBG(config, apiKey) {
+  const typeQ   = AB_TYPE_QUERY_BG[config.type] || "restaurant";
+  const country = AB_COUNTRY_NAMES_BG[config.country] || "Belgium";
+  const bounds  = AB_BOUNDS_BG[config.country] || AB_BOUNDS_BG.BE;
+  const region  = config.region || "";
+  const locPart = region ? `${region}, ${country}` : country;
+
+  const res = await fetch(AB_PLACES_SEARCH, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      "X-Goog-Api-Key": apiKey,
+      "X-Goog-FieldMask": "places.id,places.displayName,places.formattedAddress,places.rating,places.userRatingCount,places.googleMapsUri,places.photos",
+    },
+    body: JSON.stringify({
+      textQuery: `${typeQ} in ${locPart}`,
+      maxResultCount: 20,
+      minRating: parseFloat(config.minStars || "4"),
+      locationRestriction: { rectangle: bounds },
+    }),
+  });
+  const data = await res.json();
+  if (!data.places?.length) throw new Error(`No ${typeQ}s found in ${locPart}`);
+
+  const minRatings = parseInt(config.minRatings || "100", 10);
+  const minPics    = parseInt(config.minPics    || "3",   10);
+  const filtered   = data.places.filter(p =>
+    (p.userRatingCount || 0) >= minRatings && (p.photos || []).length >= minPics
+  );
+  const pool = filtered.length ? filtered : data.places;
+  return pool[Math.floor(Math.random() * pool.length)];
+}
+
+async function resolvePhotoUriBG(photoName, maxWidth, apiKey) {
+  const res  = await fetch(`${AB_PLACES_PHOTO}/${photoName}/media?maxWidthPx=${maxWidth}&key=${apiKey}&skipHttpRedirect=true`);
+  const data = await res.json();
+  return data.photoUri;
+}
+
+async function fetchAsDataUrl(url) {
+  const res  = await fetch(url);
+  const blob = await res.blob();
+  const ab   = await blob.arrayBuffer();
+  const bytes = new Uint8Array(ab);
+  let binary = "";
+  for (let i = 0; i < bytes.length; i += 8192)
+    binary += String.fromCharCode(...bytes.slice(i, i + 8192));
+  return `data:${blob.type || "image/jpeg"};base64,${btoa(binary)}`;
+}
+
+async function getAutoSongBG(genre, country) {
+  const cc = AB_ITUNES_CC_BG[country] || "be";
+  if (genre === "top100") {
+    try {
+      const feedRes = await fetch(`https://itunes.apple.com/${cc}/rss/topsongs/limit=100/json`);
+      if (feedRes.ok) {
+        const fd      = await feedRes.json();
+        const entries = fd.feed?.entry || [];
+        if (entries.length) {
+          const entry   = entries[Math.floor(Math.random() * entries.length)];
+          const trackId = entry.id?.attributes?.["im:id"];
+          if (trackId) {
+            const lr = await fetch(`https://itunes.apple.com/lookup?id=${trackId}`);
+            if (lr.ok) {
+              const ld    = await lr.json();
+              const track = ld.results?.[0];
+              if (track) return { name:track.trackName, artist:track.artistName, artwork:track.artworkUrl100, previewUrl:track.previewUrl||null, genre:"Top 100" };
+            }
+          }
+        }
+      }
+    } catch(_) {}
+  }
+  const queries = { top100:`top hits ${new Date().getFullYear()}`, pop:"pop hit", socialmedia:`viral trending ${new Date().getFullYear()}` };
+  const labels  = { top100:"Top 100", pop:"Pop", socialmedia:"Social Media" };
+  const res = await fetch(`${AB_ITUNES_SEARCH}?term=${encodeURIComponent(queries[genre]||"pop hit")}&media=music&entity=song&limit=50`);
+  const d   = await res.json();
+  const songs = d.results || [];
+  if (!songs.length) return null;
+  const s = songs[Math.floor(Math.random() * songs.length)];
+  return { name:s.trackName, artist:s.artistName, artwork:s.artworkUrl100, previewUrl:s.previewUrl||null, genre:labels[genre]||genre };
+}
+
+function getAutoCaptionBG(name, address, type, language, captionOpts, songInfo) {
+  const LANG = {
+    en: { opener:(name,t,city,seed) => [`Have you visited ${name} yet? 💬`,`Best ${t} in ${city}? ${name} is worth a visit! 🔥`,`What do you think of ${name}? 👇`,`Discover ${city}'s hidden gem: ${name} ✨`,`Don't miss ${name} in ${city}! 📍`,`Have you tried ${name}? 😍`][seed%6] },
+    nl: { opener:(name,t,city,seed) => [`Ben je al bij ${name}? Laat het weten! 💬`,`Beste ${t} in ${city}? ${name} is een bezoek waard! 🔥`,`Wat vind je van ${name}? 👇`,`Ontdek de parel van ${city}: ${name} ✨`,`Mis ${name} niet als je in ${city} bent! 📍`,`Heb je ${name} al geprobeerd? 😍`][seed%6] },
+    fr: { opener:(name,t,city,seed) => [`Avez-vous visité ${name}? 💬`,`Meilleur ${t} à ${city}? ${name} vaut le détour! 🔥`,`Que pensez-vous de ${name}? 👇`,`Découvrez ${city}: ${name} ✨`,`Ne manquez pas ${name} à ${city}! 📍`,`Avez-vous essayé ${name}? 😍`][seed%6] },
+    de: { opener:(name,t,city,seed) => [`Habt ihr ${name} besucht? 💬`,`Bestes ${t} in ${city}? ${name} ist jeden Besuch wert! 🔥`,`Was denkt ihr über ${name}? 👇`,`Entdeckt das Juwel von ${city}: ${name} ✨`,`Verpasst ${name} in ${city} nicht! 📍`,`Habt ihr ${name} probiert? 😍`][seed%6] },
+  };
+  const cityM  = address.match(/\d{4}\s+([A-Za-zÀ-ÿ\s-]+),/i);
+  const city   = (cityM?.[1] || address.split(",")[0] || "").trim();
+  const seed   = name.split("").reduce((a,c) => a+c.charCodeAt(0), 0);
+  const tLabel = { restaurant:"restaurant", hotel:"hotel", bar:"bar" }[type] || type;
+  const cityTag = city.replace(/\s+/g,"");
+  const lang   = LANG[language] || LANG.en;
+  const parts  = [];
+  if (captionOpts.catchy)  { parts.push(lang.opener(name,tLabel,city,seed)); parts.push(""); }
+  if (captionOpts.name && name)       parts.push(`📍 ${name}`);
+  if (captionOpts.address && address) parts.push(`📌 ${address}`);
+  if ((captionOpts.name||captionOpts.address) && (captionOpts.song||captionOpts.hashtags)) parts.push("");
+  if (captionOpts.song && songInfo)   parts.push(`🎵 ${songInfo.name} – ${songInfo.artist}`);
+  if (captionOpts.hashtags) {
+    const tc = tLabel.charAt(0).toUpperCase() + tLabel.slice(1);
+    parts.push(`\n#${cityTag} #FoodFluencer #${tc}Photography #Foodie #Belgium`);
+  }
+  return parts.join("\n").trim();
+}
+
+async function updateRunLogStatus(postIndex, status) {
+  const d = await chrome.storage.local.get({ autoBotRunLog:[] });
+  const log = d.autoBotRunLog;
+  const entry = log.find(e => e.postIndex === postIndex);
+  if (entry) entry.status = status; else log.push({ postIndex, status, ts:new Date().toISOString() });
+  await chrome.storage.local.set({ autoBotRunLog: log });
+  chrome.runtime.sendMessage({ type:"AUTO_BOT_STATUS_UPDATE", postIndex, status }).catch(() => {});
+}
+
+// ── Main auto-posting function ────────────────────────────────────────────────
+async function autoPostNow(postIndex) {
+  const data = await chrome.storage.local.get(["autoBotActive","autoBotSchedule","autoBotConfig"]);
+  if (!data.autoBotActive) return;
+
+  const post   = data.autoBotSchedule?.posts?.[postIndex];
+  const config = data.autoBotConfig;
+  if (!post || !config) return;
+
+  const apiKey = await getApiKey();
+  if (!apiKey) { bgLog("error","Auto Bot: no API key configured"); return; }
+
+  await updateRunLogStatus(postIndex, "triggered");
+
+  try {
+    // 1 ── Find an entity matching the config
+    bgLog("info", `Auto Bot post ${postIndex}: searching for ${config.type||"restaurant"}…`);
+    const place   = await searchAutoPlaceBG(config, apiKey);
+    const name    = place.displayName?.text || "";
+    const address = place.formattedAddress  || "";
+    bgLog("info", `Auto Bot: found "${name}"`);
+
+    // 2 ── Resolve photos
+    const allPhotos = (place.photos||[]).sort((a,b)=>(b.width||0)-(a.width||0));
+    const minPics   = Math.max(parseInt(config.minPics||"3",10), 3);
+    const numPhotos = Math.min(allPhotos.length, 5, Math.max(minPics, 3));
+    const photoUris = await Promise.all(
+      allPhotos.slice(0, numPhotos).map(p => resolvePhotoUriBG(p.name, 900, apiKey))
+    );
+    const photoDataUrls = await Promise.all(photoUris.map(fetchAsDataUrl));
+
+    // 3 ── Pick a song
+    const songInfo = await getAutoSongBG(config.songGenre||"top100", config.country||"BE").catch(() => null);
+
+    // 4 ── Build caption
+    const captionOpts = {
+      catchy:   config.capCatchy   ?? true,
+      name:     config.capName     ?? true,
+      address:  config.capAddr     ?? true,
+      hashtags: config.capHash     ?? true,
+      song:     config.capSong     ?? true,
+    };
+    const caption = getAutoCaptionBG(name, address, config.type||"restaurant",
+                                      config.language||"nl", captionOpts, songInfo);
+
+    // 5 ── Fetch audio for TikTok
+    let tiktokAudioDataUrl = null;
+    if (post.platforms.includes("tiktok") && songInfo?.previewUrl) {
+      tiktokAudioDataUrl = await fetchAsDataUrl(songInfo.previewUrl).catch(() => null);
+    }
+
+    // 6 ── Post to each platform
+    for (const platform of post.platforms) {
+      bgLog("info", `Auto Bot: posting to ${platform}…`);
+      await handleSocialPost({
+        platform, photoDataUrls, caption,
+        songName:          songInfo?.name || "",
+        location:          address,
+        restaurantName:    name,
+        tiktokAudioDataUrl: platform === "tiktok" ? tiktokAudioDataUrl : null,
+        autoPost:          true,
+      });
+      if (post.platforms.indexOf(platform) < post.platforms.length - 1)
+        await new Promise(r => setTimeout(r, 4000));
+    }
+
+    await updateRunLogStatus(postIndex, "done");
+    bgLog("info", `Auto Bot post ${postIndex} complete`, { name });
+
+  } catch(err) {
+    bgLog("error", `Auto Bot post ${postIndex} failed`, err.message);
+    await updateRunLogStatus(postIndex, "failed");
+  }
+}
 
 // ── Background logger ─────────────────────────────────────────────────────────
 
@@ -85,9 +302,10 @@ const INJECTORS = {
   tiktok:    injectTikTok,
 };
 
-async function handleSocialPost({ platform, photoDataUrls, caption, songName, location, restaurantName, tiktokAudioDataUrl }) {
-  bgLog('info', `Opening ${platform}`, { photos: photoDataUrls.length, song: songName, location, tiktokAudioKB: tiktokAudioDataUrl ? Math.round(tiktokAudioDataUrl.length * 0.75 / 1024) : 0 });
-  const tab = await chrome.tabs.create({ url: PLATFORM_URLS[platform], active: true });
+async function handleSocialPost({ platform, photoDataUrls, caption, songName, location, restaurantName, tiktokAudioDataUrl, autoPost = false }) {
+  bgLog('info', `Opening ${platform}`, { photos: photoDataUrls.length, song: songName, location, autoPost });
+  // In auto mode open the tab in the background so it doesn't interrupt the user
+  const tab = await chrome.tabs.create({ url: PLATFORM_URLS[platform], active: !autoPost });
 
   await new Promise(resolve => {
     function listener(tabId, info) {
@@ -105,13 +323,29 @@ async function handleSocialPost({ platform, photoDataUrls, caption, songName, lo
     await chrome.scripting.executeScript({
       target: { tabId: tab.id },
       func:   INJECTORS[platform],
-      args:   [photoDataUrls, caption, songName || "", location || "", { restaurantName: restaurantName || "", tiktokAudioDataUrl: tiktokAudioDataUrl || null }],
+      args:   [photoDataUrls, caption, songName || "", location || "", { restaurantName: restaurantName || "", tiktokAudioDataUrl: tiktokAudioDataUrl || null, autoPost: autoPost }],
       world:  "MAIN",
     });
     bgLog('info', `Injected script on ${platform}`);
+
+    // In auto mode: close the tab once the injector signals completion (or after timeout)
+    if (autoPost) {
+      await new Promise(resolve => {
+        const timeout = setTimeout(() => { cleanup(); resolve(); }, 90000); // 90s max
+        function cleanup() { clearTimeout(timeout); chrome.runtime.onMessage.removeListener(listener); }
+        function listener(msg, sender) {
+          if ((msg.type === "PLATFORM_POST_COMPLETE" || msg.type === "PLATFORM_POST_FAILED") && sender.tab?.id === tab.id) {
+            cleanup(); resolve();
+          }
+        }
+        chrome.runtime.onMessage.addListener(listener);
+      });
+      setTimeout(() => chrome.tabs.remove(tab.id).catch(() => {}), 3000);
+    }
+
   } catch (err) {
     bgLog('error', `Inject failed on ${platform}`, String(err));
-    console.error(`[FoodFluencer] Inject failed on ${platform}:`, err);
+    if (autoPost) chrome.tabs.remove(tab.id).catch(() => {});
   }
 }
 
@@ -279,8 +513,24 @@ function injectFacebook(photoDataUrls, caption, songName, location, opts) {
     }
     await sleep(400);
 
-    // ⑤  Song hint (optional)
-    if (songName) {
+    // ⑤  Song hint / auto-post
+    const { autoPost: fbAutoPost = false } = opts || {};
+    if (fbAutoPost) {
+      step(4, total, '🤖 Auto-posting…');
+      await sleep(800);
+      // Find Facebook's blue "Post" button inside the open dialog
+      const postBtn = document.querySelector('[aria-label="Post"]') ||
+        [...document.querySelectorAll('[role="button"]')]
+          .find(el => /^post$/i.test((el.innerText||'').trim()));
+      if (postBtn) {
+        postBtn.click();
+        step(4, total, '✅ Posted to Facebook!', 'success');
+        try { chrome.runtime.sendMessage({ type:"PLATFORM_POST_COMPLETE", platform:"facebook" }); } catch(_) {}
+      } else {
+        step(4, total, '⚠️ Could not find Post button', 'warn');
+        try { chrome.runtime.sendMessage({ type:"PLATFORM_POST_FAILED", platform:"facebook" }); } catch(_) {}
+      }
+    } else if (songName) {
       step(5, total, `Add <em>"${songName}"</em> via <strong>Feeling/Activity → Music</strong>, then click <strong>Post</strong>.`, 'success');
     } else {
       step(4, total, `✅ ${files.length} photo${files.length > 1 ? 's' : ''} &amp; caption ready — click <strong>Post</strong> to publish.`, 'success');
@@ -834,12 +1084,30 @@ function injectInstagram(photoDataUrls, caption, songName, location, opts) {
       }
     }
 
-    // ══ Final: stop here, user clicks Share ══════════════════════════════════
-    const songHint = songName ? ` &nbsp;🎵 Tap <strong>Add music</strong> → <em>"${songName}"</em>.` : '';
-    step(total, total,
-      `✅ All ready! Review caption, location &amp; collaborator.${songHint} Click <strong>Share</strong> to publish.`,
-      'success');
-    dbg('Bot stopped — waiting for user to click Share');
+    // ══ Final: auto-click Share (auto mode) or wait for user (manual mode) ═══
+    const { autoPost = false } = opts || {};
+    if (autoPost) {
+      step(total, total, '🤖 Auto-sharing…');
+      await sleep(800);
+      // Find the Share button (Instagram's final submit)
+      const shareBtn = await waitForBtn(/^(share|delen|partager|teilen)$/i, 10000);
+      if (shareBtn) {
+        shareBtn.click();
+        dbg('Auto-clicked Share on Instagram');
+        await sleep(5000);
+        step(total, total, '✅ Posted to Instagram!', 'success');
+        try { chrome.runtime.sendMessage({ type:"PLATFORM_POST_COMPLETE", platform:"instagram" }); } catch(_) {}
+      } else {
+        step(total, total, '⚠️ Could not find Share button', 'warn');
+        try { chrome.runtime.sendMessage({ type:"PLATFORM_POST_FAILED", platform:"instagram" }); } catch(_) {}
+      }
+    } else {
+      const songHint = songName ? ` &nbsp;🎵 Tap <strong>Add music</strong> → <em>"${songName}"</em>.` : '';
+      step(total, total,
+        `✅ All ready! Review caption, location &amp; collaborator.${songHint} Click <strong>Share</strong> to publish.`,
+        'success');
+      dbg('Bot stopped — waiting for user to click Share');
+    }
   })();
 }
 
@@ -1299,13 +1567,30 @@ function injectTikTok(photoDataUrls, caption, songName, location, opts) {
       } else { dbg('Location button not found'); }
     }
 
-    // ── Done ─────────────────────────────────────────────────────────────
+    // ── Done: auto-click Post (auto mode) or wait for user (manual mode) ────
+    const { autoPost: ttAutoPost = false } = opts || {};
     const note = hasAudio ? ` 🎵 Song baked in.` : '';
-    banner(5,
-      `✅ All set!${note} Review &amp; click <strong>Post</strong>.`,
-      'success'
-    );
-    dbg('Bot complete');
+
+    if (ttAutoPost) {
+      banner(5, '🤖 Auto-posting…');
+      await sleep(1000);
+      // Find TikTok's Post button at the bottom of the edit screen
+      const postBtn = [...document.querySelectorAll('button, [role="button"]')]
+        .find(el => /^post$/i.test((el.innerText||el.textContent||'').trim()));
+      if (postBtn) {
+        postBtn.click();
+        dbg('Auto-clicked Post on TikTok');
+        await sleep(6000);
+        banner(5, `✅ Posted to TikTok!${note}`, 'success');
+        try { chrome.runtime.sendMessage({ type:"PLATFORM_POST_COMPLETE", platform:"tiktok" }); } catch(_) {}
+      } else {
+        banner(5, '⚠️ Could not find Post button', 'warn');
+        try { chrome.runtime.sendMessage({ type:"PLATFORM_POST_FAILED", platform:"tiktok" }); } catch(_) {}
+      }
+    } else {
+      banner(5, `✅ All set!${note} Review &amp; click <strong>Post</strong>.`, 'success');
+      dbg('Bot complete');
+    }
   })();
 }
 
