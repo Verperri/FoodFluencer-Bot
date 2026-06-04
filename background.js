@@ -850,20 +850,19 @@ function injectInstagram(photoDataUrls, caption, songName, location, opts) {
         const img = new Image();
         img.onload = () => {
           try {
-            // Normalise to a fixed 1080 px wide canvas regardless of source size.
-            // This ensures font sizes are always proportional to a known reference
-            // dimension — prevents oversized text on large Google Places photos.
+            // ── Canvas: cap at 1080px wide, preserve aspect ratio ──────────
             const MAX_W = 1080;
-            const srcW  = img.naturalWidth  || 1080;
-            const srcH  = img.naturalHeight || 1080;
-            const scale = Math.min(1, MAX_W / srcW);   // never upscale
-            const W = Math.round(srcW * scale);
-            const H = Math.round(srcH * scale);
-            const cv = document.createElement('canvas'); cv.width = W; cv.height = H;
+            const srcW = img.naturalWidth  || 1080;
+            const srcH = img.naturalHeight || 1080;
+            const sc   = Math.min(1, MAX_W / srcW);
+            const W = Math.round(srcW * sc);
+            const H = Math.round(srcH * sc);
+            const cv = document.createElement('canvas');
+            cv.width = W; cv.height = H;
             const cx = cv.getContext('2d');
             cx.drawImage(img, 0, 0, W, H);
 
-            // Luminance sampling — find darkest of top / middle / bottom thirds
+            // ── Luminance: pick darkest of 3 horizontal zones ──────────────
             function sampleLum(y0, h0) {
               try {
                 const d = cx.getImageData(0, Math.round(y0), W, Math.max(1, Math.round(h0))).data;
@@ -873,51 +872,106 @@ function injectInstagram(photoDataUrls, caption, songName, location, opts) {
               } catch(_) { return 128; }
             }
             const zones = [
-              { lum: sampleLum(0,      H*0.37), centerY: H*0.22 },
-              { lum: sampleLum(H*0.30, H*0.40), centerY: H*0.50 },
-              { lum: sampleLum(H*0.63, H*0.37), centerY: H*0.80 },
+              { lum: sampleLum(0,       H*0.37), centerY: H*0.22 },
+              { lum: sampleLum(H*0.30,  H*0.40), centerY: H*0.50 },
+              { lum: sampleLum(H*0.63,  H*0.37), centerY: H*0.80 },
             ];
             const best = zones.reduce((a, b) => a.lum <= b.lum ? a : b);
 
-            // Vignette on chosen zone
-            const vl = cx.createLinearGradient(0, best.centerY-H*0.22, 0, best.centerY+H*0.22);
-            vl.addColorStop(0, 'rgba(0,0,0,0)'); vl.addColorStop(0.5, 'rgba(0,0,0,.48)'); vl.addColorStop(1, 'rgba(0,0,0,0)');
-            cx.fillStyle = vl; cx.fillRect(0,0,W,H);
-            const ve = cx.createRadialGradient(W/2,H/2,H*.18,W/2,H/2,H*.82);
-            ve.addColorStop(0,'rgba(0,0,0,0)'); ve.addColorStop(1,'rgba(0,0,0,.28)');
-            cx.fillStyle = ve; cx.fillRect(0,0,W,H);
+            // ── Text sizes: use SMALLER dimension as reference ─────────────
+            // Using Math.min(W,H) keeps text proportional regardless of
+            // aspect ratio — landscape photos get smaller text than squares.
+            const ref        = Math.min(W, H);
+            const nameSize   = Math.max(24, Math.round(ref * 0.058));
+            const tagSize    = Math.max(12, Math.round(ref * 0.022));
+            const cornerSize = Math.max(9,  Math.round(ref * 0.013));
+            const gap        = Math.round(nameSize * 0.38);
+            const maxTW      = W * 0.78;  // max text width — prevents overflow
 
-            // Text sizes
-            const nameSize   = Math.max(32, Math.round(W * 0.072));
-            const tagSize    = Math.max(16, Math.round(W * 0.028));
-            const cornerSize = Math.max(10, Math.round(W * 0.016));
-            const gap        = Math.round(nameSize * 0.42);
-
+            // ── City + tagline ─────────────────────────────────────────────
             const cityM = (addr||'').match(/\d{4}\s+([A-Za-zÀ-ÿ\s-]+),\s*Belgium/i);
             const city  = (cityM?.[1] || (addr||'').split(',')[0] || '').trim();
-            const taglines = [`Discover ${city}'s hidden gem ✨`,`Best kept secret in ${city} 🍽`,`A must-visit in ${city} 📍`,`Taste the best of ${city} 🔥`];
+            const taglines = [
+              `Discover ${city}'s hidden gem ✨`,
+              `Best kept secret in ${city} 🍽`,
+              `A must-visit in ${city} 📍`,
+              `Taste the best of ${city} 🔥`,
+            ];
             const tagline = city
               ? taglines[Math.abs([...(name||'')].reduce((a,c)=>a+c.charCodeAt(0),0)) % taglines.length]
               : 'Discover this hidden gem ✨';
 
-            let ty = best.centerY - (tagSize + gap + nameSize) / 2;
-            cx.fillStyle='#fff'; cx.textAlign='center'; cx.textBaseline='top';
-            cx.shadowColor='rgba(0,0,0,.72)'; cx.shadowOffsetX=0;
+            // ── Measure name width; split into two lines if too wide ───────
+            cx.font = `400 ${nameSize}px "Cormorant Garamond",Georgia,Palatino,serif`;
+            const nameLines = (() => {
+              if (!name) return [''];
+              if (cx.measureText(name).width <= maxTW) return [name];
+              // Split at the middle space closest to centre
+              const words = name.split(' ');
+              let best2 = [name, ''];
+              let bestDiff = Infinity;
+              for (let i = 1; i < words.length; i++) {
+                const l1 = words.slice(0, i).join(' ');
+                const l2 = words.slice(i).join(' ');
+                const diff = Math.abs(cx.measureText(l1).width - cx.measureText(l2).width);
+                if (diff < bestDiff) { bestDiff = diff; best2 = [l1, l2]; }
+              }
+              return best2;
+            })();
 
-            cx.font=`300 italic ${tagSize}px "Cormorant Garamond",Georgia,Palatino,serif`;
-            cx.shadowBlur=Math.round(tagSize*.55); cx.shadowOffsetY=1;
-            cx.fillText(tagline, W/2, ty);
+            // ── Total text block height (for centring and vignette) ────────
+            const nameBlockH = nameLines.length > 1
+              ? nameSize * 2 + gap * 0.5
+              : nameSize;
+            const blockH = tagSize + gap + nameBlockH;
+            const padV  = nameSize * 0.9;  // vertical padding around text block
+
+            // ── Vignette: sized to exactly fit the text block + padding ────
+            const vigTop = best.centerY - blockH / 2 - padV;
+            const vigBot = best.centerY + blockH / 2 + padV;
+            const vl = cx.createLinearGradient(0, vigTop, 0, vigBot);
+            vl.addColorStop(0,   'rgba(0,0,0,0.00)');
+            vl.addColorStop(0.3, 'rgba(0,0,0,0.42)');
+            vl.addColorStop(0.7, 'rgba(0,0,0,0.42)');
+            vl.addColorStop(1,   'rgba(0,0,0,0.00)');
+            cx.fillStyle = vl; cx.fillRect(0, 0, W, H);
+
+            // Subtle edge vignette using image diagonal (works for any aspect ratio)
+            const diag = Math.sqrt(W*W + H*H) / 2;
+            const ve = cx.createRadialGradient(W/2, H/2, diag*0.40, W/2, H/2, diag*0.95);
+            ve.addColorStop(0, 'rgba(0,0,0,0.00)');
+            ve.addColorStop(1, 'rgba(0,0,0,0.20)');
+            cx.fillStyle = ve; cx.fillRect(0, 0, W, H);
+
+            // ── Draw text ──────────────────────────────────────────────────
+            cx.fillStyle = '#fff'; cx.textAlign = 'center'; cx.textBaseline = 'top';
+            cx.shadowColor = 'rgba(0,0,0,0.65)'; cx.shadowOffsetX = 0;
+
+            let ty = best.centerY - blockH / 2;
+
+            // Tagline
+            cx.font = `300 italic ${tagSize}px "Cormorant Garamond",Georgia,Palatino,serif`;
+            cx.shadowBlur = Math.round(tagSize * 0.5); cx.shadowOffsetY = 1;
+            cx.fillText(tagline, W/2, ty, maxTW);
             ty += tagSize + gap;
 
-            cx.font=`400 ${nameSize}px "Cormorant Garamond",Georgia,Palatino,serif`;
-            cx.shadowBlur=Math.round(nameSize*.26); cx.shadowOffsetY=2;
-            cx.fillText(name||'', W/2, ty);
+            // Restaurant name (one or two lines)
+            cx.font = `400 ${nameSize}px "Cormorant Garamond",Georgia,Palatino,serif`;
+            cx.shadowBlur = Math.round(nameSize * 0.22); cx.shadowOffsetY = 2;
+            if (nameLines.length > 1) {
+              cx.fillText(nameLines[0], W/2, ty, maxTW);
+              ty += nameSize + Math.round(gap * 0.5);
+              cx.fillText(nameLines[1], W/2, ty, maxTW);
+            } else {
+              cx.fillText(nameLines[0], W/2, ty, maxTW);
+            }
 
+            // Corner label
             if (city) {
-              cx.font=`300 ${cornerSize}px "Cormorant Garamond",Georgia,Palatino,serif`;
-              cx.textAlign='right'; cx.textBaseline='bottom';
-              cx.shadowBlur=3; cx.shadowOffsetY=0;
-              cx.fillText(`${city}, Belgium`, W-Math.round(W*.032), H-Math.round(H*.025));
+              cx.font = `300 ${cornerSize}px "Cormorant Garamond",Georgia,Palatino,serif`;
+              cx.textAlign = 'right'; cx.textBaseline = 'bottom';
+              cx.shadowBlur = 2; cx.shadowOffsetY = 0;
+              cx.fillText(`${city}, Belgium`, W - Math.round(W*0.030), H - Math.round(H*0.022));
             }
 
             resolve(cv.toDataURL('image/jpeg', 0.93));
