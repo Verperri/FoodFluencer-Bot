@@ -1739,13 +1739,11 @@ function generateAutoBotSchedule(settings) {
       }));
     }
   } else if (freq.period === "week") {
-    // Distribute across Mon–Sun of the current week
-    const monday = new Date(today);
-    monday.setDate(today.getDate() - ((today.getDay() + 6) % 7));
+    // Distribute across the NEXT 7 days starting from today (never past days)
     const perDay = abDistributePostsAcrossDays(totalPosts, 7, 2);
     for (let d = 0; d < 7; d++) {
       if (perDay[d] === 0) continue;
-      const date = new Date(monday); date.setDate(monday.getDate() + d);
+      const date = new Date(today); date.setDate(today.getDate() + d);
       const times = abRandomTimesInWindow(perDay[d], winBounds.start, winBounds.end);
       times.forEach(time => posts.push({
         date: abFormatDate(date), time, platforms,
@@ -1753,7 +1751,7 @@ function generateAutoBotSchedule(settings) {
       }));
     }
   } else if (freq.period === "month") {
-    // Distribute across next 30 days
+    // Distribute across next 30 days starting from today
     const perDay = abDistributePostsAcrossDays(totalPosts, 30, 2);
     for (let d = 0; d < 30; d++) {
       if (perDay[d] === 0) continue;
@@ -1766,23 +1764,25 @@ function generateAutoBotSchedule(settings) {
     }
   }
 
-  // Sort chronologically
+  // Always sort chronologically and strip any posts already in the past
+  const now = new Date();
   posts.sort((a, b) => `${a.date}${a.time}`.localeCompare(`${b.date}${b.time}`));
+  const futurePosts = posts.filter(p => new Date(`${p.date}T${p.time}:00`) > now);
 
   const result = {
     generatedAt: new Date().toISOString(),
     period: freq.period,
     frequencyIsRandom: freq.isRandom,
     windowIsRandom: win.isRandom,
-    totalPosts: posts.length,
+    totalPosts: futurePosts.length,
     platforms,
-    posts,
+    posts: futurePosts, // always future-only
   };
 
   // Persist the schedule
   chrome.storage.local.set({ autoBotSchedule: result });
   AppLog.info("Auto Bot schedule generated", {
-    totalPosts: posts.length, period: freq.period,
+    totalPosts: futurePosts.length, period: freq.period,
     platforms, windowRandom: win.isRandom,
   });
 
@@ -1883,10 +1883,12 @@ function deactivateBot() {
   updateBotUI(false);
   // Reset schedule-specific UI
   updateProgress(0, 0);
-  const schedBody = document.getElementById("abSchedBody");
-  if (schedBody) schedBody.innerHTML = "";
-  const badge = document.getElementById("abSchedCount");
-  if (badge) badge.textContent = "0";
+  const schedBody  = document.getElementById("abSchedBody");
+  const schedBadge = document.getElementById("abSchedCount");
+  const schedTitle = document.querySelector("#abScheduledSection .ab-collapse-hdr-title");
+  if (schedBody)  schedBody.innerHTML = "";
+  if (schedBadge) schedBadge.textContent = "0";
+  if (schedTitle) schedTitle.textContent = "📅 Scheduled Posts";
   // Refresh activity log from persistent store (unchanged)
   refreshActivityLog();
   AppLog.info("Auto Bot deactivated — schedule cleared, activity log preserved");
@@ -1937,9 +1939,26 @@ function setupScheduleAlarms(schedule) {
 function renderScheduledPosts(schedule) {
   const body  = document.getElementById("abSchedBody");
   const badge = document.getElementById("abSchedCount");
+  const title = document.querySelector("#abScheduledSection .ab-collapse-hdr-title");
   if (!body) return;
-  if (badge) badge.textContent = schedule.posts.length;
+
+  const postCount = schedule?.posts?.length || 0;
+  if (badge) badge.textContent = postCount;
+
+  // Show generation timestamp in the section header
+  if (title && schedule?.generatedAt) {
+    const genTime = new Date(schedule.generatedAt).toLocaleTimeString("en-GB", { hour:"2-digit", minute:"2-digit" });
+    const genDate = new Date(schedule.generatedAt).toLocaleDateString("en-GB", { day:"numeric", month:"short" });
+    title.textContent = `📅 Scheduled Posts — generated ${genDate} at ${genTime}`;
+  }
+
   body.innerHTML = "";
+
+  // Empty state
+  if (!postCount) {
+    body.innerHTML = `<div style="padding:12px;text-align:center;font-size:.75rem;color:var(--muted)">No upcoming posts scheduled</div>`;
+    return;
+  }
 
   // Group by date
   const grouped = {};
