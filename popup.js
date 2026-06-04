@@ -1873,11 +1873,19 @@ function activateBot() {
 
 function deactivateBot() {
   autoBotActive = false;
-  chrome.storage.local.set({ autoBotActive: false });
+  // Clear schedule + run log so the next activation gets a fresh start
+  chrome.storage.local.set({ autoBotActive: false, autoBotSchedule: null, autoBotRunLog: [] });
   chrome.alarms.clearAll();
   updateBotUI(false);
-  AppLog.info("Auto Bot deactivated");
-  TechLog.info("SCHEDULE", "bot_deactivated", {});
+  // Reset all counters and panels
+  updateProgress(0, 0);
+  refreshActivityLog([]);
+  const schedBody = document.getElementById("abSchedBody");
+  if (schedBody) schedBody.innerHTML = "";
+  const badge = document.getElementById("abSchedCount");
+  if (badge) badge.textContent = "0";
+  AppLog.info("Auto Bot deactivated — schedule cleared");
+  TechLog.info("SCHEDULE", "bot_deactivated", { scheduleCleared: true });
 }
 
 function updateBotUI(active) {
