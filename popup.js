@@ -1,4 +1,10 @@
-﻿// ── Constants ─────────────────────────────────────────────────────────────────
+﻿// ── Version footer ────────────────────────────────────────────────────────────
+fetch('version.json').then(r => r.json()).then(v => {
+  const el = document.getElementById('versionFooter');
+  if (el) el.textContent = `${v.branch} · ${v.commit}`;
+}).catch(() => {});
+
+// ── Constants ─────────────────────────────────────────────────────────────────
 
 const PLACES_SEARCH = "https://places.googleapis.com/v1/places:searchText";
 const PLACES_PHOTO  = "https://places.googleapis.com/v1";

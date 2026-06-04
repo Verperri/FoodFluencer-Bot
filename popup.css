@@ -806,3 +806,14 @@ h1 { font-size: 0.95rem; font-weight: 700; line-height: 1.2; }
 }
 
 .hidden { display: none !important; }
+
+/* ── Version footer ──────────────────────────────────────────────────────── */
+.version-footer {
+  text-align: center;
+  font-size: 0.65rem;
+  color: var(--muted);
+  opacity: 0.55;
+  padding: 6px 0 4px;
+  letter-spacing: 0.03em;
+  user-select: none;
+}

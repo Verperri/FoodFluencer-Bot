@@ -270,26 +270,34 @@ async function autoPostNow(postIndex) {
     }
 
     // 6 ── Post to each platform
+    let anyFailed = false;
     for (const platform of post.platforms) {
       TechLog.info("POST", "platform_start", { platform, postIndex });
       bgLog("info", `Auto Bot: posting to ${platform}…`);
-      await handleSocialPost({
+      const result = await handleSocialPost({
         platform, photoDataUrls, caption,
-        songName:          songInfo?.name || "",
-        location:          address,
-        restaurantName:    name,
+        songName:           songInfo?.name || "",
+        location:           address,
+        restaurantName:     name,
         tiktokAudioDataUrl: platform === "tiktok" ? tiktokAudioDataUrl : null,
-        autoPost:          true,
+        autoPost:           true,
       });
-      TechLog.info("POST", "platform_injected", { platform });
+      if (result?.failed) {
+        anyFailed = true;
+        TechLog.error("POST", "platform_post_failed", { platform, postIndex, error: result.error });
+        bgLog("error", `Auto Bot: ${platform} failed — ${result.error}`);
+      } else {
+        TechLog.info("POST", "platform_post_complete", { platform, postIndex });
+      }
       if (post.platforms.indexOf(platform) < post.platforms.length - 1)
         await new Promise(r => setTimeout(r, 4000));
     }
 
-    await updateRunLogStatus(postIndex, "done");
-    TechLog.info("POST", "post_complete", { postIndex, name, platforms: post.platforms });
+    const finalStatus = anyFailed ? "failed" : "done";
+    await updateRunLogStatus(postIndex, finalStatus);
+    TechLog.info("POST", "post_complete", { postIndex, name, platforms: post.platforms, status: finalStatus });
     TechLog._flush();
-    bgLog("info", `Auto Bot post ${postIndex} complete`, { name });
+    bgLog("info", `Auto Bot post ${postIndex} ${finalStatus}`, { name });
 
   } catch(err) {
     TechLog.error("POST", "post_failed", { postIndex, error: err.message });
@@ -400,6 +408,26 @@ async function handleSocialPost({ platform, photoDataUrls, caption, songName, lo
   await new Promise(r => setTimeout(r, 3000));
 
   try {
+    // ── Relay script (ISOLATED world) ───────────────────────────────────────
+    // Injectors run in MAIN world where chrome.runtime is unavailable.
+    // This relay runs in ISOLATED world, listens for custom DOM events
+    // dispatched by the MAIN injector, and forwards them as real messages.
+    await chrome.scripting.executeScript({
+      target: { tabId: tab.id },
+      func: function ffbotRelay() {
+        if (window.__ffbotRelayActive) return;
+        window.__ffbotRelayActive = true;
+        document.addEventListener('__ffbot_complete', e =>
+          chrome.runtime.sendMessage({ type:'PLATFORM_POST_COMPLETE', ...(e.detail||{}) }));
+        document.addEventListener('__ffbot_failed', e =>
+          chrome.runtime.sendMessage({ type:'PLATFORM_POST_FAILED',   ...(e.detail||{}) }));
+        document.addEventListener('__ffbot_event', e =>
+          chrome.runtime.sendMessage(e.detail || {}));
+      },
+      world: "ISOLATED",
+    });
+
+    // ── Main injector (MAIN world) ───────────────────────────────────────────
     await chrome.scripting.executeScript({
       target: { tabId: tab.id },
       func:   INJECTORS[platform],
@@ -408,25 +436,28 @@ async function handleSocialPost({ platform, photoDataUrls, caption, songName, lo
     });
     bgLog('info', `Injected script on ${platform}`);
 
-    // In auto mode: close the tab once the injector signals completion (or after timeout)
+    // ── Wait for completion signal (60 s fallback) ───────────────────────────
     if (autoPost) {
-      await new Promise(resolve => {
-        const timeout = setTimeout(() => { cleanup(); resolve(); }, 90000); // 90s max
+      const result = await new Promise(resolve => {
+        const timeout = setTimeout(() => { cleanup(); resolve({ failed: false }); }, 60000);
         function cleanup() { clearTimeout(timeout); chrome.runtime.onMessage.removeListener(listener); }
         function listener(msg, sender) {
-          if ((msg.type === "PLATFORM_POST_COMPLETE" || msg.type === "PLATFORM_POST_FAILED") && sender.tab?.id === tab.id) {
-            cleanup(); resolve();
-          }
+          if (sender.tab?.id !== tab.id) return;
+          if (msg.type === "PLATFORM_POST_COMPLETE") { cleanup(); resolve({ failed: false }); }
+          if (msg.type === "PLATFORM_POST_FAILED")   { cleanup(); resolve({ failed: true, error: msg.error }); }
         }
         chrome.runtime.onMessage.addListener(listener);
       });
       setTimeout(() => chrome.tabs.remove(tab.id).catch(() => {}), 3000);
+      return result;
     }
 
   } catch (err) {
     bgLog('error', `Inject failed on ${platform}`, String(err));
     if (autoPost) chrome.tabs.remove(tab.id).catch(() => {});
+    return { failed: true, error: String(err) };
   }
+  return { failed: false };
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -605,10 +636,10 @@ function injectFacebook(photoDataUrls, caption, songName, location, opts) {
       if (postBtn) {
         postBtn.click();
         step(4, total, '✅ Posted to Facebook!', 'success');
-        try { chrome.runtime.sendMessage({ type:"PLATFORM_POST_COMPLETE", platform:"facebook" }); } catch(_) {}
+        document.dispatchEvent(new CustomEvent('__ffbot_complete', { detail:{ platform:'facebook' } }));
       } else {
         step(4, total, '⚠️ Could not find Post button', 'warn');
-        try { chrome.runtime.sendMessage({ type:"PLATFORM_POST_FAILED", platform:"facebook" }); } catch(_) {}
+        document.dispatchEvent(new CustomEvent('__ffbot_failed', { detail:{ platform:'facebook', error:'Post button not found' } }));
       }
     } else if (songName) {
       step(5, total, `Add <em>"${songName}"</em> via <strong>Feeling/Activity → Music</strong>, then click <strong>Post</strong>.`, 'success');
@@ -1176,10 +1207,10 @@ function injectInstagram(photoDataUrls, caption, songName, location, opts) {
         dbg('Auto-clicked Share on Instagram');
         await sleep(5000);
         step(total, total, '✅ Posted to Instagram!', 'success');
-        try { chrome.runtime.sendMessage({ type:"PLATFORM_POST_COMPLETE", platform:"instagram" }); } catch(_) {}
+        document.dispatchEvent(new CustomEvent('__ffbot_complete', { detail:{ platform:'instagram' } }));
       } else {
         step(total, total, '⚠️ Could not find Share button', 'warn');
-        try { chrome.runtime.sendMessage({ type:"PLATFORM_POST_FAILED", platform:"instagram" }); } catch(_) {}
+        document.dispatchEvent(new CustomEvent('__ffbot_failed', { detail:{ platform:'instagram', error:'Share button not found' } }));
       }
     } else {
       const songHint = songName ? ` &nbsp;🎵 Tap <strong>Add music</strong> → <em>"${songName}"</em>.` : '';
@@ -1234,7 +1265,7 @@ function injectTikTok(photoDataUrls, caption, songName, location, opts) {
   // ═══════════════════════════════════════════════════════════════════════════
   // Build H.264 MP4 (+ optional AAC audio) entirely inside TikTok's page context
   // ═══════════════════════════════════════════════════════════════════════════
-  async function buildH264MP4(imgDataUrls, audioDataUrl) {
+  async function buildH264MP4(imgDataUrls, audioDataUrl, restaurantName, address) {
     const W = 720, H = 1280, FPS = 25, BITRATE = 2_000_000, SEC = 1.2;
 
     const images = [];
@@ -1252,10 +1283,79 @@ function injectTikTok(photoDataUrls, caption, songName, location, opts) {
     canvas.width = W; canvas.height = H;
     const ctx = canvas.getContext('2d');
 
+    // ── Plain slide (photos 2-N) ─────────────────────────────────────────────
     function drawSlide(img) {
       ctx.fillStyle = '#000'; ctx.fillRect(0, 0, W, H);
       const s = Math.min(W / img.naturalWidth, H / img.naturalHeight);
       ctx.drawImage(img, (W - img.naturalWidth * s) / 2, (H - img.naturalHeight * s) / 2, img.naturalWidth * s, img.naturalHeight * s);
+    }
+
+    // ── Cover slide (first frame) — restaurant name + location overlay ───────
+    // Mirrors popup.js createCoverOverlay logic, adapted for 720×1280 portrait.
+    function drawCoverSlide(img) {
+      ctx.fillStyle = '#000'; ctx.fillRect(0, 0, W, H);
+      const s = Math.min(W / img.naturalWidth, H / img.naturalHeight);
+      const ox = (W - img.naturalWidth * s) / 2, oy = (H - img.naturalHeight * s) / 2;
+      ctx.drawImage(img, ox, oy, img.naturalWidth * s, img.naturalHeight * s);
+
+      // Sample luminance of 3 vertical zones → choose darkest for text placement
+      function sampleLum(y0, h0) {
+        try {
+          const d = ctx.getImageData(0, Math.round(y0), W, Math.max(1, Math.round(h0))).data;
+          let sum = 0, n = 0;
+          for (let i = 0; i < d.length; i += 16) { sum += 0.299*d[i] + 0.587*d[i+1] + 0.114*d[i+2]; n++; }
+          return n > 0 ? sum / n : 128;
+        } catch(_) { return 128; }
+      }
+      const zones = [
+        { lum: sampleLum(0,      H*0.37), centerY: H*0.22 },
+        { lum: sampleLum(H*0.30, H*0.40), centerY: H*0.50 },
+        { lum: sampleLum(H*0.63, H*0.37), centerY: H*0.80 },
+      ];
+      const best = zones.reduce((a, b) => a.lum <= b.lum ? a : b);
+
+      // Vignette centred on the chosen zone
+      const vlin = ctx.createLinearGradient(0, best.centerY - H*0.22, 0, best.centerY + H*0.22);
+      vlin.addColorStop(0,   'rgba(0,0,0,0.00)');
+      vlin.addColorStop(0.5, 'rgba(0,0,0,0.52)');
+      vlin.addColorStop(1,   'rgba(0,0,0,0.00)');
+      ctx.fillStyle = vlin; ctx.fillRect(0, 0, W, H);
+      const vedge = ctx.createRadialGradient(W/2, H/2, H*0.18, W/2, H/2, H*0.82);
+      vedge.addColorStop(0, 'rgba(0,0,0,0.00)');
+      vedge.addColorStop(1, 'rgba(0,0,0,0.28)');
+      ctx.fillStyle = vedge; ctx.fillRect(0, 0, W, H);
+
+      const nameSize   = Math.max(36, Math.round(W * 0.072));
+      const tagSize    = Math.max(18, Math.round(W * 0.028));
+      const cornerSize = Math.max(12, Math.round(W * 0.016));
+      const gap        = Math.round(nameSize * 0.42);
+
+      const cityM = (address || '').match(/\d{4}\s+([A-Za-zÀ-ÿ\s-]+),\s*Belgium/i);
+      const city  = (cityM?.[1] || (address || '').split(',')[0] || '').trim();
+      const taglines = [`Discover ${city}'s hidden gem ✨`, `Best kept secret in ${city} 🍽`, `A must-visit in ${city} 📍`, `Taste the best of ${city} 🔥`];
+      const tagline = city
+        ? taglines[Math.abs([...(restaurantName||'')].reduce((a,c)=>a+c.charCodeAt(0),0)) % taglines.length]
+        : 'Discover this hidden gem ✨';
+
+      let ty = best.centerY - (tagSize + gap + nameSize) / 2;
+      ctx.fillStyle = '#FFF'; ctx.textAlign = 'center'; ctx.textBaseline = 'top';
+      ctx.shadowColor = 'rgba(0,0,0,0.72)'; ctx.shadowOffsetX = 0;
+
+      ctx.font = `300 italic ${tagSize}px "Cormorant Garamond",Georgia,Palatino,serif`;
+      ctx.shadowBlur = Math.round(tagSize * 0.55); ctx.shadowOffsetY = 1;
+      ctx.fillText(tagline, W/2, ty);
+      ty += tagSize + gap;
+
+      ctx.font = `400 ${nameSize}px "Cormorant Garamond",Georgia,Palatino,serif`;
+      ctx.shadowBlur = Math.round(nameSize * 0.26); ctx.shadowOffsetY = 2;
+      ctx.fillText(restaurantName || '', W/2, ty);
+
+      if (city) {
+        ctx.font = `300 ${cornerSize}px "Cormorant Garamond",Georgia,Palatino,serif`;
+        ctx.textAlign = 'right'; ctx.textBaseline = 'bottom';
+        ctx.shadowBlur = 3; ctx.shadowOffsetY = 0;
+        ctx.fillText(`${city}, Belgium`, W - Math.round(W*0.032), H - Math.round(H*0.025));
+      }
     }
 
     // ── Encode video with WebCodecs ──────────────────────────────────────────
@@ -1286,7 +1386,8 @@ function injectTikTok(photoDataUrls, caption, songName, location, opts) {
     const framesPerSlide = Math.ceil(SEC * FPS);
     let fi = 0;
     for (let i = 0; i < images.length; i++) {
-      drawSlide(images[i]);
+      if (i === 0 && restaurantName) drawCoverSlide(images[i]);
+      else drawSlide(images[i]);
       for (let f = 0; f < framesPerSlide; f++) {
         if (vErr) throw new Error('VideoEncoder: ' + vErr.message);
         const ts = Math.round(fi * 1_000_000 / FPS);
@@ -1307,71 +1408,85 @@ function injectTikTok(photoDataUrls, caption, songName, location, opts) {
     const videoSec = images.length * SEC;
 
     if (audioDataUrl && window.AudioEncoder && window.AudioData) {
-      try {
-        banner(1, `Encoding audio (${Math.round(videoSec)}s)…`);
-        // Decode audio data URL → AudioBuffer
-        const b64   = audioDataUrl.split(',')[1];
-        const bytes = Uint8Array.from(atob(b64), c => c.charCodeAt(0));
-        const tmpCtx = new (window.AudioContext || window.webkitAudioContext)({ sampleRate: AUDIO_SAMPLE_RATE });
-        // Resume in case the tab was briefly backgrounded (Chrome suspends AudioContext in background tabs)
-        if (tmpCtx.state === 'suspended') { try { await tmpCtx.resume(); } catch(_) {} }
-        const audioBuf = await tmpCtx.decodeAudioData(bytes.buffer.slice(0));
-        await tmpCtx.close();
+      banner(1, `Encoding audio (${Math.round(videoSec)}s)…`);
 
-        const totalAudioFrames = Math.min(
-          Math.ceil(videoSec * AUDIO_SAMPLE_RATE),
-          audioBuf.length
-        );
-        const numCh = Math.min(audioBuf.numberOfChannels, AUDIO_CHANNELS);
+      // Three-layer protection:
+      //  1. No AudioContext.resume() — it hangs forever without a user gesture
+      //     (TikTok tab is active so AudioContext won't be suspended anyway).
+      //  2. Per-operation timeouts on isConfigSupported() and flush().
+      //  3. 20s master timeout: bot always falls back to video-only rather than blocking.
+      const audioResult = await Promise.race([
 
-        const aSupport = await AudioEncoder.isConfigSupported({
-          codec: 'mp4a.40.2', sampleRate: AUDIO_SAMPLE_RATE,
-          numberOfChannels: numCh, bitrate: 128000,
-        });
+        (async () => {
+          try {
+            // ── Decode MP3 → AudioBuffer ─────────────────────────────────────
+            // decodeAudioData works in any AudioContext state — no resume() needed.
+            const b64    = audioDataUrl.split(',')[1];
+            const bytes  = Uint8Array.from(atob(b64), c => c.charCodeAt(0));
+            const tmpCtx = new (window.AudioContext || window.webkitAudioContext)({ sampleRate: AUDIO_SAMPLE_RATE });
+            const audioBuf = await tmpCtx.decodeAudioData(bytes.buffer.slice(0));
+            tmpCtx.close().catch(() => {});   // fire-and-forget — no await
 
-        if (aSupport.supported) {
-          let aErr = null;
-          const aEnc = new AudioEncoder({
-            output: (chunk) => {
-              const buf = new ArrayBuffer(chunk.byteLength); chunk.copyTo(buf);
-              aChunks.push({ data: new Uint8Array(buf), timestamp: chunk.timestamp });
-            },
-            error: e => { aErr = e; },
-          });
-          aEnc.configure({ codec: 'mp4a.40.2', sampleRate: AUDIO_SAMPLE_RATE, numberOfChannels: numCh, bitrate: 128000 });
+            const totalAudioFrames = Math.min(Math.ceil(videoSec * AUDIO_SAMPLE_RATE), audioBuf.length);
+            const numCh = Math.min(audioBuf.numberOfChannels, AUDIO_CHANNELS);
 
-          const FRAME_SIZE = 1024;
-          const ch = [];
-          for (let c = 0; c < numCh; c++) ch.push(audioBuf.getChannelData(c));
+            // ── Check codec support (5 s guard) ─────────────────────────────
+            const aSupport = await Promise.race([
+              AudioEncoder.isConfigSupported({ codec:'mp4a.40.2', sampleRate:AUDIO_SAMPLE_RATE, numberOfChannels:numCh, bitrate:128000 }),
+              new Promise(res => setTimeout(() => res({ supported: false }), 5000)),
+            ]);
+            if (!aSupport.supported) { dbg('AAC not supported — video-only'); return []; }
 
-          let processed = 0;
-          while (processed < totalAudioFrames) {
-            const frames = Math.min(FRAME_SIZE, totalAudioFrames - processed);
-            const planar  = new Float32Array(frames * numCh);
-            for (let c = 0; c < numCh; c++)
-              planar.set(ch[c].slice(processed, processed + frames), c * frames);
-
-            const ad = new AudioData({
-              format: 'f32-planar',
-              sampleRate: AUDIO_SAMPLE_RATE,
-              numberOfFrames: frames,
-              numberOfChannels: numCh,
-              timestamp: Math.round(processed * 1_000_000 / AUDIO_SAMPLE_RATE),
-              data: planar,
+            // ── Encode PCM → AAC-LC ──────────────────────────────────────────
+            const chunks = [];
+            let aErr = null;
+            const aEnc = new AudioEncoder({
+              output: (chunk) => {
+                const buf = new ArrayBuffer(chunk.byteLength); chunk.copyTo(buf);
+                chunks.push({ data: new Uint8Array(buf), timestamp: chunk.timestamp });
+              },
+              error: e => { aErr = e; },
             });
-            aEnc.encode(ad); ad.close();
-            processed += frames;
+            aEnc.configure({ codec:'mp4a.40.2', sampleRate:AUDIO_SAMPLE_RATE, numberOfChannels:numCh, bitrate:128000 });
+
+            const FRAME_SIZE = 1024;
+            const ch = [];
+            for (let c = 0; c < numCh; c++) ch.push(audioBuf.getChannelData(c));
+            let processed = 0;
+            while (processed < totalAudioFrames) {
+              if (aErr) throw new Error('AudioEncoder: ' + aErr.message);
+              const frames = Math.min(FRAME_SIZE, totalAudioFrames - processed);
+              const planar = new Float32Array(frames * numCh);
+              for (let c = 0; c < numCh; c++)
+                planar.set(ch[c].slice(processed, processed + frames), c * frames);
+              const ad = new AudioData({ format:'f32-planar', sampleRate:AUDIO_SAMPLE_RATE, numberOfFrames:frames, numberOfChannels:numCh, timestamp:Math.round(processed*1_000_000/AUDIO_SAMPLE_RATE), data:planar });
+              aEnc.encode(ad); ad.close();
+              processed += frames;
+            }
+
+            // ── Flush (10 s guard) ───────────────────────────────────────────
+            await Promise.race([
+              aEnc.flush().then(() => aEnc.close()),
+              new Promise((_, rej) => setTimeout(() => rej(new Error('flush timeout')), 10000)),
+            ]);
+            if (aErr) throw new Error('AudioEncoder: ' + aErr.message);
+            dbg(`Audio: ${chunks.length} AAC chunks (${numCh}ch)`);
+            return chunks;
+
+          } catch(e) {
+            dbg(`Audio encoding failed: ${e.message} — video-only`);
+            return [];
           }
-          await aEnc.flush(); aEnc.close();
-          if (aErr) throw new Error('AudioEncoder: ' + aErr.message);
-          dbg(`Audio: ${aChunks.length} AAC chunks (${numCh}ch)`);
-        } else {
-          dbg('AAC not supported — video-only');
-        }
-      } catch(e) {
-        dbg(`Audio encoding failed: ${e.message} — video-only`);
-        aChunks = [];
-      }
+        })(),
+
+        // ── Master timeout (20 s) ──────────────────────────────────────────
+        new Promise(res => setTimeout(() => {
+          dbg('Audio encoding timed out (20 s) — video-only');
+          res([]);
+        }, 20000)),
+      ]);
+
+      aChunks = audioResult;
     }
 
     const blob = muxMP4(vChunks, vDcfg, aChunks, W, H, FPS, fi, AUDIO_SAMPLE_RATE);
@@ -1545,15 +1660,9 @@ function injectTikTok(photoDataUrls, caption, songName, location, opts) {
         const errIdx  = text.toLowerCase().indexOf(errMatch[0].toLowerCase());
         const context = text.slice(Math.max(0, errIdx - 40), errIdx + 120).trim();
         dbg(`TikTok error detected: "${errMatch[0]}" | context: "${context}"`);
-        // Send full error details back to background service worker for persistent logging
-        try {
-          chrome.runtime.sendMessage({
-            type:    'TIKTOK_UPLOAD_ERROR',
-            matched: errMatch[0],
-            context,
-            pageSnippet: text.slice(0, 600),
-          });
-        } catch(_) {}
+        document.dispatchEvent(new CustomEvent('__ffbot_event', { detail:{
+          type:'TIKTOK_UPLOAD_ERROR', matched:errMatch[0], context, pageSnippet:text.slice(0,600),
+        }}));
         return 'rejected';
       }
       if (document.querySelector('[class*="DraftEditor"],[data-placeholder*="description" i],[data-placeholder*="caption" i]')) return 'accepted';
@@ -1562,7 +1671,7 @@ function injectTikTok(photoDataUrls, caption, songName, location, opts) {
     const finalText = document.body.innerText || '';
     const finalErr  = finalText.match(ERR_RE);
     if (finalErr) {
-      try { chrome.runtime.sendMessage({ type:'TIKTOK_UPLOAD_ERROR', matched:finalErr[0], context:'timeout-check', pageSnippet:finalText.slice(0,600) }); } catch(_) {}
+      document.dispatchEvent(new CustomEvent('__ffbot_event', { detail:{ type:'TIKTOK_UPLOAD_ERROR', matched:finalErr[0], context:'timeout-check', pageSnippet:finalText.slice(0,600) }}));
       return 'rejected';
     }
     return 'timeout';
@@ -1580,7 +1689,7 @@ function injectTikTok(photoDataUrls, caption, songName, location, opts) {
 
     let videoFile = null;
     try {
-      const blob = await buildH264MP4(photoDataUrls, tiktokAudioDataUrl);
+      const blob = await buildH264MP4(photoDataUrls, tiktokAudioDataUrl, opts.restaurantName || '', location || '');
       const sizeMB = (blob.size / 1024 / 1024).toFixed(1);
       videoFile = new File([blob], 'tiktok-post.mp4', { type: 'video/mp4' });
       banner(1, `Video ready: ${sizeMB}MB H.264${hasAudio ? ' + AAC 🎵' : ''} — uploading…`);
@@ -1599,7 +1708,7 @@ function injectTikTok(photoDataUrls, caption, songName, location, opts) {
     const sizeMB = (videoFile.size / 1024 / 1024).toFixed(2);
     dbg(`Injecting ${sizeMB}MB MP4 (type=${videoFile.type})…`);
     // Log video specs before injection so we have this in TechLog for debugging
-    try { chrome.runtime.sendMessage({ type:'TIKTOK_VIDEO_SPECS', sizeMB, mimeType:videoFile.type, hasAudio }); } catch(_) {}
+    document.dispatchEvent(new CustomEvent('__ffbot_event', { detail:{ type:'TIKTOK_VIDEO_SPECS', sizeMB, mimeType:videoFile.type, hasAudio }}));
     injectFile(fileInput, videoFile);
 
     // ── Step 3: Wait for TikTok to process ──────────────────────────────
@@ -1609,7 +1718,8 @@ function injectTikTok(photoDataUrls, caption, songName, location, opts) {
       // Capture visible error text for the banner
       const visibleErr = (document.body.innerText || '').match(ERR_RE)?.[0] || 'unknown error';
       banner(3, `⚠️ TikTok rejected: "<em>${visibleErr}</em>". Check the page for details.`, 'warn');
-      try { chrome.runtime.sendMessage({ type:'TIKTOK_UPLOAD_ERROR', matched:visibleErr, context:'post-check', autoPost: opts?.autoPost }); } catch(_) {}
+      document.dispatchEvent(new CustomEvent('__ffbot_event', { detail:{ type:'TIKTOK_UPLOAD_ERROR', matched:visibleErr, context:'post-check', autoPost:opts?.autoPost }}));
+      document.dispatchEvent(new CustomEvent('__ffbot_failed', { detail:{ platform:'tiktok', error:'Upload rejected: '+visibleErr }}));
       return;
     }
     dbg('Upload accepted');
@@ -1726,14 +1836,47 @@ function injectTikTok(photoDataUrls, caption, songName, location, opts) {
 
       if (postBtn) {
         banner(5, '🤖 Auto-clicking Post…');
-        dbg(`Post button found: <${postBtn.tagName}> data-e2e="${postBtn.getAttribute('data-e2e')}" text="${(postBtn.innerText||'').trim()}"`);
+        dbg(`Post button found: <${postBtn.tagName}> text="${(postBtn.innerText||'').trim()}"`);
         reactClickEl(postBtn);
-        await sleep(8000); // TikTok processing + upload time
-        banner(5, `✅ Posted to TikTok!${note}`, 'success');
-        try { chrome.runtime.sendMessage({ type:"PLATFORM_POST_COMPLETE", platform:"tiktok" }); } catch(_) {}
+
+        // TikTok sometimes shows a "Continue to post?" confirmation modal while
+        // still checking the video. Poll for it and click "Post Now" if it appears.
+        let confirmClicked = false;
+        for (let i = 0; i < 16; i++) {
+          await sleep(500);
+          const confirmBtn = Array.from(document.querySelectorAll('button,[role="button"],div[class*="btn"],div[class*="button"]'))
+            .find(el => /post\s*now/i.test((el.innerText || el.textContent || '').trim()));
+          if (confirmBtn) {
+            dbg('"Continue to post?" modal — clicking Post Now');
+            banner(5, '🤖 Confirming post (video still being reviewed)…');
+            reactClickEl(confirmBtn);
+            confirmClicked = true;
+            await sleep(3000);
+            break;
+          }
+        }
+
+        // Detect actual success (URL leaves /upload) or failure (error on page)
+        let postSuccess = false, postError = null;
+        for (let i = 0; i < 30; i++) {
+          await sleep(500);
+          if (!window.location.href.includes('/upload')) { postSuccess = true; break; }
+          const err = (document.body.innerText||'').match(/upload.*fail|post.*fail|violat|prohibited|not.*allow/i);
+          if (err) { postError = err[0]; break; }
+        }
+        if (!postSuccess && !postError) { postSuccess = true; } // timeout → assume success
+
+        if (postError) {
+          banner(5, `⚠️ TikTok post failed: ${postError}`, 'warn');
+          document.dispatchEvent(new CustomEvent('__ffbot_event', { detail:{ type:'TIKTOK_UPLOAD_ERROR', matched:postError, context:'post-completion' }}));
+          document.dispatchEvent(new CustomEvent('__ffbot_failed', { detail:{ platform:'tiktok', error:postError }}));
+        } else {
+          banner(5, `✅ Posted to TikTok!${note}`, 'success');
+          document.dispatchEvent(new CustomEvent('__ffbot_complete', { detail:{ platform:'tiktok' }}));
+        }
       } else {
         banner(5, '⚠️ Post button not found — please click Post manually.', 'warn');
-        try { chrome.runtime.sendMessage({ type:"PLATFORM_POST_FAILED", platform:"tiktok" }); } catch(_) {}
+        document.dispatchEvent(new CustomEvent('__ffbot_failed', { detail:{ platform:'tiktok', error:'Post button not found' }}));
       }
     } else {
       banner(5, `✅ All set!${note} Review &amp; click <strong>Post</strong>.`, 'success');
