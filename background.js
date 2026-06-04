@@ -1,4 +1,47 @@
-﻿// ── Background logger ─────────────────────────────────────────────────────────
+﻿// ── Auto Bot alarm handler ────────────────────────────────────────────────────
+// Fires when a scheduled post time is reached.
+// Logs the trigger and notifies the popup. Actual posting will be added in V1.5.
+
+chrome.alarms.onAlarm.addListener((alarm) => {
+  if (!alarm.name.startsWith("ffbot-auto-")) return;
+
+  const postIndex = parseInt(alarm.name.replace("ffbot-auto-", ""), 10);
+
+  chrome.storage.local.get(["autoBotActive", "autoBotSchedule", "autoBotRunLog"], (data) => {
+    if (!data.autoBotActive) return; // bot was deactivated
+
+    const post = data.autoBotSchedule?.posts?.[postIndex];
+    if (!post) return;
+
+    const logEntry = {
+      id:          `post-${Date.now()}`,
+      ts:          new Date().toISOString(),
+      postIndex,
+      date:        post.date,
+      time:        post.time,
+      platforms:   post.platforms,
+      status:      "triggered", // changes to "done" when posting is implemented in V1.5
+    };
+
+    const runLog = [...(data.autoBotRunLog || []), logEntry];
+    chrome.storage.local.set({ autoBotRunLog: runLog });
+
+    // Notify popup if open
+    chrome.runtime.sendMessage({ type: "AUTO_BOT_TRIGGERED", logEntry }).catch(() => {});
+
+    bgLog("info", `Auto Bot alarm triggered: post ${postIndex}`, {
+      date:      post.date,
+      time:      post.time,
+      platforms: post.platforms,
+    });
+
+    // ── V1.5: Trigger actual social media posting here ──────────────────────
+    // handleSocialPost({ platform, photoDataUrls, caption, ... }) will be called here
+    // using the autoBotConfig settings to search, pick a song, and post.
+  });
+});
+
+// ── Background logger ─────────────────────────────────────────────────────────
 
 function bgLog(level, message, data) {
   const entry = {

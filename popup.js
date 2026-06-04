@@ -1737,6 +1737,242 @@ function getScheduleSettings() {
   };
 }
 
+// ══════════════════════════════════════════════════════════════════════════════
+// AUTO BOT ACTIVATION LOGIC
+// ══════════════════════════════════════════════════════════════════════════════
+
+let autoBotActive = false;
+
+// ── Collapsible config toggle ─────────────────────────────────────────────────
+document.getElementById("abConfigToggle")?.addEventListener("click", () => {
+  const body  = document.getElementById("abConfigBody");
+  const arrow = document.getElementById("abConfigArrow");
+  if (!body) return;
+  const collapsed = body.classList.toggle("collapsed");
+  arrow?.classList.toggle("collapsed", collapsed);
+});
+
+// ── Collapsible scheduled posts toggle ───────────────────────────────────────
+document.getElementById("abSchedToggle")?.addEventListener("click", () => {
+  const body  = document.getElementById("abSchedBody");
+  const arrow = document.getElementById("abSchedArrow");
+  if (!body) return;
+  const collapsed = body.classList.toggle("collapsed");
+  arrow?.classList.toggle("collapsed", collapsed);
+});
+
+// ── Activate / Deactivate ─────────────────────────────────────────────────────
+document.getElementById("abScheduleBtn")?.addEventListener("click", () => {
+  if (autoBotActive) deactivateBot();
+  else               activateBot();
+});
+
+function activateBot() {
+  if (!API_KEY) { alert("Please save your Google API key before activating the bot."); return; }
+  const platforms = [];
+  if (document.getElementById("abSocialIG")?.classList.contains("active")) platforms.push("instagram");
+  if (document.getElementById("abSocialFB")?.classList.contains("active")) platforms.push("facebook");
+  if (document.getElementById("abSocialTT")?.classList.contains("active")) platforms.push("tiktok");
+  if (!platforms.length) { alert("Please select at least one social media platform."); return; }
+
+  const settings = getAutoBotSettings();
+  const schedule = generateAutoBotSchedule(settings);
+
+  autoBotActive = true;
+  chrome.storage.local.set({ autoBotActive: true, autoBotSchedule: schedule, autoBotRunLog: [] });
+  setupScheduleAlarms(schedule);
+
+  updateBotUI(true);
+  renderScheduledPosts(schedule);
+  refreshActivityLog([]);
+  updateProgress(0, schedule.totalPosts);
+  updateNextPostLabel(schedule);
+  updateConfigSummary();
+
+  AppLog.info("Auto Bot activated", { totalPosts: schedule.totalPosts, platforms });
+}
+
+function deactivateBot() {
+  autoBotActive = false;
+  chrome.storage.local.set({ autoBotActive: false });
+  chrome.alarms.clearAll();
+  updateBotUI(false);
+  AppLog.info("Auto Bot deactivated");
+}
+
+function updateBotUI(active) {
+  const btn      = document.getElementById("abScheduleBtn");
+  const body     = document.getElementById("abConfigBody");
+  const arrow    = document.getElementById("abConfigArrow");
+  const status   = document.getElementById("abBotStatus");
+  const progress = document.getElementById("abProgressWrap");
+  const schedSec = document.getElementById("abScheduledSection");
+  const actLog   = document.getElementById("abActivityLog");
+
+  if (active) {
+    if (btn) { btn.textContent = "⏹ Deactivate Bot"; btn.classList.add("is-active"); }
+    body?.classList.add("collapsed");
+    arrow?.classList.add("collapsed");
+    status?.classList.remove("hidden");
+    progress?.classList.remove("hidden");
+    schedSec?.classList.remove("hidden");
+    actLog?.classList.add("prominent");
+  } else {
+    if (btn) { btn.textContent = "⏰ Schedule Auto Bot"; btn.classList.remove("is-active"); }
+    body?.classList.remove("collapsed");
+    arrow?.classList.remove("collapsed");
+    status?.classList.add("hidden");
+    progress?.classList.add("hidden");
+    schedSec?.classList.add("hidden");
+    actLog?.classList.remove("prominent");
+  }
+}
+
+// ── Chrome Alarms ─────────────────────────────────────────────────────────────
+function setupScheduleAlarms(schedule) {
+  chrome.alarms.clearAll(() => {
+    const now = Date.now();
+    schedule.posts.forEach((post, idx) => {
+      const when = new Date(`${post.date}T${post.time}:00`).getTime();
+      if (when > now) chrome.alarms.create(`ffbot-auto-${idx}`, { when });
+    });
+    AppLog.info(`Set ${schedule.posts.length} alarms`);
+  });
+}
+
+// ── Render scheduled posts list ───────────────────────────────────────────────
+function renderScheduledPosts(schedule) {
+  const body  = document.getElementById("abSchedBody");
+  const badge = document.getElementById("abSchedCount");
+  if (!body) return;
+  if (badge) badge.textContent = schedule.posts.length;
+  body.innerHTML = "";
+
+  // Group by date
+  const grouped = {};
+  schedule.posts.forEach((post, idx) => {
+    if (!grouped[post.date]) grouped[post.date] = [];
+    grouped[post.date].push({ ...post, idx });
+  });
+
+  const now = new Date();
+  Object.entries(grouped).sort(([a],[b]) => a.localeCompare(b)).forEach(([date, posts]) => {
+    const dayEl  = document.createElement("div");
+    dayEl.className = "ab-sched-day-group";
+    const dayObj = new Date(`${date}T00:00:00`);
+    const dayLbl = dayObj.toLocaleDateString("en-GB", { weekday:"long", day:"numeric", month:"short" });
+    dayEl.innerHTML = `<div class="ab-sched-day-label">${dayLbl}</div>`;
+
+    posts.forEach(post => {
+      const postTime = new Date(`${date}T${post.time}:00`);
+      const isPast   = postTime < now;
+      const plat = post.platforms.map(p => ({ instagram:"📸 IG", facebook:"👥 FB", tiktok:"🎵 TT" }[p] || p)).join("  ");
+
+      const item = document.createElement("div");
+      item.className = "ab-sched-item";
+      item.id = `abSchedItem-${post.idx}`;
+      item.innerHTML = `
+        <span class="ab-sched-time">${post.time}</span>
+        <span class="ab-sched-platforms">${plat}</span>
+        <span class="ab-sched-status ${isPast ? 'done' : 'pending'}" id="abSchedStatus-${post.idx}">
+          ${isPast ? "✓ Done" : "⏳ Pending"}
+        </span>`;
+      dayEl.appendChild(item);
+    });
+    body.appendChild(dayEl);
+  });
+}
+
+function updateScheduledItemStatus(idx, status) {
+  const el = document.getElementById(`abSchedStatus-${idx}`);
+  if (!el) return;
+  const labels = { pending:"⏳ Pending", triggered:"🔄 Posting…", done:"✓ Done", failed:"✗ Failed" };
+  el.textContent = labels[status] || status;
+  el.className   = `ab-sched-status ${status}`;
+}
+
+// ── Progress ──────────────────────────────────────────────────────────────────
+function updateProgress(done, total) {
+  const fill  = document.getElementById("abProgressFill");
+  const label = document.getElementById("abProgressLabel");
+  const pct   = total > 0 ? Math.round((done / total) * 100) : 0;
+  if (fill)  fill.style.width = `${pct}%`;
+  if (label) label.textContent = `${done} of ${total} posts published`;
+  const txt = document.getElementById("abBotProgressText");
+  if (txt)   txt.textContent = `${done} / ${total} posts`;
+}
+
+function updateNextPostLabel(schedule) {
+  const el  = document.getElementById("abBotNextPost");
+  if (!el) return;
+  const now  = new Date();
+  const next = schedule.posts.find(p => new Date(`${p.date}T${p.time}:00`) > now);
+  if (next) {
+    const d = new Date(`${next.date}T${next.time}:00`);
+    el.textContent = `Next: ${d.toLocaleDateString("en-GB", { weekday:"short", day:"numeric", month:"short" })} at ${next.time}`;
+  } else {
+    el.textContent = "All posts complete";
+  }
+}
+
+// ── Activity log ──────────────────────────────────────────────────────────────
+function refreshActivityLog(runLog) {
+  const counts = { instagram:0, facebook:0, tiktok:0 };
+  (runLog||[]).forEach(e => {
+    if (e.status === "done") (e.platforms||[]).forEach(p => { if (p in counts) counts[p]++; });
+  });
+  const total = Object.values(counts).reduce((a,b)=>a+b,0);
+  const fmt = n => `${n} post${n !== 1 ? "s" : ""}`;
+  const s = (id,v) => { const e=document.getElementById(id); if(e) e.textContent=fmt(v); };
+  s("abLogIG", counts.instagram); s("abLogFB", counts.facebook);
+  s("abLogTT", counts.tiktok);    s("abLogTotal", total);
+}
+
+// ── Config summary (shown when config is collapsed) ───────────────────────────
+function updateConfigSummary() {
+  const el = document.getElementById("abConfigSummary");
+  if (!el) return;
+  const type    = document.querySelector("#abType .ab-pill.active")?.dataset?.val || "restaurant";
+  const cc      = document.getElementById("abCountry")?.value || "BE";
+  const country = AB_COUNTRY_NAMES[cc] || cc;
+  const allChip = document.querySelector("#abRegionWrap .all-chip");
+  const region  = allChip?.classList.contains("active") ? "All regions"
+    : [...document.querySelectorAll("#abRegionWrap .ab-region-chip:not(.all-chip)")]
+        .filter(c => c.classList.contains("active")).map(c => c.textContent.trim()).join(", ") || "All regions";
+  el.textContent = `${type.charAt(0).toUpperCase() + type.slice(1)} · ${country} · ${region}`;
+}
+
+// Listen for alarm triggers from background (status update)
+chrome.runtime.onMessage.addListener((msg) => {
+  if (msg.type !== "AUTO_BOT_TRIGGERED") return;
+  updateScheduledItemStatus(msg.logEntry.postIndex, "triggered");
+  chrome.storage.local.get({ autoBotRunLog:[], autoBotSchedule:null }, ({ autoBotRunLog, autoBotSchedule }) => {
+    refreshActivityLog(autoBotRunLog);
+    const done  = autoBotRunLog.filter(e => e.status === "done").length;
+    updateProgress(done, autoBotSchedule?.totalPosts || 0);
+  });
+});
+
+// Restore active state whenever Auto Bot mode is opened
+function restoreBotActiveState() {
+  chrome.storage.local.get({ autoBotActive:false, autoBotSchedule:null, autoBotRunLog:[] },
+    ({ autoBotActive: wasActive, autoBotSchedule: schedule, autoBotRunLog: runLog }) => {
+      autoBotActive = wasActive;
+      refreshActivityLog(runLog);
+      if (wasActive && schedule) {
+        updateBotUI(true);
+        renderScheduledPosts(schedule);
+        const done = runLog.filter(e => e.status === "done").length;
+        updateProgress(done, schedule.totalPosts);
+        updateNextPostLabel(schedule);
+        updateConfigSummary();
+      } else {
+        updateBotUI(false);
+      }
+    }
+  );
+}
+
 // ── Mode selector ────────────────────────────────────────────────────────────
 
 function showMode(mode) {
@@ -1754,7 +1990,11 @@ function showMode(mode) {
 }
 
 document.getElementById("btnManualMode").addEventListener("click", () => showMode("manual"));
-document.getElementById("btnAutoMode").addEventListener("click",   () => { showMode("auto"); loadAutoBotConfig(); });
+document.getElementById("btnAutoMode").addEventListener("click",   () => {
+  showMode("auto");
+  loadAutoBotConfig();
+  setTimeout(restoreBotActiveState, 80); // after config loads
+});
 document.getElementById("manualBackBtn").addEventListener("click", () => showMode("selector"));
 document.getElementById("autoBackBtn").addEventListener("click",   () => showMode("selector"));
 

@@ -623,6 +623,102 @@ h1 { font-size: 0.95rem; font-weight: 700; line-height: 1.2; }
   text-align: center; padding: 12px; color: var(--error); font-size: .78rem;
 }
 
+/* ── Bot status bar ── */
+.ab-bot-status {
+  display: flex; align-items: center; gap: 10px;
+  background: #f0fdf4; border: 1.5px solid #22c55e;
+  border-radius: var(--radius); padding: 10px 13px;
+  margin-bottom: 4px;
+}
+.ab-bot-dot {
+  width: 10px; height: 10px; border-radius: 50%;
+  background: #22c55e; flex-shrink: 0;
+  box-shadow: 0 0 0 3px rgba(34,197,94,.25);
+  animation: botPulse 2s ease-in-out infinite;
+}
+@keyframes botPulse {
+  0%,100% { box-shadow: 0 0 0 3px rgba(34,197,94,.25); }
+  50%      { box-shadow: 0 0 0 6px rgba(34,197,94,.10); }
+}
+.ab-bot-status-info { flex: 1; min-width: 0; }
+.ab-bot-status-title { font-size: .78rem; font-weight: 700; color: #15803d; display: block; }
+.ab-bot-status-next  { font-size: .7rem;  color: #166534; }
+.ab-bot-status-progress { font-size: .72rem; font-weight: 600; color: #15803d; white-space: nowrap; }
+
+/* ── Config collapse toggle header ── */
+.ab-collapse-hdr {
+  display: flex; align-items: center; gap: 8px;
+  padding: 9px 12px; background: var(--bg);
+  border: 1px solid var(--border); border-radius: var(--radius);
+  cursor: pointer; user-select: none; transition: background .15s;
+}
+.ab-collapse-hdr:hover { background: #f0f0f0; }
+.ab-collapse-hdr-title { font-size: .78rem; font-weight: 700; color: var(--text); }
+.ab-config-summary     { font-size: .7rem; color: var(--muted); flex: 1; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.ab-collapse-arrow     { font-size: .7rem; color: var(--muted); transition: transform .2s; flex-shrink: 0; }
+.ab-collapse-arrow.collapsed { transform: rotate(-90deg); }
+
+#abConfigBody.collapsed { display: none; }
+
+/* Schedule button active (Deactivate) */
+.btn--schedule.is-active {
+  background: #dc2626 !important;
+  opacity: 1 !important; cursor: pointer !important;
+}
+.btn--schedule.is-active:hover { background: #b91c1c !important; }
+
+/* Progress bar */
+.ab-progress-wrap { display: flex; flex-direction: column; gap: 4px; }
+.ab-progress-bar  {
+  height: 6px; background: var(--border); border-radius: 10px; overflow: hidden;
+}
+.ab-progress-fill {
+  height: 100%; background: var(--accent);
+  border-radius: 10px; transition: width .6s ease;
+}
+.ab-progress-label { font-size: .72rem; color: var(--muted); text-align: center; }
+
+/* Scheduled posts panel */
+.ab-scheduled-section {
+  background: var(--surface); border: 1px solid var(--border);
+  border-radius: var(--radius); overflow: hidden;
+}
+.ab-sched-badge {
+  background: var(--accent); color: #fff;
+  border-radius: 10px; font-size: .65rem; font-weight: 700;
+  padding: 1px 7px;
+}
+.ab-sched-body { max-height: 240px; overflow-y: auto; }
+.ab-sched-body.collapsed { display: none; }
+
+.ab-sched-day-group { padding: 6px 12px 2px; }
+.ab-sched-day-label {
+  font-size: .67rem; font-weight: 700; color: var(--muted);
+  text-transform: uppercase; letter-spacing: .06em; margin-bottom: 3px;
+}
+.ab-sched-item {
+  display: flex; align-items: center; gap: 8px;
+  padding: 5px 0; border-bottom: 1px solid var(--border);
+  font-size: .74rem;
+}
+.ab-sched-item:last-child { border-bottom: none; }
+.ab-sched-time { font-weight: 600; color: var(--text); min-width: 40px; }
+.ab-sched-platforms { flex: 1; color: var(--muted); font-size: .7rem; }
+.ab-sched-status {
+  font-size: .65rem; font-weight: 700; padding: 2px 7px;
+  border-radius: 10px; white-space: nowrap;
+}
+.ab-sched-status.pending  { background: #fff7ed; color: #c2410c; }
+.ab-sched-status.done     { background: #f0fdf4; color: #15803d; }
+.ab-sched-status.triggered{ background: #eff6ff; color: #1d4ed8; }
+.ab-sched-status.failed   { background: #fef2f2; color: #991b1b; }
+
+/* Activity log prominent mode */
+.ab-activity-log.prominent {
+  border: 1.5px solid var(--accent);
+  box-shadow: 0 2px 8px rgba(232,73,15,.10);
+}
+
 /* ── Activity Log ── */
 .ab-activity-log {
   background: var(--surface); border: 1px solid var(--border);

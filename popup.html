@@ -200,7 +200,29 @@
         <span class="mode-topbar-title">🤖 Auto Bot</span>
       </div>
 
+      <!-- ── Bot status bar (visible only when active) ──────────── -->
+      <div id="abBotStatus" class="ab-bot-status hidden">
+        <div class="ab-bot-dot"></div>
+        <div class="ab-bot-status-info">
+          <span class="ab-bot-status-title">Auto Bot is Active</span>
+          <span class="ab-bot-status-next" id="abBotNextPost">Calculating next post…</span>
+        </div>
+        <div class="ab-bot-status-progress">
+          <span id="abBotProgressText">0 / 0 posts</span>
+        </div>
+      </div>
+
       <div class="autobot-body">
+
+        <!-- ── Config collapse toggle ───────────────────────────── -->
+        <div class="ab-collapse-hdr" id="abConfigToggle">
+          <span class="ab-collapse-hdr-title">⚙ Configuration</span>
+          <span class="ab-config-summary" id="abConfigSummary"></span>
+          <span class="ab-collapse-arrow" id="abConfigArrow">▼</span>
+        </div>
+
+        <!-- ── Collapsible config body ───────────────────────────── -->
+        <div id="abConfigBody">
         <p class="autobot-intro">Configure the filters below to set up automated restaurant discovery and posting.</p>
 
         <!-- ── Type ─────────────────────────────────────────────── -->
@@ -408,60 +430,81 @@
           </div>
         </div>
 
-        <!-- ── Schedule button (non-functional placeholder) ──────── -->
+        </div><!-- /abConfigBody -->
+
+        <!-- ── Schedule / Deactivate button ────────────────────── -->
         <div class="ab-actions">
-          <button class="btn btn--export btn--schedule" type="button" disabled>
+          <button class="btn btn--export btn--schedule" type="button" id="abScheduleBtn">
             ⏰ Schedule Auto Bot
-            <span class="ab-coming-soon">coming soon</span>
           </button>
         </div>
 
-      <!-- ── Activity Log ─────────────────────────────────────── -->
-      <div class="ab-activity-log">
-        <div class="ab-log-header">
-          <span class="ab-log-title">📊 Activity Log</span>
-          <span class="ab-log-period">Last 30 days</span>
-        </div>
-        <div class="ab-log-items">
-
-          <div class="ab-log-item">
-            <div class="ab-log-platform">
-              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" width="16" height="16">
-                <rect x="2" y="2" width="20" height="20" rx="5" ry="5"/>
-                <circle cx="12" cy="12" r="4.5"/>
-                <circle cx="17.5" cy="6.5" r="1" fill="currentColor" stroke="none"/>
-              </svg>
-              Instagram
-            </div>
-            <span class="ab-log-count">0 posts</span>
+        <!-- ── Progress bar (visible when active) ───────────────── -->
+        <div id="abProgressWrap" class="ab-progress-wrap hidden">
+          <div class="ab-progress-bar">
+            <div class="ab-progress-fill" id="abProgressFill" style="width:0%"></div>
           </div>
-
-          <div class="ab-log-item">
-            <div class="ab-log-platform">
-              <svg viewBox="0 0 24 24" fill="currentColor" width="16" height="16">
-                <path d="M18 2h-3a5 5 0 0 0-5 5v3H7v4h3v8h4v-8h3l1-4h-4V7a1 1 0 0 1 1-1h3z"/>
-              </svg>
-              Facebook
-            </div>
-            <span class="ab-log-count">0 posts</span>
-          </div>
-
-          <div class="ab-log-item">
-            <div class="ab-log-platform">
-              <svg viewBox="0 0 24 24" fill="currentColor" width="16" height="16">
-                <path d="M19.59 6.69a4.83 4.83 0 0 1-3.77-4.25V2h-3.45v13.67a2.89 2.89 0 0 1-2.88 2.5 2.89 2.89 0 0 1-2.89-2.89 2.89 2.89 0 0 1 2.89-2.89c.28 0 .54.04.79.1V9.01a6.33 6.33 0 0 0-.79-.05 6.34 6.34 0 0 0-6.34 6.34 6.34 6.34 0 0 0 6.34 6.34 6.34 6.34 0 0 0 6.33-6.34V8.73a8.18 8.18 0 0 0 4.78 1.52V6.8a4.85 4.85 0 0 1-1.01-.11z"/>
-              </svg>
-              TikTok
-            </div>
-            <span class="ab-log-count">0 posts</span>
-          </div>
-
+          <span class="ab-progress-label" id="abProgressLabel">0 of 0 posts published</span>
         </div>
-        <div class="ab-log-total">
-          <span>Total published</span>
-          <strong class="ab-log-total-val">0 posts</strong>
+
+        <!-- ── Scheduled Posts panel (visible when active) ──────── -->
+        <div id="abScheduledSection" class="ab-scheduled-section hidden">
+          <div class="ab-collapse-hdr" id="abSchedToggle">
+            <span class="ab-collapse-hdr-title">📅 Scheduled Posts</span>
+            <span class="ab-sched-badge" id="abSchedCount">0</span>
+            <span class="ab-collapse-arrow" id="abSchedArrow">▼</span>
+          </div>
+          <div id="abSchedBody" class="ab-sched-body">
+            <!-- rendered by JS -->
+          </div>
         </div>
-      </div>
+
+        <!-- ── Activity Log ──────────────────────────────────────── -->
+        <div class="ab-activity-log" id="abActivityLog">
+          <div class="ab-log-header">
+            <span class="ab-log-title">📊 Activity Log</span>
+            <span class="ab-log-period" id="abLogPeriod">Last 30 days</span>
+          </div>
+          <div class="ab-log-items">
+
+            <div class="ab-log-item">
+              <div class="ab-log-platform">
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" width="16" height="16">
+                  <rect x="2" y="2" width="20" height="20" rx="5" ry="5"/>
+                  <circle cx="12" cy="12" r="4.5"/>
+                  <circle cx="17.5" cy="6.5" r="1" fill="currentColor" stroke="none"/>
+                </svg>
+                Instagram
+              </div>
+              <span class="ab-log-count" id="abLogIG">0 posts</span>
+            </div>
+
+            <div class="ab-log-item">
+              <div class="ab-log-platform">
+                <svg viewBox="0 0 24 24" fill="currentColor" width="16" height="16">
+                  <path d="M18 2h-3a5 5 0 0 0-5 5v3H7v4h3v8h4v-8h3l1-4h-4V7a1 1 0 0 1 1-1h3z"/>
+                </svg>
+                Facebook
+              </div>
+              <span class="ab-log-count" id="abLogFB">0 posts</span>
+            </div>
+
+            <div class="ab-log-item">
+              <div class="ab-log-platform">
+                <svg viewBox="0 0 24 24" fill="currentColor" width="16" height="16">
+                  <path d="M19.59 6.69a4.83 4.83 0 0 1-3.77-4.25V2h-3.45v13.67a2.89 2.89 0 0 1-2.88 2.5 2.89 2.89 0 0 1-2.89-2.89 2.89 2.89 0 0 1 2.89-2.89c.28 0 .54.04.79.1V9.01a6.33 6.33 0 0 0-.79-.05 6.34 6.34 0 0 0-6.34 6.34 6.34 6.34 0 0 0 6.34 6.34 6.34 6.34 0 0 0 6.33-6.34V8.73a8.18 8.18 0 0 0 4.78 1.52V6.8a4.85 4.85 0 0 1-1.01-.11z"/>
+                </svg>
+                TikTok
+              </div>
+              <span class="ab-log-count" id="abLogTT">0 posts</span>
+            </div>
+
+          </div>
+          <div class="ab-log-total">
+            <span>Total published</span>
+            <strong class="ab-log-total-val" id="abLogTotal">0 posts</strong>
+          </div>
+        </div>
 
       </div><!-- /autobot-body -->
     </div><!-- /autoMode -->
