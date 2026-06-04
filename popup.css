@@ -337,6 +337,14 @@ h1 { font-size: 0.95rem; font-weight: 700; line-height: 1.2; }
   text-transform: uppercase; letter-spacing: .04em;
   display: flex; align-items: center; gap: 6px;
 }
+.ab-info-icon {
+  display: inline-flex; align-items: center; justify-content: center;
+  width: 14px; height: 14px; border-radius: 50%;
+  background: var(--muted); color: #fff; font-size: .6rem;
+  font-weight: 700; cursor: help; flex-shrink: 0;
+  font-style: normal; margin-left: 2px;
+}
+
 .ab-label-hint {
   font-weight: 400; text-transform: none; letter-spacing: 0;
   color: var(--muted); font-size: .68rem;
@@ -558,6 +566,12 @@ h1 { font-size: 0.95rem; font-weight: 700; line-height: 1.2; }
 .auto-preview-photo:first-child img,
 .auto-preview-photo:first-child .loading-thumb {
   aspect-ratio: 1/1;
+}
+
+.auto-preview-caption {
+  background: var(--bg); border: 1px solid var(--border);
+  border-radius: 8px; padding: 8px 10px; font-size: .74rem;
+  color: var(--text); line-height: 1.6; white-space: pre-wrap;
 }
 
 .auto-preview-note {

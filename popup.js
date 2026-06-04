@@ -1070,21 +1070,32 @@ function getAutoBotSettings() {
   const type    = document.querySelector("#abType .ab-pill.active")?.dataset?.val || "restaurant";
 
   // Selected regions (empty string = All)
-  const allChip      = document.querySelector("#abRegionWrap .all-chip");
-  const activeChips  = [...document.querySelectorAll("#abRegionWrap .ab-region-chip:not(.all-chip)")]
-                         .filter(c => c.classList.contains("active"));
-
+  const allChip     = document.querySelector("#abRegionWrap .all-chip");
+  const activeChips = [...document.querySelectorAll("#abRegionWrap .ab-region-chip:not(.all-chip)")]
+                        .filter(c => c.classList.contains("active"));
   let region = "";
   if (!allChip?.classList.contains("active") && activeChips.length > 0) {
-    // Pick a random active region each time for variety
     region = activeChips[Math.floor(Math.random() * activeChips.length)].textContent.trim();
   }
 
-  return { country, type, region };
+  const minRatings = parseInt(document.getElementById("abMinRatings")?.value || "100", 10);
+  const minStars   = parseFloat(document.querySelector("#abStars .ab-pill.active")?.dataset?.val || "4");
+  const minPics    = parseInt(document.querySelector("#abPics .ab-pill.active")?.dataset?.val || "5", 10);
+
+  // Caption checkboxes
+  const captionOpts = {
+    catchy:   document.getElementById("abCapCatchy")?.checked ?? true,
+    name:     document.getElementById("abCapName")?.checked   ?? true,
+    address:  document.getElementById("abCapAddr")?.checked   ?? true,
+    hashtags: document.getElementById("abCapHash")?.checked   ?? true,
+    song:     document.getElementById("abCapSong")?.checked   ?? true,
+  };
+
+  return { country, type, region, minRatings, minStars, minPics, captionOpts };
 }
 
-// Search Places API for a random entity matching type + location
-async function searchAutoPlace(type, country, region) {
+// Search Places API with ALL filter parameters baked in (one call)
+async function searchAutoPlace(type, country, region, minRatings = 0, minStars = 3, minPics = 3) {
   const typeQuery   = AB_TYPE_QUERY[type] || "restaurant";
   const countryName = AB_COUNTRY_NAMES[country] || "Belgium";
   const bounds      = AB_COUNTRY_BOUNDS[country] || AB_COUNTRY_BOUNDS.BE;
@@ -1093,7 +1104,16 @@ async function searchAutoPlace(type, country, region) {
   const q = `${typeQuery} in ${locationPart}`;
 
   trackApiCall("search", q);
-  AppLog.info("Auto Bot search", { type, country, region, query: q });
+  AppLog.info("Auto Bot search", { type, country, region, query: q, minRatings, minStars, minPics });
+
+  // Build request — push minRating into the API to let the server pre-filter by stars.
+  // This reduces the client-side work we need to do.
+  const body = {
+    textQuery:           q,
+    maxResultCount:      20,        // fetch up to 20 so client-side filters have options
+    minRating:           minStars,  // API-level star filter (reduces wasted results)
+    locationRestriction: { rectangle: bounds },
+  };
 
   const res = await fetch(PLACES_SEARCH, {
     method: "POST",
@@ -1102,11 +1122,7 @@ async function searchAutoPlace(type, country, region) {
       "X-Goog-Api-Key": API_KEY,
       "X-Goog-FieldMask": "places.id,places.displayName,places.formattedAddress,places.rating,places.userRatingCount,places.googleMapsUri,places.photos",
     },
-    body: JSON.stringify({
-      textQuery: q,
-      maxResultCount: 5,           // fetch several so we can pick randomly
-      locationRestriction: { rectangle: bounds },
-    }),
+    body: JSON.stringify(body),
   });
 
   if (!res.ok) {
@@ -1115,10 +1131,72 @@ async function searchAutoPlace(type, country, region) {
   }
   const data = await res.json();
   if (!data.places?.length)
-    throw new Error(`No ${type}s found in "${locationPart}"`);
+    throw new Error(`No ${type}s found in "${locationPart}" (try relaxing filters)`);
 
-  // Pick a random result for variety
-  return data.places[Math.floor(Math.random() * data.places.length)];
+  // Client-side filters: ratings count and minimum photos
+  // (minRating/stars already handled server-side above)
+  const filtered = data.places.filter(p =>
+    (p.userRatingCount || 0) >= minRatings &&
+    (p.photos           || []).length >= minPics
+  );
+
+  if (!filtered.length) {
+    // Fall back to star/count filtered only (ignore photo count) to avoid 0 results
+    const partialFiltered = data.places.filter(p => (p.userRatingCount || 0) >= minRatings);
+    if (!partialFiltered.length)
+      throw new Error(`No ${type}s in "${locationPart}" have ${minRatings}+ ratings. Try lowering the threshold.`);
+    AppLog.warn("No results met photo minimum — returning best available", { minPics });
+    return partialFiltered[Math.floor(Math.random() * partialFiltered.length)];
+  }
+
+  // Pick a random result from the filtered set for variety
+  return filtered[Math.floor(Math.random() * filtered.length)];
+}
+
+// ── Auto Bot caption generator ────────────────────────────────────────────────
+// Builds a caption string based on the Caption Content checkboxes.
+function getAutoCaption(name, address, type, captionOpts) {
+  const cityM  = address.match(/\d{4}\s+([A-Za-zÀ-ÿ\s-]+),\s*(?:Belgium|France|Germany|Luxembourg|Netherlands)/i);
+  const city   = (cityM?.[1] || address.split(",")[0] || "").trim();
+  const seed   = name.split("").reduce((a, c) => a + c.charCodeAt(0), 0);
+  const tLabel = type === "restaurant" ? "restaurant" : type === "hotel" ? "hotel" : "bar";
+  const cityTag = city.replace(/\s+/g, "");
+
+  const parts = [];
+
+  // ── Catchy phrase ─────────────────────────────────────────────────────────
+  if (captionOpts.catchy) {
+    const openers = [
+      `Have you visited ${name} yet? Drop a 💬 below!`,
+      `Best ${tLabel} in ${city}? ${name} is worth every visit 🔥`,
+      `What do you think of ${name}? Let us know 👇`,
+      `Discover the hidden gem of ${city}: ${name} ✨`,
+      `Don't miss ${name} next time you're in ${city}! 📍`,
+      `Have you tried ${name}? This is what dreams look like 😍`,
+    ];
+    parts.push(openers[seed % openers.length]);
+    parts.push("");
+  }
+
+  // ── Name ─────────────────────────────────────────────────────────────────
+  if (captionOpts.name && name)       parts.push(`📍 ${name}`);
+
+  // ── Address ──────────────────────────────────────────────────────────────
+  if (captionOpts.address && address) parts.push(`📌 ${address}`);
+
+  if ((captionOpts.name || captionOpts.address) && (captionOpts.hashtags || captionOpts.song))
+    parts.push("");
+
+  // ── Song name placeholder (wired up when song genre is implemented) ───────
+  if (captionOpts.song) parts.push(`🎵 [Song — selected based on genre]`);
+
+  // ── Hashtags ──────────────────────────────────────────────────────────────
+  if (captionOpts.hashtags) {
+    const tCapit = tLabel.charAt(0).toUpperCase() + tLabel.slice(1);
+    parts.push(`\n#${cityTag} #Belgian${tCapit} #FoodFluencer #Foodie #${tCapit}Photography #Belgium`);
+  }
+
+  return parts.join("\n").trim();
 }
 
 // Preview Example Post — runs a real search and renders the result
@@ -1139,17 +1217,28 @@ async function previewExamplePost() {
   panel.scrollIntoView({ behavior: "smooth", block: "nearest" });
 
   try {
-    const place = await searchAutoPlace(settings.type, settings.country, settings.region);
+    const place = await searchAutoPlace(
+      settings.type, settings.country, settings.region,
+      settings.minRatings, settings.minStars, settings.minPics
+    );
 
     const name    = place.displayName?.text || "Unknown";
     const address = place.formattedAddress  || "";
     const rating  = place.rating;
-    const photos  = (place.photos || [])
-      .sort((a, b) => (b.width || 0) - (a.width || 0))
-      .slice(0, 5)
-      .map(p => ({ name: p.name }));
+    const ratingCount = place.userRatingCount || 0;
 
-    const typeLabel = settings.type.charAt(0).toUpperCase() + settings.type.slice(1);
+    // Select how many photos to show: random between minPics and min(available, 5)
+    const allPhotos  = (place.photos || []).sort((a, b) => (b.width || 0) - (a.width || 0));
+    const available  = Math.min(allPhotos.length, 5);
+    const minP       = Math.min(settings.minPics, available);
+    const numPhotos  = minP >= available ? available
+                     : minP + Math.floor(Math.random() * (available - minP + 1));
+    const photos     = allPhotos.slice(0, numPhotos).map(p => ({ name: p.name }));
+
+    // Build caption from checkboxes
+    const caption = getAutoCaption(name, address, settings.type, settings.captionOpts);
+
+    const typeLabel   = settings.type.charAt(0).toUpperCase() + settings.type.slice(1);
     const regionLabel = settings.region || AB_COUNTRY_NAMES[settings.country] || "Belgium";
 
     content.innerHTML = `
@@ -1160,10 +1249,11 @@ async function previewExamplePost() {
       <div class="auto-preview-card">
         <span class="auto-preview-name">${name}</span>
         <span class="auto-preview-addr">${address}</span>
-        ${rating ? `<span class="auto-preview-rating">⭐ ${rating}</span>` : ""}
+        ${rating ? `<span class="auto-preview-rating">⭐ ${rating} · ${ratingCount.toLocaleString()} ratings</span>` : ""}
       </div>
       <div class="auto-preview-photos" id="autoPreviewPhotos"></div>
-      <p class="auto-preview-note">The Auto Bot would generate and post this ${settings.type}.</p>
+      ${caption ? `<div class="auto-preview-caption">${caption.replace(/\n/g, '<br>')}</div>` : ""}
+      <p class="auto-preview-note">${photos.length} photo${photos.length !== 1 ? 's' : ''} · filters: ≥${settings.minRatings} ratings · ≥${settings.minStars}⭐</p>
     `;
 
     // Load photos async
@@ -1177,7 +1267,6 @@ async function previewExamplePost() {
 
         resolvePhotoUri(photos[i].name, 400).then(uri => {
           if (i === 0) {
-            // Apply cover overlay to the first photo
             createCoverOverlay(uri, name, address).then(overlay => {
               div.innerHTML = `<img src="${overlay || uri}" alt="Cover" />`;
             });
@@ -1188,7 +1277,7 @@ async function previewExamplePost() {
       }
     }
 
-    AppLog.info("Auto Bot preview rendered", { name, type: settings.type });
+    AppLog.info("Auto Bot preview rendered", { name, type: settings.type, numPhotos, minRatings: settings.minRatings, minStars: settings.minStars });
   } catch(err) {
     content.innerHTML = `<div class="auto-preview-error">⚠️ ${err.message}</div>`;
     AppLog.error("Auto Bot preview failed", err.message);
