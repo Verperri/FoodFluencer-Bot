@@ -35,11 +35,299 @@ chrome.alarms.onAlarm.addListener((alarm) => {
       platforms: post.platforms,
     });
 
-    // ── V1.5: Trigger actual social media posting here ──────────────────────
-    // handleSocialPost({ platform, photoDataUrls, caption, ... }) will be called here
-    // using the autoBotConfig settings to search, pick a song, and post.
+    // Trigger the full auto-posting flow
+    autoPostNow(postIndex);
   });
 });
+
+// ══════════════════════════════════════════════════════════════════════════════
+// AUTO BOT — full posting pipeline (runs in background service worker)
+// ══════════════════════════════════════════════════════════════════════════════
+
+// ── Helpers ───────────────────────────────────────────────────────────────────
+
+const AB_PLACES_SEARCH = "https://places.googleapis.com/v1/places:searchText";
+const AB_PLACES_PHOTO  = "https://places.googleapis.com/v1";
+const AB_ITUNES_SEARCH = "https://itunes.apple.com/search";
+
+const AB_TYPE_QUERY_BG = { restaurant:"restaurant", hotel:"hotel", bar:"bar" };
+const AB_COUNTRY_NAMES_BG = { BE:"Belgium", FR:"France", DE:"Germany", LU:"Luxembourg", NL:"The Netherlands" };
+const AB_BOUNDS_BG = {
+  BE: { low:{latitude:49.5,longitude:2.5},  high:{latitude:51.5,longitude:6.4}  },
+  FR: { low:{latitude:41.3,longitude:-5.1}, high:{latitude:51.1,longitude:9.6}  },
+  DE: { low:{latitude:47.2,longitude:5.9},  high:{latitude:55.1,longitude:15.0} },
+  LU: { low:{latitude:49.4,longitude:5.7},  high:{latitude:50.2,longitude:6.5}  },
+  NL: { low:{latitude:50.7,longitude:3.3},  high:{latitude:53.6,longitude:7.2}  },
+};
+const AB_ITUNES_CC_BG = { BE:"be", FR:"fr", DE:"de", LU:"be", NL:"nl" };
+
+async function getApiKey() {
+  return new Promise(res => chrome.storage.local.get({ googleApiKey:"" }, d => res(d.googleApiKey)));
+}
+
+async function searchAutoPlaceBG(config, apiKey) {
+  const typeQ   = AB_TYPE_QUERY_BG[config.type] || "restaurant";
+  const country = AB_COUNTRY_NAMES_BG[config.country] || "Belgium";
+  const bounds  = AB_BOUNDS_BG[config.country] || AB_BOUNDS_BG.BE;
+  const region  = config.region || "";
+  const locPart = region ? `${region}, ${country}` : country;
+
+  const res = await fetch(AB_PLACES_SEARCH, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      "X-Goog-Api-Key": apiKey,
+      "X-Goog-FieldMask": "places.id,places.displayName,places.formattedAddress,places.rating,places.userRatingCount,places.googleMapsUri,places.photos",
+    },
+    body: JSON.stringify({
+      textQuery: `${typeQ} in ${locPart}`,
+      maxResultCount: 20,
+      minRating: parseFloat(config.minStars || "4"),
+      locationRestriction: { rectangle: bounds },
+    }),
+  });
+  const data = await res.json();
+  if (!data.places?.length) throw new Error(`No ${typeQ}s found in ${locPart}`);
+
+  const minRatings = parseInt(config.minRatings || "100", 10);
+  const minPics    = parseInt(config.minPics    || "3",   10);
+  const filtered   = data.places.filter(p =>
+    (p.userRatingCount || 0) >= minRatings && (p.photos || []).length >= minPics
+  );
+  const pool = filtered.length ? filtered : data.places;
+  return pool[Math.floor(Math.random() * pool.length)];
+}
+
+async function resolvePhotoUriBG(photoName, maxWidth, apiKey) {
+  const res  = await fetch(`${AB_PLACES_PHOTO}/${photoName}/media?maxWidthPx=${maxWidth}&key=${apiKey}&skipHttpRedirect=true`);
+  const data = await res.json();
+  return data.photoUri;
+}
+
+async function fetchAsDataUrl(url) {
+  const res  = await fetch(url);
+  const blob = await res.blob();
+  const ab   = await blob.arrayBuffer();
+  const bytes = new Uint8Array(ab);
+  let binary = "";
+  for (let i = 0; i < bytes.length; i += 8192)
+    binary += String.fromCharCode(...bytes.slice(i, i + 8192));
+  return `data:${blob.type || "image/jpeg"};base64,${btoa(binary)}`;
+}
+
+async function getAutoSongBG(genre, country) {
+  const cc = AB_ITUNES_CC_BG[country] || "be";
+  if (genre === "top100") {
+    try {
+      const feedRes = await fetch(`https://itunes.apple.com/${cc}/rss/topsongs/limit=100/json`);
+      if (feedRes.ok) {
+        const fd      = await feedRes.json();
+        const entries = fd.feed?.entry || [];
+        if (entries.length) {
+          const entry   = entries[Math.floor(Math.random() * entries.length)];
+          const trackId = entry.id?.attributes?.["im:id"];
+          if (trackId) {
+            const lr = await fetch(`https://itunes.apple.com/lookup?id=${trackId}`);
+            if (lr.ok) {
+              const ld    = await lr.json();
+              const track = ld.results?.[0];
+              if (track) return { name:track.trackName, artist:track.artistName, artwork:track.artworkUrl100, previewUrl:track.previewUrl||null, genre:"Top 100" };
+            }
+          }
+        }
+      }
+    } catch(_) {}
+  }
+  const queries = { top100:`top hits ${new Date().getFullYear()}`, pop:"pop hit", socialmedia:`viral trending ${new Date().getFullYear()}` };
+  const labels  = { top100:"Top 100", pop:"Pop", socialmedia:"Social Media" };
+  const res = await fetch(`${AB_ITUNES_SEARCH}?term=${encodeURIComponent(queries[genre]||"pop hit")}&media=music&entity=song&limit=50`);
+  const d   = await res.json();
+  const songs = d.results || [];
+  if (!songs.length) return null;
+  const s = songs[Math.floor(Math.random() * songs.length)];
+  return { name:s.trackName, artist:s.artistName, artwork:s.artworkUrl100, previewUrl:s.previewUrl||null, genre:labels[genre]||genre };
+}
+
+function getAutoCaptionBG(name, address, type, language, captionOpts, songInfo) {
+  const LANG = {
+    en: { opener:(name,t,city,seed) => [`Have you visited ${name} yet? 💬`,`Best ${t} in ${city}? ${name} is worth a visit! 🔥`,`What do you think of ${name}? 👇`,`Discover ${city}'s hidden gem: ${name} ✨`,`Don't miss ${name} in ${city}! 📍`,`Have you tried ${name}? 😍`][seed%6] },
+    nl: { opener:(name,t,city,seed) => [`Ben je al bij ${name}? Laat het weten! 💬`,`Beste ${t} in ${city}? ${name} is een bezoek waard! 🔥`,`Wat vind je van ${name}? 👇`,`Ontdek de parel van ${city}: ${name} ✨`,`Mis ${name} niet als je in ${city} bent! 📍`,`Heb je ${name} al geprobeerd? 😍`][seed%6] },
+    fr: { opener:(name,t,city,seed) => [`Avez-vous visité ${name}? 💬`,`Meilleur ${t} à ${city}? ${name} vaut le détour! 🔥`,`Que pensez-vous de ${name}? 👇`,`Découvrez ${city}: ${name} ✨`,`Ne manquez pas ${name} à ${city}! 📍`,`Avez-vous essayé ${name}? 😍`][seed%6] },
+    de: { opener:(name,t,city,seed) => [`Habt ihr ${name} besucht? 💬`,`Bestes ${t} in ${city}? ${name} ist jeden Besuch wert! 🔥`,`Was denkt ihr über ${name}? 👇`,`Entdeckt das Juwel von ${city}: ${name} ✨`,`Verpasst ${name} in ${city} nicht! 📍`,`Habt ihr ${name} probiert? 😍`][seed%6] },
+  };
+  const cityM  = address.match(/\d{4}\s+([A-Za-zÀ-ÿ\s-]+),/i);
+  const city   = (cityM?.[1] || address.split(",")[0] || "").trim();
+  const seed   = name.split("").reduce((a,c) => a+c.charCodeAt(0), 0);
+  const tLabel = { restaurant:"restaurant", hotel:"hotel", bar:"bar" }[type] || type;
+  const cityTag = city.replace(/\s+/g,"");
+  const lang   = LANG[language] || LANG.en;
+  const parts  = [];
+  if (captionOpts.catchy)  { parts.push(lang.opener(name,tLabel,city,seed)); parts.push(""); }
+  if (captionOpts.name && name)       parts.push(`📍 ${name}`);
+  if (captionOpts.address && address) parts.push(`📌 ${address}`);
+  if ((captionOpts.name||captionOpts.address) && (captionOpts.song||captionOpts.hashtags)) parts.push("");
+  if (captionOpts.song && songInfo)   parts.push(`🎵 ${songInfo.name} – ${songInfo.artist}`);
+  if (captionOpts.hashtags) {
+    const tc = tLabel.charAt(0).toUpperCase() + tLabel.slice(1);
+    parts.push(`\n#${cityTag} #FoodFluencer #${tc}Photography #Foodie #Belgium`);
+  }
+  return parts.join("\n").trim();
+}
+
+async function updateRunLogStatus(postIndex, status) {
+  // 1. Update the per-schedule run log
+  const d = await chrome.storage.local.get({ autoBotRunLog:[], autoBotSchedule:null });
+  const log = d.autoBotRunLog;
+  const entry = log.find(e => e.postIndex === postIndex);
+  if (entry) entry.status = status; else log.push({ postIndex, status, ts:new Date().toISOString() });
+  await chrome.storage.local.set({ autoBotRunLog: log });
+
+  // 2. On completion, append to the persistent activityLog (survives deactivation)
+  if (status === "done") {
+    const post = d.autoBotSchedule?.posts?.[postIndex];
+    if (post?.platforms?.length) {
+      const newEntries = post.platforms.map(platform => ({
+        id:        `al-${Date.now()}-${platform}`,
+        ts:        new Date().toISOString(),
+        platform,
+        postIndex,
+        status:    "done",
+      }));
+      const al = await chrome.storage.local.get({ activityLog:[] });
+      await chrome.storage.local.set({
+        activityLog: [...al.activityLog, ...newEntries].slice(-2000),
+      });
+      TechLog.info("LOG", "activity_log_written", { postIndex, platforms: post.platforms });
+    }
+  }
+
+  chrome.runtime.sendMessage({ type:"AUTO_BOT_STATUS_UPDATE", postIndex, status }).catch(() => {});
+}
+
+// ── Main auto-posting function ────────────────────────────────────────────────
+async function autoPostNow(postIndex) {
+  const data = await chrome.storage.local.get(["autoBotActive","autoBotSchedule","autoBotConfig"]);
+  if (!data.autoBotActive) return;
+
+  const post   = data.autoBotSchedule?.posts?.[postIndex];
+  const config = data.autoBotConfig;
+  if (!post || !config) return;
+
+  const apiKey = await getApiKey();
+  if (!apiKey) { bgLog("error","Auto Bot: no API key configured"); return; }
+
+  await updateRunLogStatus(postIndex, "triggered");
+  TechLog.info("POST", "post_start", { postIndex, platforms: post.platforms });
+
+  try {
+    // 1 ── Find an entity
+    TechLog.info("SEARCH", "search_start", { type: config.type, country: config.country, region: config.region });
+    bgLog("info", `Auto Bot post ${postIndex}: searching for ${config.type||"restaurant"}…`);
+    const t0    = Date.now();
+    const place = await searchAutoPlaceBG(config, apiKey);
+    const name    = place.displayName?.text || "";
+    const address = place.formattedAddress  || "";
+    TechLog.info("SEARCH", "search_done", { name, address, duration: Date.now()-t0 });
+    bgLog("info", `Auto Bot: found "${name}"`);
+
+    // 2 ── Resolve photos
+    TechLog.info("MEDIA", "photos_start", { name });
+    const allPhotos = (place.photos||[]).sort((a,b)=>(b.width||0)-(a.width||0));
+    const minPics   = Math.max(parseInt(config.minPics||"3",10), 3);
+    const numPhotos = Math.min(allPhotos.length, 5, Math.max(minPics, 3));
+    const photoUris = await Promise.all(
+      allPhotos.slice(0, numPhotos).map(p => resolvePhotoUriBG(p.name, 900, apiKey))
+    );
+    const photoDataUrls = await Promise.all(photoUris.map(fetchAsDataUrl));
+    TechLog.info("MEDIA", "photos_done", { count: photoDataUrls.length });
+
+    // 3 ── Pick a song
+    TechLog.info("SONG", "song_start", { genre: config.songGenre });
+    const songInfo = await getAutoSongBG(config.songGenre||"top100", config.country||"BE").catch(() => null);
+    TechLog.info("SONG", songInfo ? "song_found" : "song_skipped", { song: songInfo?.name, artist: songInfo?.artist });
+
+    // 4 ── Build caption
+    const captionOpts = {
+      catchy:   config.capCatchy   ?? true,
+      name:     config.capName     ?? true,
+      address:  config.capAddr     ?? true,
+      hashtags: config.capHash     ?? true,
+      song:     config.capSong     ?? true,
+    };
+    const caption = getAutoCaptionBG(name, address, config.type||"restaurant",
+                                      config.language||"nl", captionOpts, songInfo);
+    TechLog.info("CAPTION", "caption_built", { language: config.language, length: caption.length });
+
+    // 5 ── Fetch audio for TikTok
+    let tiktokAudioDataUrl = null;
+    if (post.platforms.includes("tiktok") && songInfo?.previewUrl) {
+      TechLog.info("MEDIA", "audio_fetch_start", { previewUrl: songInfo.previewUrl });
+      tiktokAudioDataUrl = await fetchAsDataUrl(songInfo.previewUrl).catch(e => {
+        TechLog.warn("MEDIA", "audio_fetch_failed", { error: e.message });
+        return null;
+      });
+      if (tiktokAudioDataUrl) TechLog.info("MEDIA", "audio_fetch_done", { sizeKB: Math.round(tiktokAudioDataUrl.length * 0.75 / 1024) });
+    }
+
+    // 6 ── Post to each platform
+    let anyFailed = false;
+    for (const platform of post.platforms) {
+      TechLog.info("POST", "platform_start", { platform, postIndex });
+      bgLog("info", `Auto Bot: posting to ${platform}…`);
+      const result = await handleSocialPost({
+        platform, photoDataUrls, caption,
+        songName:           songInfo?.name || "",
+        location:           address,
+        restaurantName:     name,
+        tiktokAudioDataUrl: platform === "tiktok" ? tiktokAudioDataUrl : null,
+        autoPost:           true,
+      });
+      if (result?.failed) {
+        anyFailed = true;
+        TechLog.error("POST", "platform_post_failed", { platform, postIndex, error: result.error });
+        bgLog("error", `Auto Bot: ${platform} failed — ${result.error}`);
+      } else {
+        TechLog.info("POST", "platform_post_complete", { platform, postIndex });
+      }
+      if (post.platforms.indexOf(platform) < post.platforms.length - 1)
+        await new Promise(r => setTimeout(r, 4000));
+    }
+
+    const finalStatus = anyFailed ? "failed" : "done";
+    await updateRunLogStatus(postIndex, finalStatus);
+    TechLog.info("POST", "post_complete", { postIndex, name, platforms: post.platforms, status: finalStatus });
+    TechLog._flush();
+    bgLog("info", `Auto Bot post ${postIndex} ${finalStatus}`, { name });
+
+  } catch(err) {
+    TechLog.error("POST", "post_failed", { postIndex, error: err.message });
+    TechLog._flush();
+    bgLog("error", `Auto Bot post ${postIndex} failed`, err.message);
+    await updateRunLogStatus(postIndex, "failed");
+  }
+}
+
+// ── Technical logger (background context) ────────────────────────────────────
+const TechLog = {
+  _buf: [],
+  _MAX: 25,
+  _entry(level, cat, action, details = {}) {
+    const e = { id:`${Date.now()}-${Math.random().toString(36).slice(2,5)}`, ts:new Date().toISOString(), level, source:"background", category:cat, action, ...details };
+    this._buf.push(e);
+    if (this._buf.length >= this._MAX || level === "error") this._flush();
+    return e;
+  },
+  info:  (c,a,d) => TechLog._entry("info",  c,a,d||{}),
+  warn:  (c,a,d) => TechLog._entry("warn",  c,a,d||{}),
+  error: (c,a,d) => TechLog._entry("error", c,a,d||{}),
+  _flush() {
+    if (!this._buf.length) return;
+    const toFlush = [...this._buf]; this._buf = [];
+    chrome.storage.local.get({ techLog:[] }, ({techLog}) => {
+      chrome.storage.local.set({ techLog:[...techLog,...toFlush].slice(-1000) });
+    });
+  },
+};
 
 // ── Background logger ─────────────────────────────────────────────────────────
 
@@ -58,6 +346,20 @@ function bgLog(level, message, data) {
 // ── Message router ────────────────────────────────────────────────────────────
 
 chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
+  if (msg.type === "TIKTOK_VIDEO_SPECS") {
+    TechLog.info("POST", "tiktok_video_injected", { sizeMB: msg.sizeMB, mimeType: msg.mimeType, hasAudio: msg.hasAudio });
+    return;
+  }
+  if (msg.type === "TIKTOK_UPLOAD_ERROR") {
+    TechLog.error("POST", "tiktok_upload_rejected", {
+      matched:     msg.matched,
+      context:     msg.context,
+      pageSnippet: msg.pageSnippet,
+      autoPost:    msg.autoPost,
+    });
+    bgLog("error", "TikTok upload rejected", msg.matched);
+    return;
+  }
   if (msg.type === "DOWNLOAD") {
     chrome.downloads.download(
       { url: msg.url, filename: msg.filename, conflictAction: "uniquify" },
@@ -85,8 +387,12 @@ const INJECTORS = {
   tiktok:    injectTikTok,
 };
 
-async function handleSocialPost({ platform, photoDataUrls, caption, songName, location, restaurantName, tiktokAudioDataUrl }) {
-  bgLog('info', `Opening ${platform}`, { photos: photoDataUrls.length, song: songName, location, tiktokAudioKB: tiktokAudioDataUrl ? Math.round(tiktokAudioDataUrl.length * 0.75 / 1024) : 0 });
+async function handleSocialPost({ platform, photoDataUrls, caption, songName, location, restaurantName, tiktokAudioDataUrl, autoPost = false }) {
+  bgLog('info', `Opening ${platform}`, { photos: photoDataUrls.length, song: songName, location, autoPost });
+  // TikTok's upload page REQUIRES an active/focused tab to initialise its upload
+  // handlers and process file input injection. Opening in the background (active:false)
+  // throttles timers and prevents TikTok from processing the injected video file.
+  // Always open as active — this was the V1.4 behaviour that worked correctly.
   const tab = await chrome.tabs.create({ url: PLATFORM_URLS[platform], active: true });
 
   await new Promise(resolve => {
@@ -102,17 +408,56 @@ async function handleSocialPost({ platform, photoDataUrls, caption, songName, lo
   await new Promise(r => setTimeout(r, 3000));
 
   try {
+    // ── Relay script (ISOLATED world) ───────────────────────────────────────
+    // Injectors run in MAIN world where chrome.runtime is unavailable.
+    // This relay runs in ISOLATED world, listens for custom DOM events
+    // dispatched by the MAIN injector, and forwards them as real messages.
+    await chrome.scripting.executeScript({
+      target: { tabId: tab.id },
+      func: function ffbotRelay() {
+        if (window.__ffbotRelayActive) return;
+        window.__ffbotRelayActive = true;
+        document.addEventListener('__ffbot_complete', e =>
+          chrome.runtime.sendMessage({ type:'PLATFORM_POST_COMPLETE', ...(e.detail||{}) }));
+        document.addEventListener('__ffbot_failed', e =>
+          chrome.runtime.sendMessage({ type:'PLATFORM_POST_FAILED',   ...(e.detail||{}) }));
+        document.addEventListener('__ffbot_event', e =>
+          chrome.runtime.sendMessage(e.detail || {}));
+      },
+      world: "ISOLATED",
+    });
+
+    // ── Main injector (MAIN world) ───────────────────────────────────────────
     await chrome.scripting.executeScript({
       target: { tabId: tab.id },
       func:   INJECTORS[platform],
-      args:   [photoDataUrls, caption, songName || "", location || "", { restaurantName: restaurantName || "", tiktokAudioDataUrl: tiktokAudioDataUrl || null }],
+      args:   [photoDataUrls, caption, songName || "", location || "", { restaurantName: restaurantName || "", tiktokAudioDataUrl: tiktokAudioDataUrl || null, autoPost: autoPost }],
       world:  "MAIN",
     });
     bgLog('info', `Injected script on ${platform}`);
+
+    // ── Wait for completion signal (60 s fallback) ───────────────────────────
+    if (autoPost) {
+      const result = await new Promise(resolve => {
+        const timeout = setTimeout(() => { cleanup(); resolve({ failed: false }); }, 60000);
+        function cleanup() { clearTimeout(timeout); chrome.runtime.onMessage.removeListener(listener); }
+        function listener(msg, sender) {
+          if (sender.tab?.id !== tab.id) return;
+          if (msg.type === "PLATFORM_POST_COMPLETE") { cleanup(); resolve({ failed: false }); }
+          if (msg.type === "PLATFORM_POST_FAILED")   { cleanup(); resolve({ failed: true, error: msg.error }); }
+        }
+        chrome.runtime.onMessage.addListener(listener);
+      });
+      setTimeout(() => chrome.tabs.remove(tab.id).catch(() => {}), 3000);
+      return result;
+    }
+
   } catch (err) {
     bgLog('error', `Inject failed on ${platform}`, String(err));
-    console.error(`[FoodFluencer] Inject failed on ${platform}:`, err);
+    if (autoPost) chrome.tabs.remove(tab.id).catch(() => {});
+    return { failed: true, error: String(err) };
   }
+  return { failed: false };
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -279,8 +624,24 @@ function injectFacebook(photoDataUrls, caption, songName, location, opts) {
     }
     await sleep(400);
 
-    // ⑤  Song hint (optional)
-    if (songName) {
+    // ⑤  Song hint / auto-post
+    const { autoPost: fbAutoPost = false } = opts || {};
+    if (fbAutoPost) {
+      step(4, total, '🤖 Auto-posting…');
+      await sleep(800);
+      // Find Facebook's blue "Post" button inside the open dialog
+      const postBtn = document.querySelector('[aria-label="Post"]') ||
+        [...document.querySelectorAll('[role="button"]')]
+          .find(el => /^post$/i.test((el.innerText||'').trim()));
+      if (postBtn) {
+        postBtn.click();
+        step(4, total, '✅ Posted to Facebook!', 'success');
+        document.dispatchEvent(new CustomEvent('__ffbot_complete', { detail:{ platform:'facebook' } }));
+      } else {
+        step(4, total, '⚠️ Could not find Post button', 'warn');
+        document.dispatchEvent(new CustomEvent('__ffbot_failed', { detail:{ platform:'facebook', error:'Post button not found' } }));
+      }
+    } else if (songName) {
       step(5, total, `Add <em>"${songName}"</em> via <strong>Feeling/Activity → Music</strong>, then click <strong>Post</strong>.`, 'success');
     } else {
       step(4, total, `✅ ${files.length} photo${files.length > 1 ? 's' : ''} &amp; caption ready — click <strong>Post</strong> to publish.`, 'success');
@@ -834,12 +1195,30 @@ function injectInstagram(photoDataUrls, caption, songName, location, opts) {
       }
     }
 
-    // ══ Final: stop here, user clicks Share ══════════════════════════════════
-    const songHint = songName ? ` &nbsp;🎵 Tap <strong>Add music</strong> → <em>"${songName}"</em>.` : '';
-    step(total, total,
-      `✅ All ready! Review caption, location &amp; collaborator.${songHint} Click <strong>Share</strong> to publish.`,
-      'success');
-    dbg('Bot stopped — waiting for user to click Share');
+    // ══ Final: auto-click Share (auto mode) or wait for user (manual mode) ═══
+    const { autoPost = false } = opts || {};
+    if (autoPost) {
+      step(total, total, '🤖 Auto-sharing…');
+      await sleep(800);
+      // Find the Share button (Instagram's final submit)
+      const shareBtn = await waitForBtn(/^(share|delen|partager|teilen)$/i, 10000);
+      if (shareBtn) {
+        shareBtn.click();
+        dbg('Auto-clicked Share on Instagram');
+        await sleep(5000);
+        step(total, total, '✅ Posted to Instagram!', 'success');
+        document.dispatchEvent(new CustomEvent('__ffbot_complete', { detail:{ platform:'instagram' } }));
+      } else {
+        step(total, total, '⚠️ Could not find Share button', 'warn');
+        document.dispatchEvent(new CustomEvent('__ffbot_failed', { detail:{ platform:'instagram', error:'Share button not found' } }));
+      }
+    } else {
+      const songHint = songName ? ` &nbsp;🎵 Tap <strong>Add music</strong> → <em>"${songName}"</em>.` : '';
+      step(total, total,
+        `✅ All ready! Review caption, location &amp; collaborator.${songHint} Click <strong>Share</strong> to publish.`,
+        'success');
+      dbg('Bot stopped — waiting for user to click Share');
+    }
   })();
 }
 
@@ -886,7 +1265,7 @@ function injectTikTok(photoDataUrls, caption, songName, location, opts) {
   // ═══════════════════════════════════════════════════════════════════════════
   // Build H.264 MP4 (+ optional AAC audio) entirely inside TikTok's page context
   // ═══════════════════════════════════════════════════════════════════════════
-  async function buildH264MP4(imgDataUrls, audioDataUrl) {
+  async function buildH264MP4(imgDataUrls, audioDataUrl, restaurantName, address) {
     const W = 720, H = 1280, FPS = 25, BITRATE = 2_000_000, SEC = 1.2;
 
     const images = [];
@@ -904,10 +1283,79 @@ function injectTikTok(photoDataUrls, caption, songName, location, opts) {
     canvas.width = W; canvas.height = H;
     const ctx = canvas.getContext('2d');
 
+    // ── Plain slide (photos 2-N) ─────────────────────────────────────────────
     function drawSlide(img) {
       ctx.fillStyle = '#000'; ctx.fillRect(0, 0, W, H);
       const s = Math.min(W / img.naturalWidth, H / img.naturalHeight);
       ctx.drawImage(img, (W - img.naturalWidth * s) / 2, (H - img.naturalHeight * s) / 2, img.naturalWidth * s, img.naturalHeight * s);
+    }
+
+    // ── Cover slide (first frame) — restaurant name + location overlay ───────
+    // Mirrors popup.js createCoverOverlay logic, adapted for 720×1280 portrait.
+    function drawCoverSlide(img) {
+      ctx.fillStyle = '#000'; ctx.fillRect(0, 0, W, H);
+      const s = Math.min(W / img.naturalWidth, H / img.naturalHeight);
+      const ox = (W - img.naturalWidth * s) / 2, oy = (H - img.naturalHeight * s) / 2;
+      ctx.drawImage(img, ox, oy, img.naturalWidth * s, img.naturalHeight * s);
+
+      // Sample luminance of 3 vertical zones → choose darkest for text placement
+      function sampleLum(y0, h0) {
+        try {
+          const d = ctx.getImageData(0, Math.round(y0), W, Math.max(1, Math.round(h0))).data;
+          let sum = 0, n = 0;
+          for (let i = 0; i < d.length; i += 16) { sum += 0.299*d[i] + 0.587*d[i+1] + 0.114*d[i+2]; n++; }
+          return n > 0 ? sum / n : 128;
+        } catch(_) { return 128; }
+      }
+      const zones = [
+        { lum: sampleLum(0,      H*0.37), centerY: H*0.22 },
+        { lum: sampleLum(H*0.30, H*0.40), centerY: H*0.50 },
+        { lum: sampleLum(H*0.63, H*0.37), centerY: H*0.80 },
+      ];
+      const best = zones.reduce((a, b) => a.lum <= b.lum ? a : b);
+
+      // Vignette centred on the chosen zone
+      const vlin = ctx.createLinearGradient(0, best.centerY - H*0.22, 0, best.centerY + H*0.22);
+      vlin.addColorStop(0,   'rgba(0,0,0,0.00)');
+      vlin.addColorStop(0.5, 'rgba(0,0,0,0.52)');
+      vlin.addColorStop(1,   'rgba(0,0,0,0.00)');
+      ctx.fillStyle = vlin; ctx.fillRect(0, 0, W, H);
+      const vedge = ctx.createRadialGradient(W/2, H/2, H*0.18, W/2, H/2, H*0.82);
+      vedge.addColorStop(0, 'rgba(0,0,0,0.00)');
+      vedge.addColorStop(1, 'rgba(0,0,0,0.28)');
+      ctx.fillStyle = vedge; ctx.fillRect(0, 0, W, H);
+
+      const nameSize   = Math.max(36, Math.round(W * 0.072));
+      const tagSize    = Math.max(18, Math.round(W * 0.028));
+      const cornerSize = Math.max(12, Math.round(W * 0.016));
+      const gap        = Math.round(nameSize * 0.42);
+
+      const cityM = (address || '').match(/\d{4}\s+([A-Za-zÀ-ÿ\s-]+),\s*Belgium/i);
+      const city  = (cityM?.[1] || (address || '').split(',')[0] || '').trim();
+      const taglines = [`Discover ${city}'s hidden gem ✨`, `Best kept secret in ${city} 🍽`, `A must-visit in ${city} 📍`, `Taste the best of ${city} 🔥`];
+      const tagline = city
+        ? taglines[Math.abs([...(restaurantName||'')].reduce((a,c)=>a+c.charCodeAt(0),0)) % taglines.length]
+        : 'Discover this hidden gem ✨';
+
+      let ty = best.centerY - (tagSize + gap + nameSize) / 2;
+      ctx.fillStyle = '#FFF'; ctx.textAlign = 'center'; ctx.textBaseline = 'top';
+      ctx.shadowColor = 'rgba(0,0,0,0.72)'; ctx.shadowOffsetX = 0;
+
+      ctx.font = `300 italic ${tagSize}px "Cormorant Garamond",Georgia,Palatino,serif`;
+      ctx.shadowBlur = Math.round(tagSize * 0.55); ctx.shadowOffsetY = 1;
+      ctx.fillText(tagline, W/2, ty);
+      ty += tagSize + gap;
+
+      ctx.font = `400 ${nameSize}px "Cormorant Garamond",Georgia,Palatino,serif`;
+      ctx.shadowBlur = Math.round(nameSize * 0.26); ctx.shadowOffsetY = 2;
+      ctx.fillText(restaurantName || '', W/2, ty);
+
+      if (city) {
+        ctx.font = `300 ${cornerSize}px "Cormorant Garamond",Georgia,Palatino,serif`;
+        ctx.textAlign = 'right'; ctx.textBaseline = 'bottom';
+        ctx.shadowBlur = 3; ctx.shadowOffsetY = 0;
+        ctx.fillText(`${city}, Belgium`, W - Math.round(W*0.032), H - Math.round(H*0.025));
+      }
     }
 
     // ── Encode video with WebCodecs ──────────────────────────────────────────
@@ -938,7 +1386,8 @@ function injectTikTok(photoDataUrls, caption, songName, location, opts) {
     const framesPerSlide = Math.ceil(SEC * FPS);
     let fi = 0;
     for (let i = 0; i < images.length; i++) {
-      drawSlide(images[i]);
+      if (i === 0 && restaurantName) drawCoverSlide(images[i]);
+      else drawSlide(images[i]);
       for (let f = 0; f < framesPerSlide; f++) {
         if (vErr) throw new Error('VideoEncoder: ' + vErr.message);
         const ts = Math.round(fi * 1_000_000 / FPS);
@@ -959,69 +1408,85 @@ function injectTikTok(photoDataUrls, caption, songName, location, opts) {
     const videoSec = images.length * SEC;
 
     if (audioDataUrl && window.AudioEncoder && window.AudioData) {
-      try {
-        banner(1, `Encoding audio (${Math.round(videoSec)}s)…`);
-        // Decode audio data URL → AudioBuffer
-        const b64   = audioDataUrl.split(',')[1];
-        const bytes = Uint8Array.from(atob(b64), c => c.charCodeAt(0));
-        const tmpCtx = new (window.AudioContext || window.webkitAudioContext)({ sampleRate: AUDIO_SAMPLE_RATE });
-        const audioBuf = await tmpCtx.decodeAudioData(bytes.buffer.slice(0));
-        await tmpCtx.close();
+      banner(1, `Encoding audio (${Math.round(videoSec)}s)…`);
 
-        const totalAudioFrames = Math.min(
-          Math.ceil(videoSec * AUDIO_SAMPLE_RATE),
-          audioBuf.length
-        );
-        const numCh = Math.min(audioBuf.numberOfChannels, AUDIO_CHANNELS);
+      // Three-layer protection:
+      //  1. No AudioContext.resume() — it hangs forever without a user gesture
+      //     (TikTok tab is active so AudioContext won't be suspended anyway).
+      //  2. Per-operation timeouts on isConfigSupported() and flush().
+      //  3. 20s master timeout: bot always falls back to video-only rather than blocking.
+      const audioResult = await Promise.race([
 
-        const aSupport = await AudioEncoder.isConfigSupported({
-          codec: 'mp4a.40.2', sampleRate: AUDIO_SAMPLE_RATE,
-          numberOfChannels: numCh, bitrate: 128000,
-        });
+        (async () => {
+          try {
+            // ── Decode MP3 → AudioBuffer ─────────────────────────────────────
+            // decodeAudioData works in any AudioContext state — no resume() needed.
+            const b64    = audioDataUrl.split(',')[1];
+            const bytes  = Uint8Array.from(atob(b64), c => c.charCodeAt(0));
+            const tmpCtx = new (window.AudioContext || window.webkitAudioContext)({ sampleRate: AUDIO_SAMPLE_RATE });
+            const audioBuf = await tmpCtx.decodeAudioData(bytes.buffer.slice(0));
+            tmpCtx.close().catch(() => {});   // fire-and-forget — no await
 
-        if (aSupport.supported) {
-          let aErr = null;
-          const aEnc = new AudioEncoder({
-            output: (chunk) => {
-              const buf = new ArrayBuffer(chunk.byteLength); chunk.copyTo(buf);
-              aChunks.push({ data: new Uint8Array(buf), timestamp: chunk.timestamp });
-            },
-            error: e => { aErr = e; },
-          });
-          aEnc.configure({ codec: 'mp4a.40.2', sampleRate: AUDIO_SAMPLE_RATE, numberOfChannels: numCh, bitrate: 128000 });
+            const totalAudioFrames = Math.min(Math.ceil(videoSec * AUDIO_SAMPLE_RATE), audioBuf.length);
+            const numCh = Math.min(audioBuf.numberOfChannels, AUDIO_CHANNELS);
 
-          const FRAME_SIZE = 1024;
-          const ch = [];
-          for (let c = 0; c < numCh; c++) ch.push(audioBuf.getChannelData(c));
+            // ── Check codec support (5 s guard) ─────────────────────────────
+            const aSupport = await Promise.race([
+              AudioEncoder.isConfigSupported({ codec:'mp4a.40.2', sampleRate:AUDIO_SAMPLE_RATE, numberOfChannels:numCh, bitrate:128000 }),
+              new Promise(res => setTimeout(() => res({ supported: false }), 5000)),
+            ]);
+            if (!aSupport.supported) { dbg('AAC not supported — video-only'); return []; }
 
-          let processed = 0;
-          while (processed < totalAudioFrames) {
-            const frames = Math.min(FRAME_SIZE, totalAudioFrames - processed);
-            const planar  = new Float32Array(frames * numCh);
-            for (let c = 0; c < numCh; c++)
-              planar.set(ch[c].slice(processed, processed + frames), c * frames);
-
-            const ad = new AudioData({
-              format: 'f32-planar',
-              sampleRate: AUDIO_SAMPLE_RATE,
-              numberOfFrames: frames,
-              numberOfChannels: numCh,
-              timestamp: Math.round(processed * 1_000_000 / AUDIO_SAMPLE_RATE),
-              data: planar,
+            // ── Encode PCM → AAC-LC ──────────────────────────────────────────
+            const chunks = [];
+            let aErr = null;
+            const aEnc = new AudioEncoder({
+              output: (chunk) => {
+                const buf = new ArrayBuffer(chunk.byteLength); chunk.copyTo(buf);
+                chunks.push({ data: new Uint8Array(buf), timestamp: chunk.timestamp });
+              },
+              error: e => { aErr = e; },
             });
-            aEnc.encode(ad); ad.close();
-            processed += frames;
+            aEnc.configure({ codec:'mp4a.40.2', sampleRate:AUDIO_SAMPLE_RATE, numberOfChannels:numCh, bitrate:128000 });
+
+            const FRAME_SIZE = 1024;
+            const ch = [];
+            for (let c = 0; c < numCh; c++) ch.push(audioBuf.getChannelData(c));
+            let processed = 0;
+            while (processed < totalAudioFrames) {
+              if (aErr) throw new Error('AudioEncoder: ' + aErr.message);
+              const frames = Math.min(FRAME_SIZE, totalAudioFrames - processed);
+              const planar = new Float32Array(frames * numCh);
+              for (let c = 0; c < numCh; c++)
+                planar.set(ch[c].slice(processed, processed + frames), c * frames);
+              const ad = new AudioData({ format:'f32-planar', sampleRate:AUDIO_SAMPLE_RATE, numberOfFrames:frames, numberOfChannels:numCh, timestamp:Math.round(processed*1_000_000/AUDIO_SAMPLE_RATE), data:planar });
+              aEnc.encode(ad); ad.close();
+              processed += frames;
+            }
+
+            // ── Flush (10 s guard) ───────────────────────────────────────────
+            await Promise.race([
+              aEnc.flush().then(() => aEnc.close()),
+              new Promise((_, rej) => setTimeout(() => rej(new Error('flush timeout')), 10000)),
+            ]);
+            if (aErr) throw new Error('AudioEncoder: ' + aErr.message);
+            dbg(`Audio: ${chunks.length} AAC chunks (${numCh}ch)`);
+            return chunks;
+
+          } catch(e) {
+            dbg(`Audio encoding failed: ${e.message} — video-only`);
+            return [];
           }
-          await aEnc.flush(); aEnc.close();
-          if (aErr) throw new Error('AudioEncoder: ' + aErr.message);
-          dbg(`Audio: ${aChunks.length} AAC chunks (${numCh}ch)`);
-        } else {
-          dbg('AAC not supported — video-only');
-        }
-      } catch(e) {
-        dbg(`Audio encoding failed: ${e.message} — video-only`);
-        aChunks = [];
-      }
+        })(),
+
+        // ── Master timeout (20 s) ──────────────────────────────────────────
+        new Promise(res => setTimeout(() => {
+          dbg('Audio encoding timed out (20 s) — video-only');
+          res([]);
+        }, 20000)),
+      ]);
+
+      aChunks = audioResult;
     }
 
     const blob = muxMP4(vChunks, vDcfg, aChunks, W, H, FPS, fi, AUDIO_SAMPLE_RATE);
@@ -1174,17 +1639,42 @@ function injectTikTok(photoDataUrls, caption, songName, location, opts) {
     ['change','input'].forEach(ev => input.dispatchEvent(new Event(ev, { bubbles: true })));
   }
 
-  // ── Upload detection ──────────────────────────────────────────────────────
-  const ERR_RE = /over.*\d+.?min|minute.*limit|size.*too|too.*large|file.*too|maximum.*size|not.*support|unsupport|invalid.*file|upload.*fail/i;
+  // ── Upload detection — captures full error text for logging ──────────────
+  // NOTE: "maximum.*size" is intentionally excluded — TikTok shows
+  // "Maximum size: 30 GB, video…" as INSTRUCTIONAL text on the upload page
+  // before any file is processed. Matching it causes a false positive.
+  const ERR_RE = /over.*\d+.?min|minute.*limit|size.*too.*large|too.*large.*file|size.*exceed|exceed.*size|not.*support.*format|unsupport|invalid.*file.*format|upload.*fail|failed.*upload/i;
+
   async function checkUpload(ms = 25000) {
+    // Wait for TikTok to clear the upload-zone instructional text and start
+    // processing the injected file before we begin scanning for errors.
+    await sleep(4000);
+
     const start = Date.now();
     while (Date.now() - start < ms) {
       await sleep(700);
       const text = document.body.innerText || '';
-      if (ERR_RE.test(text)) { dbg(`Rejected: "${text.match(ERR_RE)?.[0]}"`); return 'rejected'; }
+      const errMatch = text.match(ERR_RE);
+      if (errMatch) {
+        // Extract a wider context around the error for logging
+        const errIdx  = text.toLowerCase().indexOf(errMatch[0].toLowerCase());
+        const context = text.slice(Math.max(0, errIdx - 40), errIdx + 120).trim();
+        dbg(`TikTok error detected: "${errMatch[0]}" | context: "${context}"`);
+        document.dispatchEvent(new CustomEvent('__ffbot_event', { detail:{
+          type:'TIKTOK_UPLOAD_ERROR', matched:errMatch[0], context, pageSnippet:text.slice(0,600),
+        }}));
+        return 'rejected';
+      }
       if (document.querySelector('[class*="DraftEditor"],[data-placeholder*="description" i],[data-placeholder*="caption" i]')) return 'accepted';
     }
-    return ERR_RE.test(document.body.innerText) ? 'rejected' : 'timeout';
+    // Final check on timeout
+    const finalText = document.body.innerText || '';
+    const finalErr  = finalText.match(ERR_RE);
+    if (finalErr) {
+      document.dispatchEvent(new CustomEvent('__ffbot_event', { detail:{ type:'TIKTOK_UPLOAD_ERROR', matched:finalErr[0], context:'timeout-check', pageSnippet:finalText.slice(0,600) }}));
+      return 'rejected';
+    }
+    return 'timeout';
   }
 
   // ═══════════════════════════════════════════════════════════════════════════
@@ -1199,7 +1689,7 @@ function injectTikTok(photoDataUrls, caption, songName, location, opts) {
 
     let videoFile = null;
     try {
-      const blob = await buildH264MP4(photoDataUrls, tiktokAudioDataUrl);
+      const blob = await buildH264MP4(photoDataUrls, tiktokAudioDataUrl, opts.restaurantName || '', location || '');
       const sizeMB = (blob.size / 1024 / 1024).toFixed(1);
       videoFile = new File([blob], 'tiktok-post.mp4', { type: 'video/mp4' });
       banner(1, `Video ready: ${sizeMB}MB H.264${hasAudio ? ' + AAC 🎵' : ''} — uploading…`);
@@ -1215,14 +1705,21 @@ function injectTikTok(photoDataUrls, caption, songName, location, opts) {
     const fileInput = await waitFor('input[type="file"]', 12000);
     if (!fileInput) { banner(2, '⚠️ Upload area not found. Refresh and retry.', 'warn'); return; }
 
-    dbg(`Injecting ${(videoFile.size/1024/1024).toFixed(1)}MB MP4…`);
+    const sizeMB = (videoFile.size / 1024 / 1024).toFixed(2);
+    dbg(`Injecting ${sizeMB}MB MP4 (type=${videoFile.type})…`);
+    // Log video specs before injection so we have this in TechLog for debugging
+    document.dispatchEvent(new CustomEvent('__ffbot_event', { detail:{ type:'TIKTOK_VIDEO_SPECS', sizeMB, mimeType:videoFile.type, hasAudio }}));
     injectFile(fileInput, videoFile);
 
     // ── Step 3: Wait for TikTok to process ──────────────────────────────
     banner(3, 'Processing video…');
     const result = await checkUpload(30000);
     if (result === 'rejected') {
-      banner(3, '⚠️ TikTok rejected the video. Check error on page.', 'warn');
+      // Capture visible error text for the banner
+      const visibleErr = (document.body.innerText || '').match(ERR_RE)?.[0] || 'unknown error';
+      banner(3, `⚠️ TikTok rejected: "<em>${visibleErr}</em>". Check the page for details.`, 'warn');
+      document.dispatchEvent(new CustomEvent('__ffbot_event', { detail:{ type:'TIKTOK_UPLOAD_ERROR', matched:visibleErr, context:'post-check', autoPost:opts?.autoPost }}));
+      document.dispatchEvent(new CustomEvent('__ffbot_failed', { detail:{ platform:'tiktok', error:'Upload rejected: '+visibleErr }}));
       return;
     }
     dbg('Upload accepted');
@@ -1299,13 +1796,92 @@ function injectTikTok(photoDataUrls, caption, songName, location, opts) {
       } else { dbg('Location button not found'); }
     }
 
-    // ── Done ─────────────────────────────────────────────────────────────
+    // ── Done: auto-click Post (auto mode) or wait for user (manual mode) ────
+    const { autoPost: ttAutoPost = false } = opts || {};
     const note = hasAudio ? ` 🎵 Song baked in.` : '';
-    banner(5,
-      `✅ All set!${note} Review &amp; click <strong>Post</strong>.`,
-      'success'
-    );
-    dbg('Bot complete');
+
+    if (ttAutoPost) {
+      banner(5, '🤖 Locating Post button…');
+      await sleep(2000); // TikTok may still be enabling the button
+
+      // Full React-compatible click — same sequence that works for the Next button
+      function reactClickEl(el) {
+        el.focus();
+        ['mouseenter','mouseover','mousedown','mouseup','click'].forEach(type =>
+          el.dispatchEvent(new MouseEvent(type, {
+            bubbles:true, cancelable:true, view:window, buttons:1, detail:type==='click'?1:0
+          }))
+        );
+        el.click(); // native click as backup
+      }
+
+      // Try multiple selectors with retries (TikTok may need time to enable the button)
+      let postBtn = null;
+      for (let attempt = 0; attempt < 12 && !postBtn; attempt++) {
+        // Priority: data-e2e attribute → button text → submit type
+        postBtn = document.querySelector('[data-e2e="btn-post"]') ||
+          document.querySelector('button[type="submit"]:not([disabled])') ||
+          [...document.querySelectorAll('button, [role="button"]')]
+            .filter(el => {
+              const r = el.getBoundingClientRect();
+              return r.width > 40 && r.height > 20; // must be visible
+            })
+            .find(el => /^post$/i.test((el.innerText||el.textContent||'').trim()));
+
+        if (!postBtn) {
+          dbg(`Post button not found (attempt ${attempt + 1}/12) — retrying…`);
+          await sleep(800);
+        }
+      }
+
+      if (postBtn) {
+        banner(5, '🤖 Auto-clicking Post…');
+        dbg(`Post button found: <${postBtn.tagName}> text="${(postBtn.innerText||'').trim()}"`);
+        reactClickEl(postBtn);
+
+        // TikTok sometimes shows a "Continue to post?" confirmation modal while
+        // still checking the video. Poll for it and click "Post Now" if it appears.
+        let confirmClicked = false;
+        for (let i = 0; i < 16; i++) {
+          await sleep(500);
+          const confirmBtn = Array.from(document.querySelectorAll('button,[role="button"],div[class*="btn"],div[class*="button"]'))
+            .find(el => /post\s*now/i.test((el.innerText || el.textContent || '').trim()));
+          if (confirmBtn) {
+            dbg('"Continue to post?" modal — clicking Post Now');
+            banner(5, '🤖 Confirming post (video still being reviewed)…');
+            reactClickEl(confirmBtn);
+            confirmClicked = true;
+            await sleep(3000);
+            break;
+          }
+        }
+
+        // Detect actual success (URL leaves /upload) or failure (error on page)
+        let postSuccess = false, postError = null;
+        for (let i = 0; i < 30; i++) {
+          await sleep(500);
+          if (!window.location.href.includes('/upload')) { postSuccess = true; break; }
+          const err = (document.body.innerText||'').match(/upload.*fail|post.*fail|violat|prohibited|not.*allow/i);
+          if (err) { postError = err[0]; break; }
+        }
+        if (!postSuccess && !postError) { postSuccess = true; } // timeout → assume success
+
+        if (postError) {
+          banner(5, `⚠️ TikTok post failed: ${postError}`, 'warn');
+          document.dispatchEvent(new CustomEvent('__ffbot_event', { detail:{ type:'TIKTOK_UPLOAD_ERROR', matched:postError, context:'post-completion' }}));
+          document.dispatchEvent(new CustomEvent('__ffbot_failed', { detail:{ platform:'tiktok', error:postError }}));
+        } else {
+          banner(5, `✅ Posted to TikTok!${note}`, 'success');
+          document.dispatchEvent(new CustomEvent('__ffbot_complete', { detail:{ platform:'tiktok' }}));
+        }
+      } else {
+        banner(5, '⚠️ Post button not found — please click Post manually.', 'warn');
+        document.dispatchEvent(new CustomEvent('__ffbot_failed', { detail:{ platform:'tiktok', error:'Post button not found' }}));
+      }
+    } else {
+      banner(5, `✅ All set!${note} Review &amp; click <strong>Post</strong>.`, 'success');
+      dbg('Bot complete');
+    }
   })();
 }
 
