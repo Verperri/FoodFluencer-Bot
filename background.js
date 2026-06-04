@@ -1112,32 +1112,58 @@ function injectInstagram(photoDataUrls, caption, songName, location, opts) {
 
     // ══ STEP 5 (if location): Add location ════════════════════════════════════
     if (location) {
-      await sleep(400);
+      await sleep(600);
       step(5, total, 'Adding location…');
+
+      // Extract the city name from address like "1000 Brussels, Belgium" → "Brussels"
       const cityMatch = location.match(/\d{4}\s+([A-Za-zÀ-ÿ\s-]+),\s*Belgium/i);
       const searchTerm = (cityMatch?.[1] || location.split(',')[0] || location).trim();
       dbg(`Location search term: "${searchTerm}"`);
 
-      let locTrigger = document.querySelector('[aria-label="Add location"],[placeholder*="location" i]');
-      if (!locTrigger) {
-        locTrigger = [...document.querySelectorAll('[role="button"],button,a,input')]
-          .find(el => /add.*(a\s+)?location/i.test(
-            el.getAttribute('aria-label') || el.getAttribute('placeholder') || el.innerText || el.textContent || ''));
-      }
+      // Find the "Add location" trigger — Instagram renders it as a row button
+      const locTrigger = [...document.querySelectorAll('[role="button"],button,div[tabindex="0"],a')]
+        .find(el => /add\s+(a\s+)?location/i.test(
+          el.getAttribute('aria-label') || el.innerText || el.textContent || ''));
+
       if (locTrigger) {
-        dbg(`Location trigger found: ${locTrigger.tagName}`);
-        locTrigger.click(); await sleep(400);
-        const locInput = await waitFor('input[placeholder*="Search" i],input[aria-label*="location" i]', 4000);
+        dbg(`Location trigger: <${locTrigger.tagName}> "${(locTrigger.innerText||'').trim()}"`);
+        reactClick(locTrigger);
+        await sleep(800);
+
+        // Wait for the location search input to appear
+        const locInput = await waitFor(
+          'input[placeholder*="Search" i], input[aria-label*="location" i], input[name*="location" i]',
+          5000
+        );
         if (locInput) {
-          locInput.focus(); await sleep(200);
-          for (const ch of searchTerm) { document.execCommand('insertText', false, ch); await sleep(55); }
-          dbg(`Typed "${searchTerm}" in location field`);
-          await sleep(2000);
-          const firstResult = document.querySelector('[role="option"]:first-child,[role="listitem"]:first-child');
-          if (firstResult) { firstResult.click(); dbg('Selected first location result'); await sleep(500); }
-          else dbg('No location results appeared');
+          reactClick(locInput);
+          await sleep(300);
+          // Type the search term character by character (triggers Instagram's autocomplete)
+          for (const ch of searchTerm) {
+            document.execCommand('insertText', false, ch);
+            await sleep(60);
+          }
+          dbg(`Typed location: "${searchTerm}"`);
+          await sleep(2500); // wait for results to load
+
+          // Click the first result using reactClick
+          const firstResult = [...document.querySelectorAll(
+            '[role="option"], [role="listitem"], [class*="Location"] [role="button"]'
+          )].find(el => isVisible(el));
+          if (firstResult) {
+            dbg(`Location result: "${(firstResult.innerText||'').trim().slice(0,50)}"`);
+            reactClick(firstResult);
+            await sleep(700);
+            step(5, total, `📍 Location set`);
+          } else {
+            dbg('No location results — skipping');
+          }
+        } else {
+          dbg('Location input not found after trigger click');
         }
-      } else { dbg('Location trigger not found'); }
+      } else {
+        dbg('Location trigger not found on page');
+      }
     }
 
     // ══ STEP 7: Search for restaurant as collaborator ════════════════════════
@@ -1198,18 +1224,60 @@ function injectInstagram(photoDataUrls, caption, songName, location, opts) {
     // ══ Final: auto-click Share (auto mode) or wait for user (manual mode) ═══
     const { autoPost = false } = opts || {};
     if (autoPost) {
-      step(total, total, '🤖 Auto-sharing…');
-      await sleep(800);
-      // Find the Share button (Instagram's final submit)
-      const shareBtn = await waitForBtn(/^(share|delen|partager|teilen)$/i, 10000);
+      step(total, total, '🤖 Finding Share button…');
+      await sleep(600);
+
+      // Share sits in the same top-right header position as the Next buttons.
+      // Use the same strategy: text match first, then aria-label, always topmost.
+      const SHARE_RE = /^(share|delen|partager|teilen|condividi|compartir|публикувам|dela)$/i;
+
+      function findVisibleShareBtn() {
+        const dialog = document.querySelector('[role="dialog"]');
+        const roots  = [dialog, document.body].filter(Boolean);
+
+        // ① Text match — exact "Share" visible inside the dialog header
+        for (const root of roots) {
+          const btn = [...root.querySelectorAll('[role="button"],button,[tabindex="0"],a')]
+            .find(el => {
+              const txt = (el.innerText || el.textContent || '').trim();
+              return SHARE_RE.test(txt) && isVisible(el);
+            });
+          if (btn) {
+            dbg(`Share btn by text: "${(btn.innerText||btn.textContent||'').trim()}"`);
+            return btn;
+          }
+        }
+
+        // ② aria-label fallback — pick topmost inside dialog
+        if (dialog) {
+          const candidates = [...dialog.querySelectorAll('[role="button"],button,[tabindex="0"],a')]
+            .filter(el => SHARE_RE.test(el.getAttribute('aria-label') || '') && isVisible(el))
+            .sort((a, b) => a.getBoundingClientRect().top - b.getBoundingClientRect().top);
+          if (candidates.length) {
+            dbg(`Share btn by aria-label: "${candidates[0].getAttribute('aria-label')}"`);
+            return candidates[0];
+          }
+        }
+        return null;
+      }
+
+      // Poll up to 15 s — location/collab steps may still be animating
+      let shareBtn = null;
+      const shareDeadline = Date.now() + 15000;
+      while (!shareBtn && Date.now() < shareDeadline) {
+        shareBtn = findVisibleShareBtn();
+        if (!shareBtn) await sleep(400);
+      }
+
       if (shareBtn) {
-        shareBtn.click();
-        dbg('Auto-clicked Share on Instagram');
-        await sleep(5000);
+        step(total, total, '🤖 Auto-clicking Share…');
+        reactClick(shareBtn);
+        dbg('Fired reactClick on Share button');
+        await sleep(6000); // wait for post to submit
         step(total, total, '✅ Posted to Instagram!', 'success');
         document.dispatchEvent(new CustomEvent('__ffbot_complete', { detail:{ platform:'instagram' } }));
       } else {
-        step(total, total, '⚠️ Could not find Share button', 'warn');
+        step(total, total, '⚠️ Share button not found — click it manually.', 'warn');
         document.dispatchEvent(new CustomEvent('__ffbot_failed', { detail:{ platform:'instagram', error:'Share button not found' } }));
       }
     } else {
