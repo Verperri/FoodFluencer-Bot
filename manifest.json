@@ -19,7 +19,8 @@
     "storage",
     "tabs",
     "scripting",
-    "clipboardWrite"
+    "clipboardWrite",
+    "alarms"
   ],
   "host_permissions": [
     "https://places.googleapis.com/*",
