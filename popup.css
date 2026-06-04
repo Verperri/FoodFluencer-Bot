@@ -369,8 +369,8 @@ h1 { font-size: 0.95rem; font-weight: 700; line-height: 1.2; }
 .ab-region-wrap {
   display: flex; flex-wrap: wrap; gap: 5px;
   background: var(--surface); border: 1.5px solid var(--border);
-  border-radius: var(--radius); padding: 8px 10px;
-  max-height: 110px; overflow-y: auto;
+  border-radius: var(--radius); padding: 10px 10px;
+  /* No max-height — grows naturally to fit all regions */
 }
 .ab-region-chip {
   background: var(--bg); border: 1.5px solid var(--border);
@@ -418,6 +418,25 @@ h1 { font-size: 0.95rem; font-weight: 700; line-height: 1.2; }
   flex-shrink: 0; cursor: pointer;
 }
 .ab-checkbox input:checked + span { color: var(--text); font-weight: 600; }
+
+/* ── Preview Example button ── */
+.btn--preview-example {
+  width: 100%; padding: 11px 16px;
+  background: var(--surface); border: 2px dashed var(--border);
+  border-radius: var(--radius); cursor: pointer; color: var(--text);
+  font-size: .84rem; font-weight: 600; display: flex;
+  align-items: center; justify-content: center; gap: 8px;
+  transition: all .18s;
+}
+.btn--preview-example:hover {
+  border-color: var(--accent); color: var(--accent);
+  background: #fff8f6;
+}
+.preview-icon { font-size: 1rem; }
+.ab-preview-hint {
+  font-size: .7rem; color: var(--muted); text-align: center;
+  margin-top: 4px; line-height: 1.4;
+}
 
 /* ── Schedule button ── */
 .ab-actions { margin-top: 4px; }

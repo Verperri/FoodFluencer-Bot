@@ -218,10 +218,10 @@
           <label class="ab-label" for="abCountry">Country</label>
           <select id="abCountry" class="ab-select">
             <option value="BE">Belgium</option>
-            <option value="NL">The Netherlands</option>
-            <option value="LU">Luxembourg</option>
             <option value="FR">France</option>
             <option value="DE">Germany</option>
+            <option value="LU">Luxembourg</option>
+            <option value="NL">The Netherlands</option>
           </select>
         </div>
 
@@ -238,8 +238,8 @@
           <label class="ab-label" for="abLanguage">Language</label>
           <select id="abLanguage" class="ab-select">
             <option value="nl">Dutch</option>
-            <option value="fr">French</option>
             <option value="en">English</option>
+            <option value="fr">French</option>
             <option value="de">German</option>
           </select>
         </div>
@@ -251,9 +251,9 @@
             <span class="ab-slider-val" id="abMinRatingsVal">100</span>
           </label>
           <input type="range" id="abMinRatings" class="ab-slider"
-            min="0" max="2000" step="25" value="100" />
+            min="0" max="500" step="10" value="100" />
           <div class="ab-slider-range">
-            <span>0</span><span>2 000</span>
+            <span>0</span><span>500</span>
           </div>
         </div>
 
@@ -262,8 +262,8 @@
           <label class="ab-label">Minimum Stars</label>
           <div class="pill-row" id="abStars">
             <button class="ab-pill" data-val="3">⭐ 3.0</button>
-            <button class="ab-pill active" data-val="3.5">⭐ 3.5</button>
-            <button class="ab-pill" data-val="4">⭐ 4.0</button>
+            <button class="ab-pill" data-val="3.5">⭐ 3.5</button>
+            <button class="ab-pill active" data-val="4">⭐ 4.0</button>
             <button class="ab-pill" data-val="4.5">⭐ 4.5</button>
           </div>
         </div>
@@ -298,6 +298,15 @@
             <label class="ab-checkbox"><input type="checkbox" checked id="abCapHash"   /><span>Hashtags</span></label>
             <label class="ab-checkbox"><input type="checkbox" checked id="abCapSong"   /><span>Song Name</span></label>
           </div>
+        </div>
+
+        <!-- ── Preview Example ──────────────────────────────────── -->
+        <div class="ab-group">
+          <button class="btn btn--preview-example" type="button" id="abPreviewBtn">
+            <span class="preview-icon">👁</span>
+            Preview Example Post
+          </button>
+          <p class="ab-preview-hint">See what a generated post will look like based on your settings above</p>
         </div>
 
         <!-- ── Post to Social Media ─────────────────────────────── -->
