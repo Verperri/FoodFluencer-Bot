@@ -1520,8 +1520,16 @@ function injectTikTok(photoDataUrls, caption, songName, location, opts) {
   }
 
   // ── Upload detection — captures full error text for logging ──────────────
-  const ERR_RE = /over.*\d+.?min|minute.*limit|size.*too|too.*large|file.*too|maximum.*size|not.*support|unsupport|invalid.*file|upload.*fail|video.*error|error.*video/i;
+  // NOTE: "maximum.*size" is intentionally excluded — TikTok shows
+  // "Maximum size: 30 GB, video…" as INSTRUCTIONAL text on the upload page
+  // before any file is processed. Matching it causes a false positive.
+  const ERR_RE = /over.*\d+.?min|minute.*limit|size.*too.*large|too.*large.*file|size.*exceed|exceed.*size|not.*support.*format|unsupport|invalid.*file.*format|upload.*fail|failed.*upload/i;
+
   async function checkUpload(ms = 25000) {
+    // Wait for TikTok to clear the upload-zone instructional text and start
+    // processing the injected file before we begin scanning for errors.
+    await sleep(4000);
+
     const start = Date.now();
     while (Date.now() - start < ms) {
       await sleep(700);
