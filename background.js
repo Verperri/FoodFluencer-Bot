@@ -841,7 +841,93 @@ function injectInstagram(photoDataUrls, caption, songName, location, opts) {
     dbg('Upload dialog appeared');
 
     // ══ STEP 2: Inject photos ═════════════════════════════════════════════════
-    const files = photoDataUrls.map((url, i) => dataUrlToFile(url, `restaurant-${i + 1}.jpg`));
+    // Apply cover overlay to the first photo (restaurant name + tagline on darkest zone)
+    // Mirrors the popup.js createCoverOverlay logic — runs here in MAIN world (Canvas access).
+    async function applyCoverOverlay(dataUrl, name, addr) {
+      return new Promise(resolve => {
+        const img = new Image();
+        img.onload = () => {
+          try {
+            const W = img.naturalWidth || 1080, H = img.naturalHeight || 1080;
+            const cv = document.createElement('canvas'); cv.width = W; cv.height = H;
+            const cx = cv.getContext('2d');
+            cx.drawImage(img, 0, 0, W, H);
+
+            // Luminance sampling — find darkest of top / middle / bottom thirds
+            function sampleLum(y0, h0) {
+              try {
+                const d = cx.getImageData(0, Math.round(y0), W, Math.max(1, Math.round(h0))).data;
+                let s = 0, n = 0;
+                for (let i = 0; i < d.length; i += 16) { s += 0.299*d[i]+0.587*d[i+1]+0.114*d[i+2]; n++; }
+                return n ? s/n : 128;
+              } catch(_) { return 128; }
+            }
+            const zones = [
+              { lum: sampleLum(0,      H*0.37), centerY: H*0.22 },
+              { lum: sampleLum(H*0.30, H*0.40), centerY: H*0.50 },
+              { lum: sampleLum(H*0.63, H*0.37), centerY: H*0.80 },
+            ];
+            const best = zones.reduce((a, b) => a.lum <= b.lum ? a : b);
+
+            // Vignette on chosen zone
+            const vl = cx.createLinearGradient(0, best.centerY-H*0.22, 0, best.centerY+H*0.22);
+            vl.addColorStop(0, 'rgba(0,0,0,0)'); vl.addColorStop(0.5, 'rgba(0,0,0,.48)'); vl.addColorStop(1, 'rgba(0,0,0,0)');
+            cx.fillStyle = vl; cx.fillRect(0,0,W,H);
+            const ve = cx.createRadialGradient(W/2,H/2,H*.18,W/2,H/2,H*.82);
+            ve.addColorStop(0,'rgba(0,0,0,0)'); ve.addColorStop(1,'rgba(0,0,0,.28)');
+            cx.fillStyle = ve; cx.fillRect(0,0,W,H);
+
+            // Text sizes
+            const nameSize   = Math.max(32, Math.round(W * 0.072));
+            const tagSize    = Math.max(16, Math.round(W * 0.028));
+            const cornerSize = Math.max(10, Math.round(W * 0.016));
+            const gap        = Math.round(nameSize * 0.42);
+
+            const cityM = (addr||'').match(/\d{4}\s+([A-Za-zÀ-ÿ\s-]+),\s*Belgium/i);
+            const city  = (cityM?.[1] || (addr||'').split(',')[0] || '').trim();
+            const taglines = [`Discover ${city}'s hidden gem ✨`,`Best kept secret in ${city} 🍽`,`A must-visit in ${city} 📍`,`Taste the best of ${city} 🔥`];
+            const tagline = city
+              ? taglines[Math.abs([...(name||'')].reduce((a,c)=>a+c.charCodeAt(0),0)) % taglines.length]
+              : 'Discover this hidden gem ✨';
+
+            let ty = best.centerY - (tagSize + gap + nameSize) / 2;
+            cx.fillStyle='#fff'; cx.textAlign='center'; cx.textBaseline='top';
+            cx.shadowColor='rgba(0,0,0,.72)'; cx.shadowOffsetX=0;
+
+            cx.font=`300 italic ${tagSize}px "Cormorant Garamond",Georgia,Palatino,serif`;
+            cx.shadowBlur=Math.round(tagSize*.55); cx.shadowOffsetY=1;
+            cx.fillText(tagline, W/2, ty);
+            ty += tagSize + gap;
+
+            cx.font=`400 ${nameSize}px "Cormorant Garamond",Georgia,Palatino,serif`;
+            cx.shadowBlur=Math.round(nameSize*.26); cx.shadowOffsetY=2;
+            cx.fillText(name||'', W/2, ty);
+
+            if (city) {
+              cx.font=`300 ${cornerSize}px "Cormorant Garamond",Georgia,Palatino,serif`;
+              cx.textAlign='right'; cx.textBaseline='bottom';
+              cx.shadowBlur=3; cx.shadowOffsetY=0;
+              cx.fillText(`${city}, Belgium`, W-Math.round(W*.032), H-Math.round(H*.025));
+            }
+
+            resolve(cv.toDataURL('image/jpeg', 0.93));
+          } catch(e) {
+            dbg(`Cover overlay failed: ${e.message} — using original`);
+            resolve(dataUrl);
+          }
+        };
+        img.onerror = () => resolve(dataUrl);
+        img.src = dataUrl;
+      });
+    }
+
+    // Build files array — apply cover overlay to first photo only
+    step(2, total, `Applying cover overlay…`);
+    const coveredFirst = (restaurantName && photoDataUrls.length > 0)
+      ? await applyCoverOverlay(photoDataUrls[0], restaurantName, location || '')
+      : photoDataUrls[0];
+    const allUrls = [coveredFirst, ...photoDataUrls.slice(1)];
+    const files = allUrls.map((url, i) => dataUrlToFile(url, `restaurant-${i + 1}.jpg`));
     step(2, total, `Uploading ${files.length} photo${files.length > 1 ? 's' : ''}…`);
 
     let fileInput = null;
