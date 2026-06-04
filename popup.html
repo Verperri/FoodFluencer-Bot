@@ -233,17 +233,6 @@
           </div>
         </div>
 
-        <!-- ── Language ─────────────────────────────────────────── -->
-        <div class="ab-group">
-          <label class="ab-label" for="abLanguage">Language</label>
-          <select id="abLanguage" class="ab-select">
-            <option value="nl">Dutch</option>
-            <option value="en">English</option>
-            <option value="fr">French</option>
-            <option value="de">German</option>
-          </select>
-        </div>
-
         <!-- ── Minimum Ratings ──────────────────────────────────── -->
         <div class="ab-group">
           <label class="ab-label">
@@ -294,6 +283,18 @@
         <!-- ── Caption Content ──────────────────────────────────── -->
         <div class="ab-group">
           <label class="ab-label">Caption Content</label>
+
+          <!-- Language (inside Caption Content — controls caption language) -->
+          <div class="ab-caption-lang-row">
+            <label class="ab-caption-lang-label" for="abLanguage">Language</label>
+            <select id="abLanguage" class="ab-select ab-select--sm">
+              <option value="nl">Dutch</option>
+              <option value="en">English</option>
+              <option value="fr">French</option>
+              <option value="de">German</option>
+            </select>
+          </div>
+
           <div class="ab-checkbox-grid">
             <label class="ab-checkbox"><input type="checkbox" checked id="abCapCatchy" /><span>Catchy Phrase</span></label>
             <label class="ab-checkbox"><input type="checkbox" checked id="abCapName"   /><span>Name</span></label>

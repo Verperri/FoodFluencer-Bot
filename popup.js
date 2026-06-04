@@ -1038,6 +1038,135 @@ function buildMP4Blob(chunks, dcfg, W, H, fps, ts, sampleDur, totalFrames) {
   return new Blob([out], { type: 'video/mp4' });
 }
 
+// ── Auto Bot: language caption templates ─────────────────────────────────────
+
+const CAPTION_LANG = {
+  en: {
+    opener: (name, type, city, seed) => {
+      const t = type;
+      return [
+        `Have you visited ${name} yet? Drop a 💬 below!`,
+        `Best ${t} in ${city}? ${name} is worth every visit! 🔥`,
+        `What do you think of ${name}? Let us know 👇`,
+        `Discover the hidden gem of ${city}: ${name} ✨`,
+        `Don't miss ${name} next time you're in ${city}! 📍`,
+        `Have you tried ${name}? This is what dreams are made of 😍`,
+      ][seed % 6];
+    },
+  },
+  nl: {
+    opener: (name, type, city, seed) => {
+      const t = { restaurant:"restaurant", hotel:"hotel", bar:"bar" }[type] || type;
+      return [
+        `Ben je al bij ${name} geweest? Laat het ons weten! 💬`,
+        `Beste ${t} in ${city}? ${name} is zeker een bezoek waard! 🔥`,
+        `Wat vind je van ${name}? Vertel het ons! 👇`,
+        `Ontdek de verborgen parel van ${city}: ${name} ✨`,
+        `Mis ${name} niet als je in ${city} bent! 📍`,
+        `Heb je ${name} al geprobeerd? Dit is wat dromen zijn gemaakt van 😍`,
+      ][seed % 6];
+    },
+  },
+  fr: {
+    opener: (name, type, city, seed) => {
+      const t = { restaurant:"restaurant", hotel:"hôtel", bar:"bar" }[type] || type;
+      return [
+        `Avez-vous déjà visité ${name}? Laissez un commentaire! 💬`,
+        `Meilleur ${t} à ${city}? ${name} vaut vraiment le détour! 🔥`,
+        `Que pensez-vous de ${name}? Partagez votre avis! 👇`,
+        `Découvrez la perle cachée de ${city}: ${name} ✨`,
+        `Ne manquez pas ${name} lors de votre prochain séjour à ${city}! 📍`,
+        `Avez-vous essayé ${name}? C'est ce dont on rêve 😍`,
+      ][seed % 6];
+    },
+  },
+  de: {
+    opener: (name, type, city, seed) => {
+      const t = { restaurant:"Restaurant", hotel:"Hotel", bar:"Bar" }[type] || type;
+      return [
+        `Habt ihr ${name} schon besucht? Schreibt uns! 💬`,
+        `Bestes ${t} in ${city}? ${name} ist jeden Besuch wert! 🔥`,
+        `Was denkt ihr über ${name}? Erzählt uns! 👇`,
+        `Entdeckt das versteckte Juwel von ${city}: ${name} ✨`,
+        `Verpasst ${name} nicht bei eurem nächsten Besuch in ${city}! 📍`,
+        `Habt ihr ${name} schon ausprobiert? Davon träumt man 😍`,
+      ][seed % 6];
+    },
+  },
+};
+
+// iTunes country codes for Top 100 RSS feed
+const ITUNES_CC = { BE: "be", FR: "fr", DE: "de", LU: "be", NL: "nl" };
+
+// Fetch a song based on the selected genre and country
+async function getAutoSong(genre, country) {
+  const cc = ITUNES_CC[country] || "be";
+
+  if (genre === "top100") {
+    try {
+      // Use iTunes RSS Top Songs chart for the country (one API call)
+      const feedUrl = `https://itunes.apple.com/${cc}/rss/topsongs/limit=100/json`;
+      const feedRes = await fetch(feedUrl);
+      if (feedRes.ok) {
+        const feedData = await feedRes.json();
+        const entries  = feedData.feed?.entry || [];
+        if (entries.length) {
+          const entry   = entries[Math.floor(Math.random() * entries.length)];
+          const trackId = entry.id?.attributes?.["im:id"];
+          if (trackId) {
+            // Lookup full details (including previewUrl) — one extra call but cached by iTunes CDN
+            const lookupRes = await fetch(`https://itunes.apple.com/lookup?id=${trackId}`);
+            if (lookupRes.ok) {
+              const lookupData = await lookupRes.json();
+              const track = lookupData.results?.[0];
+              if (track) return {
+                name:       track.trackName,
+                artist:     track.artistName,
+                artwork:    track.artworkUrl100,
+                previewUrl: track.previewUrl || null,
+                genre:      "Top 100",
+              };
+            }
+          }
+          // Fallback: basic info from RSS
+          return {
+            name:       entry["im:name"]?.label || "Unknown",
+            artist:     entry["im:artist"]?.label || "Unknown",
+            artwork:    entry["im:image"]?.[2]?.label || "",
+            previewUrl: null,
+            genre:      "Top 100",
+          };
+        }
+      }
+    } catch(e) { /* fall through to search */ }
+  }
+
+  // Pop and Social Media — use iTunes Search API
+  const searchQueries = {
+    top100:      `top hits ${new Date().getFullYear()}`,
+    pop:         "pop hit",
+    socialmedia: `viral trending ${new Date().getFullYear()}`,
+  };
+  const genreLabels = { top100: "Top 100", pop: "Pop", socialmedia: "Social Media" };
+  const term = searchQueries[genre] || "pop hit";
+  const searchRes = await fetch(
+    `${ITUNES_SEARCH}?term=${encodeURIComponent(term)}&media=music&entity=song&limit=50`
+  );
+  if (!searchRes.ok) throw new Error("Could not reach iTunes");
+  const searchData = await searchRes.json();
+  const songs = searchData.results || [];
+  if (!songs.length) throw new Error(`No songs found for genre "${genre}"`);
+
+  const song = songs[Math.floor(Math.random() * songs.length)];
+  return {
+    name:       song.trackName,
+    artist:     song.artistName,
+    artwork:    song.artworkUrl100,
+    previewUrl: song.previewUrl || null,
+    genre:      genreLabels[genre] || genre,
+  };
+}
+
 // ── Auto Bot: type / country data ────────────────────────────────────────────
 
 // Maps UI type value → plain-language search term for Places API
@@ -1081,6 +1210,8 @@ function getAutoBotSettings() {
   const minRatings = parseInt(document.getElementById("abMinRatings")?.value || "100", 10);
   const minStars   = parseFloat(document.querySelector("#abStars .ab-pill.active")?.dataset?.val || "4");
   const minPics    = parseInt(document.querySelector("#abPics .ab-pill.active")?.dataset?.val || "5", 10);
+  const language   = document.getElementById("abLanguage")?.value || "nl";
+  const songGenre  = document.getElementById("abSongGenre")?.value || "top100";
 
   // Caption checkboxes
   const captionOpts = {
@@ -1091,7 +1222,7 @@ function getAutoBotSettings() {
     song:     document.getElementById("abCapSong")?.checked   ?? true,
   };
 
-  return { country, type, region, minRatings, minStars, minPics, captionOpts };
+  return { country, type, region, minRatings, minStars, minPics, language, songGenre, captionOpts };
 }
 
 // Search Places API with ALL filter parameters baked in (one call)
@@ -1154,46 +1285,46 @@ async function searchAutoPlace(type, country, region, minRatings = 0, minStars =
 }
 
 // ── Auto Bot caption generator ────────────────────────────────────────────────
-// Builds a caption string based on the Caption Content checkboxes.
-function getAutoCaption(name, address, type, captionOpts) {
-  const cityM  = address.match(/\d{4}\s+([A-Za-zÀ-ÿ\s-]+),\s*(?:Belgium|France|Germany|Luxembourg|Netherlands)/i);
-  const city   = (cityM?.[1] || address.split(",")[0] || "").trim();
-  const seed   = name.split("").reduce((a, c) => a + c.charCodeAt(0), 0);
-  const tLabel = type === "restaurant" ? "restaurant" : type === "hotel" ? "hotel" : "bar";
+// Builds a multilingual caption. Catchy opener + Name + Address use the selected
+// language. Hashtags and Song name are always in English.
+function getAutoCaption(name, address, type, language, captionOpts, songInfo = null) {
+  const cityM   = address.match(/\d{4}\s+([A-Za-zÀ-ÿ\s-]+),\s*(?:Belgium|France|Germany|Luxembourg|Netherlands)/i);
+  const city    = (cityM?.[1] || address.split(",")[0] || "").trim();
+  const seed    = name.split("").reduce((a, c) => a + c.charCodeAt(0), 0);
+  const tLabel  = type === "restaurant" ? "restaurant" : type === "hotel" ? "hotel" : "bar";
   const cityTag = city.replace(/\s+/g, "");
+  const lang    = CAPTION_LANG[language] || CAPTION_LANG.en;
 
   const parts = [];
 
-  // ── Catchy phrase ─────────────────────────────────────────────────────────
+  // ── Catchy phrase (language-aware) ───────────────────────────────────────
   if (captionOpts.catchy) {
-    const openers = [
-      `Have you visited ${name} yet? Drop a 💬 below!`,
-      `Best ${tLabel} in ${city}? ${name} is worth every visit 🔥`,
-      `What do you think of ${name}? Let us know 👇`,
-      `Discover the hidden gem of ${city}: ${name} ✨`,
-      `Don't miss ${name} next time you're in ${city}! 📍`,
-      `Have you tried ${name}? This is what dreams look like 😍`,
-    ];
-    parts.push(openers[seed % openers.length]);
+    parts.push(lang.opener(name, tLabel, city, seed));
     parts.push("");
   }
 
-  // ── Name ─────────────────────────────────────────────────────────────────
+  // ── Name (language-aware label) ──────────────────────────────────────────
   if (captionOpts.name && name)       parts.push(`📍 ${name}`);
 
-  // ── Address ──────────────────────────────────────────────────────────────
+  // ── Address (same across languages — it's a proper address) ──────────────
   if (captionOpts.address && address) parts.push(`📌 ${address}`);
 
-  if ((captionOpts.name || captionOpts.address) && (captionOpts.hashtags || captionOpts.song))
+  if ((captionOpts.name || captionOpts.address) && (captionOpts.song || captionOpts.hashtags))
     parts.push("");
 
-  // ── Song name placeholder (wired up when song genre is implemented) ───────
-  if (captionOpts.song) parts.push(`🎵 [Song — selected based on genre]`);
+  // ── Song name (always English) ────────────────────────────────────────────
+  if (captionOpts.song) {
+    if (songInfo) {
+      parts.push(`🎵 ${songInfo.name} – ${songInfo.artist}`);
+    } else {
+      parts.push(`🎵 [Song — selected based on genre]`);
+    }
+  }
 
-  // ── Hashtags ──────────────────────────────────────────────────────────────
+  // ── Hashtags (always English, tag-based) ─────────────────────────────────
   if (captionOpts.hashtags) {
     const tCapit = tLabel.charAt(0).toUpperCase() + tLabel.slice(1);
-    parts.push(`\n#${cityTag} #Belgian${tCapit} #FoodFluencer #Foodie #${tCapit}Photography #Belgium`);
+    parts.push(`\n#${cityTag} #FoodFluencer #${tCapit}Photography #Foodie #Belgium`);
   }
 
   return parts.join("\n").trim();
@@ -1209,42 +1340,46 @@ async function previewExamplePost() {
 
   const settings = getAutoBotSettings();
 
-  // Show panel with loading state
   panel.classList.remove("hidden");
-  content.innerHTML = `<div class="auto-preview-loading">🔍 Searching for ${settings.type}s in ${settings.region || AB_COUNTRY_NAMES[settings.country]}…</div>`;
-
-  // Scroll panel into view
+  content.innerHTML = `<div class="auto-preview-loading">🔍 Searching for ${settings.type}s · 🎵 Finding song…</div>`;
   panel.scrollIntoView({ behavior: "smooth", block: "nearest" });
 
   try {
-    const place = await searchAutoPlace(
-      settings.type, settings.country, settings.region,
-      settings.minRatings, settings.minStars, settings.minPics
-    );
+    // Run entity search and song search in parallel — one Places call + one iTunes call
+    const [place, songInfo] = await Promise.all([
+      searchAutoPlace(settings.type, settings.country, settings.region,
+                      settings.minRatings, settings.minStars, settings.minPics),
+      getAutoSong(settings.songGenre, settings.country).catch(e => {
+        AppLog.warn("Song fetch failed", e.message);
+        return null;
+      }),
+    ]);
 
-    const name    = place.displayName?.text || "Unknown";
-    const address = place.formattedAddress  || "";
-    const rating  = place.rating;
+    const name        = place.displayName?.text || "Unknown";
+    const address     = place.formattedAddress  || "";
+    const rating      = place.rating;
     const ratingCount = place.userRatingCount || 0;
 
-    // Select how many photos to show: random between minPics and min(available, 5)
-    const allPhotos  = (place.photos || []).sort((a, b) => (b.width || 0) - (a.width || 0));
-    const available  = Math.min(allPhotos.length, 5);
-    const minP       = Math.min(settings.minPics, available);
-    const numPhotos  = minP >= available ? available
-                     : minP + Math.floor(Math.random() * (available - minP + 1));
-    const photos     = allPhotos.slice(0, numPhotos).map(p => ({ name: p.name }));
+    // Photo count: random between minPics and min(available, 5)
+    const allPhotos = (place.photos || []).sort((a, b) => (b.width || 0) - (a.width || 0));
+    const available = Math.min(allPhotos.length, 5);
+    const minP      = Math.min(settings.minPics, available);
+    const numPhotos = minP >= available ? available
+                    : minP + Math.floor(Math.random() * (available - minP + 1));
+    const photos    = allPhotos.slice(0, numPhotos).map(p => ({ name: p.name }));
 
-    // Build caption from checkboxes
-    const caption = getAutoCaption(name, address, settings.type, settings.captionOpts);
+    // Multilingual caption with real song info
+    const caption = getAutoCaption(name, address, settings.type, settings.language, settings.captionOpts, songInfo);
 
     const typeLabel   = settings.type.charAt(0).toUpperCase() + settings.type.slice(1);
     const regionLabel = settings.region || AB_COUNTRY_NAMES[settings.country] || "Belgium";
+    const langLabels  = { nl:"Dutch", en:"English", fr:"French", de:"German" };
 
     content.innerHTML = `
       <div class="auto-preview-meta">
         <span class="auto-preview-type-badge ${settings.type}">${typeLabel}</span>
         <span class="auto-preview-region">📍 ${regionLabel}</span>
+        <span class="auto-preview-lang">🌐 ${langLabels[settings.language] || settings.language}</span>
       </div>
       <div class="auto-preview-card">
         <span class="auto-preview-name">${name}</span>
@@ -1252,8 +1387,17 @@ async function previewExamplePost() {
         ${rating ? `<span class="auto-preview-rating">⭐ ${rating} · ${ratingCount.toLocaleString()} ratings</span>` : ""}
       </div>
       <div class="auto-preview-photos" id="autoPreviewPhotos"></div>
-      ${caption ? `<div class="auto-preview-caption">${caption.replace(/\n/g, '<br>')}</div>` : ""}
-      <p class="auto-preview-note">${photos.length} photo${photos.length !== 1 ? 's' : ''} · filters: ≥${settings.minRatings} ratings · ≥${settings.minStars}⭐</p>
+      ${songInfo ? `
+        <div class="auto-preview-song">
+          <img src="${songInfo.artwork}" alt="" />
+          <div class="auto-preview-song-info">
+            <span class="auto-preview-song-name">${songInfo.name}</span>
+            <span class="auto-preview-song-artist">${songInfo.artist}</span>
+          </div>
+          <span class="auto-preview-genre-badge">${songInfo.genre}</span>
+        </div>` : ""}
+      ${caption ? `<div class="auto-preview-caption">${caption.replace(/\n/g, "<br>")}</div>` : ""}
+      <p class="auto-preview-note">${photos.length} photo${photos.length !== 1 ? "s" : ""} · ≥${settings.minRatings} ratings · ≥${settings.minStars}⭐</p>
     `;
 
     // Load photos async
@@ -1264,7 +1408,6 @@ async function previewExamplePost() {
         div.className = "auto-preview-photo";
         div.innerHTML = `<div class="loading-thumb">…</div>`;
         photoGrid.appendChild(div);
-
         resolvePhotoUri(photos[i].name, 400).then(uri => {
           if (i === 0) {
             createCoverOverlay(uri, name, address).then(overlay => {
@@ -1277,7 +1420,7 @@ async function previewExamplePost() {
       }
     }
 
-    AppLog.info("Auto Bot preview rendered", { name, type: settings.type, numPhotos, minRatings: settings.minRatings, minStars: settings.minStars });
+    AppLog.info("Auto Bot preview rendered", { name, type: settings.type, song: songInfo?.name, lang: settings.language });
   } catch(err) {
     content.innerHTML = `<div class="auto-preview-error">⚠️ ${err.message}</div>`;
     AppLog.error("Auto Bot preview failed", err.message);

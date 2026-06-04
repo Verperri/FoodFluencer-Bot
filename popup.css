@@ -427,6 +427,15 @@ h1 { font-size: 0.95rem; font-weight: 700; line-height: 1.2; }
 }
 .ab-checkbox input:checked + span { color: var(--text); font-weight: 600; }
 
+/* ── Language row inside Caption Content ── */
+.ab-caption-lang-row {
+  display: flex; align-items: center; gap: 8px; margin-bottom: 8px;
+}
+.ab-caption-lang-label {
+  font-size: .72rem; font-weight: 600; color: var(--muted);
+  text-transform: uppercase; letter-spacing: .04em; white-space: nowrap;
+}
+
 /* ── Preview Example button ── */
 .btn--preview-example {
   width: 100%; padding: 11px 16px;
@@ -566,6 +575,25 @@ h1 { font-size: 0.95rem; font-weight: 700; line-height: 1.2; }
 .auto-preview-photo:first-child img,
 .auto-preview-photo:first-child .loading-thumb {
   aspect-ratio: 1/1;
+}
+
+.auto-preview-lang {
+  font-size: .68rem; color: var(--muted); background: var(--bg);
+  border: 1px solid var(--border); border-radius: 10px; padding: 1px 7px;
+}
+.auto-preview-song {
+  display: flex; align-items: center; gap: 8px;
+  background: #f5f3ff; border: 1px solid #ddd6fe;
+  border-radius: 8px; padding: 7px 9px;
+}
+.auto-preview-song img { width: 36px; height: 36px; border-radius: 6px; flex-shrink: 0; }
+.auto-preview-song-info { flex: 1; min-width: 0; }
+.auto-preview-song-name   { font-size: .78rem; font-weight: 600; display: block; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.auto-preview-song-artist { font-size: .7rem; color: var(--muted); display: block; }
+.auto-preview-genre-badge {
+  font-size: .62rem; font-weight: 700; text-transform: uppercase;
+  letter-spacing: .05em; background: #7c3aed; color: #fff;
+  border-radius: 10px; padding: 2px 7px; flex-shrink: 0;
 }
 
 .auto-preview-caption {
