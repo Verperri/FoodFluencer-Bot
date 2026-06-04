@@ -850,7 +850,15 @@ function injectInstagram(photoDataUrls, caption, songName, location, opts) {
         const img = new Image();
         img.onload = () => {
           try {
-            const W = img.naturalWidth || 1080, H = img.naturalHeight || 1080;
+            // Normalise to a fixed 1080 px wide canvas regardless of source size.
+            // This ensures font sizes are always proportional to a known reference
+            // dimension — prevents oversized text on large Google Places photos.
+            const MAX_W = 1080;
+            const srcW  = img.naturalWidth  || 1080;
+            const srcH  = img.naturalHeight || 1080;
+            const scale = Math.min(1, MAX_W / srcW);   // never upscale
+            const W = Math.round(srcW * scale);
+            const H = Math.round(srcH * scale);
             const cv = document.createElement('canvas'); cv.width = W; cv.height = H;
             const cx = cv.getContext('2d');
             cx.drawImage(img, 0, 0, W, H);
