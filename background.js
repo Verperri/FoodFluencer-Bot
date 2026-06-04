@@ -513,10 +513,11 @@ function injectFacebook(photoDataUrls, caption, songName, location, opts) {
         ${n}/${total}
       </span>
       <span style="font-weight:400;flex:1">${html}</span>
-      <button onclick="document.getElementById('ffbot-banner').remove()"
+      <button id="ffbot-close-btn"
         style="background:rgba(255,255,255,.22);border:none;color:#fff;border-radius:5px;
         padding:3px 9px;cursor:pointer;white-space:nowrap;flex-shrink:0">✕ Close</button>`;
     document.body.prepend(b);
+    b.querySelector('#ffbot-close-btn')?.addEventListener('click', () => b.remove());
   }
 
   /* ── main flow ── */
@@ -718,13 +719,14 @@ function injectInstagram(photoDataUrls, caption, songName, location, opts) {
           <span id="ffbot-step" style="background:rgba(255,255,255,.22);border-radius:20px;
             padding:1px 8px;font-size:.72rem"></span>
           <span id="ffbot-msg" style="font-weight:400;flex:1"></span>
-          <button onclick="document.getElementById('ffbot-banner').remove()"
+          <button id="ffbot-close-btn"
             style="background:rgba(255,255,255,.22);border:none;color:#fff;
             border-radius:5px;padding:3px 9px;cursor:pointer;flex-shrink:0">✕</button>
         </div>
         <div id="ffbot-log" style="font-size:.7rem;opacity:.8;line-height:1.5;
           max-height:60px;overflow:hidden"></div>`;
       document.body.prepend(b);
+      b.querySelector('#ffbot-close-btn')?.addEventListener('click', () => b.remove());
     }
     const bg = { info: '#e8490f', success: '#16a34a', warn: '#d97706' }[type] || '#e8490f';
     b.style.background = bg;
@@ -1359,8 +1361,30 @@ function injectInstagram(photoDataUrls, caption, songName, location, opts) {
         step(total, total, '🤖 Auto-clicking Share…');
         reactClick(shareBtn);
         dbg('Fired reactClick on Share button');
-        await sleep(6000); // wait for post to submit
-        step(total, total, '✅ Posted to Instagram!', 'success');
+
+        // Poll for Instagram's success confirmation message (up to 20 s).
+        // Instagram shows "Your post has been shared" in the dialog after posting.
+        // If we see it → confirmed success.  If we time out → optimistic success.
+        step(total, total, '⏳ Waiting for post confirmation…');
+        const SUCCESS_RE = /your post has been shared|post.*shared|shared.*successfully|je bericht is gedeeld|bericht.*gedeeld/i;
+        let postConfirmed = false;
+        const confirmDeadline = Date.now() + 20000;
+        while (Date.now() < confirmDeadline) {
+          await sleep(500);
+          const pageText = document.body.innerText || '';
+          if (SUCCESS_RE.test(pageText)) {
+            postConfirmed = true;
+            dbg('Instagram confirmed: "Your post has been shared"');
+            break;
+          }
+        }
+
+        if (postConfirmed) {
+          step(total, total, '✅ Instagram confirmed: post shared!', 'success');
+        } else {
+          dbg('Confirmation text not found within 20 s — assuming success');
+          step(total, total, '✅ Posted to Instagram!', 'success');
+        }
         document.dispatchEvent(new CustomEvent('__ffbot_complete', { detail:{ platform:'instagram' } }));
       } else {
         step(total, total, '⚠️ Share button not found — click it manually.', 'warn');
@@ -1404,11 +1428,12 @@ function injectTikTok(photoDataUrls, caption, songName, location, opts) {
         <strong>🍽️ FoodFluencer</strong>
         <span style="background:rgba(255,255,255,.22);border-radius:20px;padding:1px 8px;font-size:.72rem">${n}/${TOTAL}</span>
         <span style="font-weight:400;flex:1">${html}</span>
-        <button onclick="document.getElementById('ffbot-banner').remove()"
+        <button id="ffbot-close-btn"
           style="background:rgba(255,255,255,.22);border:none;color:#fff;border-radius:5px;padding:3px 9px;cursor:pointer">✕</button>
       </div>
       <div id="ffbot-log" style="font-size:.68rem;opacity:.78;max-height:30px;overflow:hidden"></div>`;
     document.body.prepend(b);
+    b.querySelector('#ffbot-close-btn')?.addEventListener('click', () => b.remove());
   }
   function dbg(msg) {
     const l = document.getElementById('ffbot-log');
