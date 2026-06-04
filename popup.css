@@ -732,10 +732,44 @@ h1 { font-size: 0.95rem; font-weight: 700; line-height: 1.2; }
 .ab-log-header {
   display: flex; align-items: center; justify-content: space-between;
   padding: 9px 12px; border-bottom: 1px solid var(--border);
-  background: var(--bg);
+  background: var(--bg); position: relative;
 }
 .ab-log-title { font-size: .78rem; font-weight: 700; color: var(--text); }
-.ab-log-period { font-size: .68rem; color: var(--muted); }
+
+/* Controls row (filter + reset) */
+.ab-log-controls { display: flex; align-items: center; gap: 5px; }
+.ab-log-filter-btn {
+  background: var(--surface); border: 1px solid var(--border); border-radius: 8px;
+  font-size: .68rem; font-weight: 600; color: var(--muted); padding: 2px 7px;
+  cursor: pointer; display: flex; align-items: center; gap: 3px;
+  transition: all .15s;
+}
+.ab-log-filter-btn:hover, .ab-log-filter-btn.active {
+  border-color: var(--accent); color: var(--accent);
+}
+.ab-log-reset-btn {
+  background: transparent; border: 1px solid var(--border); border-radius: 8px;
+  font-size: .76rem; color: var(--muted); padding: 2px 6px; cursor: pointer;
+  transition: all .15s;
+}
+.ab-log-reset-btn:hover { border-color: var(--error); color: var(--error); }
+
+/* Filter dropdown */
+.ab-filter-dropdown {
+  position: absolute; top: 100%; right: 10px; z-index: 50;
+  background: var(--surface); border: 1.5px solid var(--border);
+  border-radius: var(--radius); box-shadow: 0 4px 14px rgba(0,0,0,.12);
+  overflow: hidden; min-width: 110px;
+}
+.ab-filter-opt {
+  display: block; width: 100%; text-align: left; background: none; border: none;
+  padding: 8px 13px; font-size: .76rem; color: var(--text); cursor: pointer;
+  transition: background .12s;
+}
+.ab-filter-opt:hover { background: var(--bg); }
+.ab-filter-opt--active {
+  color: var(--accent); font-weight: 700; background: #fff8f6;
+}
 .ab-log-items { padding: 4px 0; }
 .ab-log-item {
   display: flex; align-items: center; justify-content: space-between;

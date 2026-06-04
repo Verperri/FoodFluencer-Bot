@@ -175,11 +175,32 @@ function getAutoCaptionBG(name, address, type, language, captionOpts, songInfo) 
 }
 
 async function updateRunLogStatus(postIndex, status) {
-  const d = await chrome.storage.local.get({ autoBotRunLog:[] });
+  // 1. Update the per-schedule run log
+  const d = await chrome.storage.local.get({ autoBotRunLog:[], autoBotSchedule:null });
   const log = d.autoBotRunLog;
   const entry = log.find(e => e.postIndex === postIndex);
   if (entry) entry.status = status; else log.push({ postIndex, status, ts:new Date().toISOString() });
   await chrome.storage.local.set({ autoBotRunLog: log });
+
+  // 2. On completion, append to the persistent activityLog (survives deactivation)
+  if (status === "done") {
+    const post = d.autoBotSchedule?.posts?.[postIndex];
+    if (post?.platforms?.length) {
+      const newEntries = post.platforms.map(platform => ({
+        id:        `al-${Date.now()}-${platform}`,
+        ts:        new Date().toISOString(),
+        platform,
+        postIndex,
+        status:    "done",
+      }));
+      const al = await chrome.storage.local.get({ activityLog:[] });
+      await chrome.storage.local.set({
+        activityLog: [...al.activityLog, ...newEntries].slice(-2000),
+      });
+      TechLog.info("LOG", "activity_log_written", { postIndex, platforms: post.platforms });
+    }
+  }
+
   chrome.runtime.sendMessage({ type:"AUTO_BOT_STATUS_UPDATE", postIndex, status }).catch(() => {});
 }
 

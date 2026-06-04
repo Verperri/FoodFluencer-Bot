@@ -1813,7 +1813,11 @@ function getScheduleSettings() {
 // AUTO BOT ACTIVATION LOGIC
 // ══════════════════════════════════════════════════════════════════════════════
 
-let autoBotActive = false;
+let autoBotActive      = false;
+let activityLogFilter  = "month"; // "day" | "week" | "month" | "year"
+
+const FILTER_LABELS = { day:"Last 24 hours", week:"Last 7 days", month:"Last 30 days", year:"Last year" };
+const FILTER_SHORT  = { day:"1d", week:"7d", month:"30d", year:"1y" };
 
 // ── Collapsible config toggle ─────────────────────────────────────────────────
 document.getElementById("abConfigToggle")?.addEventListener("click", () => {
@@ -1862,7 +1866,7 @@ function activateBot() {
 
   updateBotUI(true);
   renderScheduledPosts(schedule);
-  refreshActivityLog([]);
+  refreshActivityLog();
   updateProgress(0, schedule.totalPosts);
   updateNextPostLabel(schedule);
   updateConfigSummary();
@@ -1873,18 +1877,19 @@ function activateBot() {
 
 function deactivateBot() {
   autoBotActive = false;
-  // Clear schedule + run log so the next activation gets a fresh start
+  // Clear SCHEDULE data only — activityLog (persistent history) is preserved
   chrome.storage.local.set({ autoBotActive: false, autoBotSchedule: null, autoBotRunLog: [] });
   chrome.alarms.clearAll();
   updateBotUI(false);
-  // Reset all counters and panels
+  // Reset schedule-specific UI
   updateProgress(0, 0);
-  refreshActivityLog([]);
   const schedBody = document.getElementById("abSchedBody");
   if (schedBody) schedBody.innerHTML = "";
   const badge = document.getElementById("abSchedCount");
   if (badge) badge.textContent = "0";
-  AppLog.info("Auto Bot deactivated — schedule cleared");
+  // Refresh activity log from persistent store (unchanged)
+  refreshActivityLog();
+  AppLog.info("Auto Bot deactivated — schedule cleared, activity log preserved");
   TechLog.info("SCHEDULE", "bot_deactivated", { scheduleCleared: true });
 }
 
@@ -2003,18 +2008,69 @@ function updateNextPostLabel(schedule) {
   }
 }
 
-// ── Activity log ──────────────────────────────────────────────────────────────
-function refreshActivityLog(runLog) {
-  const counts = { instagram:0, facebook:0, tiktok:0 };
-  (runLog||[]).forEach(e => {
-    if (e.status === "done") (e.platforms||[]).forEach(p => { if (p in counts) counts[p]++; });
+// ── Activity log — reads from persistent activityLog, filtered by time ────────
+function refreshActivityLog(filter) {
+  if (filter) activityLogFilter = filter;
+  const now    = new Date();
+  const ms     = { day:864e5, week:6048e5, month:2592e6, year:31536e6 };
+  const cutoff = new Date(now - (ms[activityLogFilter] || ms.month));
+
+  chrome.storage.local.get({ activityLog:[] }, ({ activityLog }) => {
+    const counts = { instagram:0, facebook:0, tiktok:0 };
+    activityLog
+      .filter(e => e.status === "done" && new Date(e.ts) >= cutoff)
+      .forEach(e => { if (e.platform in counts) counts[e.platform]++; });
+
+    const total = Object.values(counts).reduce((a,b) => a+b, 0);
+    const fmt   = n => `${n} post${n !== 1 ? "s" : ""}`;
+    const set   = (id,v) => { const el=document.getElementById(id); if(el) el.textContent=v; };
+
+    set("abLogIG",          fmt(counts.instagram));
+    set("abLogFB",          fmt(counts.facebook));
+    set("abLogTT",          fmt(counts.tiktok));
+    set("abLogTotal",       fmt(total));
+    set("abLogPeriodLabel", FILTER_SHORT[activityLogFilter]  || "30d");
+    set("abLogPeriod",      FILTER_LABELS[activityLogFilter] || "Last 30 days");
+
+    // Highlight active filter option
+    document.querySelectorAll(".ab-filter-opt").forEach(btn =>
+      btn.classList.toggle("ab-filter-opt--active", btn.dataset.filter === activityLogFilter)
+    );
   });
-  const total = Object.values(counts).reduce((a,b)=>a+b,0);
-  const fmt = n => `${n} post${n !== 1 ? "s" : ""}`;
-  const s = (id,v) => { const e=document.getElementById(id); if(e) e.textContent=fmt(v); };
-  s("abLogIG", counts.instagram); s("abLogFB", counts.facebook);
-  s("abLogTT", counts.tiktok);    s("abLogTotal", total);
 }
+
+function resetActivityLog() {
+  if (!confirm("Reset the entire activity log? This cannot be undone.")) return;
+  chrome.storage.local.set({ activityLog:[] }, () => {
+    refreshActivityLog();
+    AppLog.info("Activity log reset by user");
+    TechLog.info("LOG", "activity_log_reset", {});
+  });
+}
+
+// Filter dropdown toggle
+document.getElementById("abLogFilterBtn")?.addEventListener("click", e => {
+  e.stopPropagation();
+  document.getElementById("abLogFilterDropdown")?.classList.toggle("hidden");
+  document.getElementById("abLogFilterBtn")?.classList.toggle("active");
+});
+
+// Filter option selection
+document.getElementById("abLogFilterDropdown")?.addEventListener("click", e => {
+  const opt = e.target.closest(".ab-filter-opt");
+  if (!opt) return;
+  document.getElementById("abLogFilterDropdown")?.classList.add("hidden");
+  document.getElementById("abLogFilterBtn")?.classList.remove("active");
+  refreshActivityLog(opt.dataset.filter);
+});
+
+// Close dropdown when clicking outside
+document.addEventListener("click", () => {
+  document.getElementById("abLogFilterDropdown")?.classList.add("hidden");
+  document.getElementById("abLogFilterBtn")?.classList.remove("active");
+});
+
+document.getElementById("abLogResetBtn")?.addEventListener("click", resetActivityLog);
 
 // ── Config summary (shown when config is collapsed) ───────────────────────────
 function updateConfigSummary() {
@@ -2035,7 +2091,7 @@ chrome.runtime.onMessage.addListener((msg) => {
   if (msg.type === "AUTO_BOT_TRIGGERED") {
     updateScheduledItemStatus(msg.logEntry.postIndex, "triggered");
     chrome.storage.local.get({ autoBotRunLog:[], autoBotSchedule:null }, ({ autoBotRunLog, autoBotSchedule }) => {
-      refreshActivityLog(autoBotRunLog);
+      refreshActivityLog(); // reads from persistent activityLog
       const done = autoBotRunLog.filter(e => e.status === "done").length;
       updateProgress(done, autoBotSchedule?.totalPosts || 0);
     });
@@ -2043,7 +2099,7 @@ chrome.runtime.onMessage.addListener((msg) => {
   if (msg.type === "AUTO_BOT_STATUS_UPDATE") {
     updateScheduledItemStatus(msg.postIndex, msg.status);
     chrome.storage.local.get({ autoBotRunLog:[], autoBotSchedule:null }, ({ autoBotRunLog, autoBotSchedule }) => {
-      refreshActivityLog(autoBotRunLog);
+      refreshActivityLog(); // reads from persistent activityLog
       const done = autoBotRunLog.filter(e => e.status === "done").length;
       updateProgress(done, autoBotSchedule?.totalPosts || 0);
       if (autoBotSchedule) updateNextPostLabel(autoBotSchedule);
@@ -2056,7 +2112,7 @@ function restoreBotActiveState() {
   chrome.storage.local.get({ autoBotActive:false, autoBotSchedule:null, autoBotRunLog:[] },
     ({ autoBotActive: wasActive, autoBotSchedule: schedule, autoBotRunLog: runLog }) => {
       autoBotActive = wasActive;
-      refreshActivityLog(runLog);
+      refreshActivityLog();
       if (wasActive && schedule) {
         updateBotUI(true);
         renderScheduledPosts(schedule);
