@@ -2171,10 +2171,10 @@ document.getElementById("btnAutoMode").addEventListener("click",   () => {
 document.getElementById("manualBackBtn").addEventListener("click", () => showMode("selector"));
 document.getElementById("autoBackBtn").addEventListener("click",   () => showMode("selector"));
 
-// Restore last mode on open
-chrome.storage.local.get({ lastMode: "selector" }, ({ lastMode }) => {
-  // Always start at selector so the user consciously picks each session
-  showMode("selector");
+// Restore last mode on open — respect autoBotActive so it doesn't override auto-navigate
+chrome.storage.local.get({ lastMode: "selector", autoBotActive: false }, ({ lastMode, autoBotActive: botActive }) => {
+  // If bot is active, the main init already navigated to auto mode — don't override it
+  if (!botActive) showMode("selector");
 });
 
 // ── Auto Bot UI logic ─────────────────────────────────────────────────────────

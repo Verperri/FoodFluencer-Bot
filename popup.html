@@ -464,18 +464,20 @@
           <div class="ab-log-header">
             <span class="ab-log-title">📊 Activity Log</span>
             <div class="ab-log-controls">
-              <button class="ab-log-filter-btn" id="abLogFilterBtn" title="Filter by time period">
-                🕐 <span id="abLogPeriodLabel">30d</span> ▾
-              </button>
+              <!-- Filter button + dropdown in one positioned wrapper -->
+              <div class="ab-log-filter-wrap">
+                <button class="ab-log-filter-btn" id="abLogFilterBtn" title="Filter by time period">
+                  🕐 <span id="abLogPeriodLabel">30d</span> ▾
+                </button>
+                <div class="ab-filter-dropdown hidden" id="abLogFilterDropdown">
+                  <button class="ab-filter-opt" data-filter="day">Last Day</button>
+                  <button class="ab-filter-opt" data-filter="week">Last Week</button>
+                  <button class="ab-filter-opt ab-filter-opt--active" data-filter="month">Last Month</button>
+                  <button class="ab-filter-opt" data-filter="year">Last Year</button>
+                </div>
+              </div>
               <button class="ab-log-reset-btn" id="abLogResetBtn" title="Reset activity log">↺</button>
             </div>
-          </div>
-          <!-- Filter dropdown -->
-          <div class="ab-filter-dropdown hidden" id="abLogFilterDropdown">
-            <button class="ab-filter-opt" data-filter="day">Last Day</button>
-            <button class="ab-filter-opt" data-filter="week">Last Week</button>
-            <button class="ab-filter-opt ab-filter-opt--active" data-filter="month">Last Month</button>
-            <button class="ab-filter-opt" data-filter="year">Last Year</button>
           </div>
           <div class="ab-log-items">
 

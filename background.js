@@ -338,6 +338,20 @@ function bgLog(level, message, data) {
 // ── Message router ────────────────────────────────────────────────────────────
 
 chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
+  if (msg.type === "TIKTOK_VIDEO_SPECS") {
+    TechLog.info("POST", "tiktok_video_injected", { sizeMB: msg.sizeMB, mimeType: msg.mimeType, hasAudio: msg.hasAudio });
+    return;
+  }
+  if (msg.type === "TIKTOK_UPLOAD_ERROR") {
+    TechLog.error("POST", "tiktok_upload_rejected", {
+      matched:     msg.matched,
+      context:     msg.context,
+      pageSnippet: msg.pageSnippet,
+      autoPost:    msg.autoPost,
+    });
+    bgLog("error", "TikTok upload rejected", msg.matched);
+    return;
+  }
   if (msg.type === "DOWNLOAD") {
     chrome.downloads.download(
       { url: msg.url, filename: msg.filename, conflictAction: "uniquify" },
@@ -1505,17 +1519,40 @@ function injectTikTok(photoDataUrls, caption, songName, location, opts) {
     ['change','input'].forEach(ev => input.dispatchEvent(new Event(ev, { bubbles: true })));
   }
 
-  // ── Upload detection ──────────────────────────────────────────────────────
-  const ERR_RE = /over.*\d+.?min|minute.*limit|size.*too|too.*large|file.*too|maximum.*size|not.*support|unsupport|invalid.*file|upload.*fail/i;
+  // ── Upload detection — captures full error text for logging ──────────────
+  const ERR_RE = /over.*\d+.?min|minute.*limit|size.*too|too.*large|file.*too|maximum.*size|not.*support|unsupport|invalid.*file|upload.*fail|video.*error|error.*video/i;
   async function checkUpload(ms = 25000) {
     const start = Date.now();
     while (Date.now() - start < ms) {
       await sleep(700);
       const text = document.body.innerText || '';
-      if (ERR_RE.test(text)) { dbg(`Rejected: "${text.match(ERR_RE)?.[0]}"`); return 'rejected'; }
+      const errMatch = text.match(ERR_RE);
+      if (errMatch) {
+        // Extract a wider context around the error for logging
+        const errIdx  = text.toLowerCase().indexOf(errMatch[0].toLowerCase());
+        const context = text.slice(Math.max(0, errIdx - 40), errIdx + 120).trim();
+        dbg(`TikTok error detected: "${errMatch[0]}" | context: "${context}"`);
+        // Send full error details back to background service worker for persistent logging
+        try {
+          chrome.runtime.sendMessage({
+            type:    'TIKTOK_UPLOAD_ERROR',
+            matched: errMatch[0],
+            context,
+            pageSnippet: text.slice(0, 600),
+          });
+        } catch(_) {}
+        return 'rejected';
+      }
       if (document.querySelector('[class*="DraftEditor"],[data-placeholder*="description" i],[data-placeholder*="caption" i]')) return 'accepted';
     }
-    return ERR_RE.test(document.body.innerText) ? 'rejected' : 'timeout';
+    // Final check on timeout
+    const finalText = document.body.innerText || '';
+    const finalErr  = finalText.match(ERR_RE);
+    if (finalErr) {
+      try { chrome.runtime.sendMessage({ type:'TIKTOK_UPLOAD_ERROR', matched:finalErr[0], context:'timeout-check', pageSnippet:finalText.slice(0,600) }); } catch(_) {}
+      return 'rejected';
+    }
+    return 'timeout';
   }
 
   // ═══════════════════════════════════════════════════════════════════════════
@@ -1546,14 +1583,20 @@ function injectTikTok(photoDataUrls, caption, songName, location, opts) {
     const fileInput = await waitFor('input[type="file"]', 12000);
     if (!fileInput) { banner(2, '⚠️ Upload area not found. Refresh and retry.', 'warn'); return; }
 
-    dbg(`Injecting ${(videoFile.size/1024/1024).toFixed(1)}MB MP4…`);
+    const sizeMB = (videoFile.size / 1024 / 1024).toFixed(2);
+    dbg(`Injecting ${sizeMB}MB MP4 (type=${videoFile.type})…`);
+    // Log video specs before injection so we have this in TechLog for debugging
+    try { chrome.runtime.sendMessage({ type:'TIKTOK_VIDEO_SPECS', sizeMB, mimeType:videoFile.type, hasAudio }); } catch(_) {}
     injectFile(fileInput, videoFile);
 
     // ── Step 3: Wait for TikTok to process ──────────────────────────────
     banner(3, 'Processing video…');
     const result = await checkUpload(30000);
     if (result === 'rejected') {
-      banner(3, '⚠️ TikTok rejected the video. Check error on page.', 'warn');
+      // Capture visible error text for the banner
+      const visibleErr = (document.body.innerText || '').match(ERR_RE)?.[0] || 'unknown error';
+      banner(3, `⚠️ TikTok rejected: "<em>${visibleErr}</em>". Check the page for details.`, 'warn');
+      try { chrome.runtime.sendMessage({ type:'TIKTOK_UPLOAD_ERROR', matched:visibleErr, context:'post-check', autoPost: opts?.autoPost }); } catch(_) {}
       return;
     }
     dbg('Upload accepted');
