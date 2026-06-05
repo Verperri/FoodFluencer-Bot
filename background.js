@@ -679,7 +679,231 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
     handleSocialPost(msg).then(() => sendResponse({ ok: true })).catch(console.error);
     return true;
   }
+  if (msg.type === "TEST_SILENT_IG") {
+    testSilentInstagram().then(r => sendResponse(r)).catch(e => sendResponse({ error: e.message }));
+    return true;
+  }
+  if (msg.type === "TEST_SILENT_TT") {
+    testSilentTikTok().then(r => sendResponse(r)).catch(e => sendResponse({ error: e.message }));
+    return true;
+  }
 });
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// Silent-mode diagnostic tests
+// Opens the platform in a minimised window (no visible tab), probes whether
+// key DOM elements are reachable, and returns a step-by-step log.
+// These are read-only — nothing is posted.
+// ═══════════════════════════════════════════════════════════════════════════════
+
+async function waitForTabComplete(tabId, timeoutMs = 15000) {
+  return new Promise(resolve => {
+    const t = setTimeout(() => { chrome.tabs.onUpdated.removeListener(fn); resolve('timeout'); }, timeoutMs);
+    function fn(id, info) {
+      if (id !== tabId || info.status !== 'complete') return;
+      chrome.tabs.onUpdated.removeListener(fn);
+      clearTimeout(t);
+      resolve('complete');
+    }
+    chrome.tabs.onUpdated.addListener(fn);
+    // Also check if already complete
+    chrome.tabs.get(tabId, t => { if (t?.status === 'complete') { chrome.tabs.onUpdated.removeListener(fn); clearTimeout(t); resolve('complete'); } });
+  });
+}
+
+// ── Test 1: Instagram in a minimised window ───────────────────────────────────
+async function testSilentInstagram() {
+  const steps = [];
+  const ts = () => new Date().toISOString();
+  const t0 = Date.now();
+
+  // Step 1 — Create minimised window
+  steps.push({ step: 1, ts: ts(), label: 'Creating minimised window', detail: 'state: minimized, url: instagram.com' });
+  const win = await chrome.windows.create({
+    url: 'https://www.instagram.com/',
+    state: 'minimized',
+    width: 1280, height: 800,
+  });
+  const tabId = win.tabs[0].id;
+  steps.push({ step: 1, ts: ts(), label: 'Window created', detail: `windowId=${win.id} tabId=${tabId} state=${win.state}`, ok: true });
+
+  // Step 2 — Wait for page load
+  steps.push({ step: 2, ts: ts(), label: 'Waiting for page load…' });
+  const loadResult = await waitForTabComplete(tabId, 15000);
+  steps.push({ step: 2, ts: ts(), label: 'Page load', detail: `status=${loadResult} elapsed=${Date.now()-t0}ms`, ok: loadResult === 'complete' });
+
+  // Extra hydration buffer (SPA)
+  await new Promise(r => setTimeout(r, 4000));
+  steps.push({ step: 2, ts: ts(), label: 'SPA hydration wait (4 s)', ok: true });
+
+  // Step 3 — Inject relay + probe
+  steps.push({ step: 3, ts: ts(), label: 'Injecting diagnostic probe (MAIN world)' });
+  let probe;
+  try {
+    const res = await chrome.scripting.executeScript({
+      target: { tabId },
+      world: 'MAIN',
+      func: () => {
+        const nav        = document.querySelector('nav, [role="navigation"]');
+        const createBtn  = document.querySelector('[aria-label="New post"],[aria-label="Create"]')
+                        || [...document.querySelectorAll('[role="button"],a')]
+                             .find(el => /^create$/i.test((el.innerText||'').trim()));
+        const loginForm  = document.querySelector('input[name="username"],input[type="email"]');
+        const storyBtn   = document.querySelector('[aria-label*="story" i]');
+
+        return {
+          url:          window.location.href,
+          title:        document.title,
+          loggedIn:     !loginForm,
+          hasNav:       !!nav,
+          hasCreateBtn: !!createBtn,
+          createBtnTag: createBtn ? `<${createBtn.tagName}> aria="${createBtn.getAttribute('aria-label')}" text="${(createBtn.innerText||'').trim().slice(0,30)}"` : null,
+          hasStoryBtn:  !!storyBtn,
+          domSize:      document.body?.innerHTML?.length || 0,
+        };
+      },
+    });
+    probe = res[0]?.result || {};
+    steps.push({ step: 3, ts: ts(), label: 'Probe result', detail: JSON.stringify(probe), ok: probe.hasNav && probe.loggedIn });
+  } catch(e) {
+    steps.push({ step: 3, ts: ts(), label: 'Probe FAILED', detail: e.message, ok: false });
+    probe = { error: e.message };
+  }
+
+  // Step 4 — Summary
+  const verdict = probe.loggedIn && probe.hasCreateBtn
+    ? 'FEASIBLE — logged in and Create button found in minimised window'
+    : probe.loggedIn && probe.hasNav
+    ? 'LIKELY FEASIBLE — logged in, nav found; Create button not yet visible (may need scroll/wait)'
+    : !probe.loggedIn
+    ? 'NOT READY — user is logged out; login required before silent posting'
+    : 'UNCERTAIN — see probe details above';
+
+  steps.push({ step: 4, ts: ts(), label: 'Verdict', detail: verdict,
+    ok: probe.loggedIn && (probe.hasCreateBtn || probe.hasNav) });
+
+  // Clean up
+  chrome.tabs.remove(tabId).catch(() => {});
+
+  return { platform: 'instagram', total_ms: Date.now()-t0, steps, probe, verdict };
+}
+
+// ── Test 2: TikTok in a minimised window (with focus trick) ───────────────────
+async function testSilentTikTok() {
+  const steps = [];
+  const ts = () => new Date().toISOString();
+  const t0 = Date.now();
+
+  // Step 1 — Create minimised window
+  steps.push({ step: 1, ts: ts(), label: 'Creating minimised window', detail: 'state: minimized, url: tiktok.com/upload' });
+  const win = await chrome.windows.create({
+    url: 'https://www.tiktok.com/upload',
+    state: 'minimized',
+    width: 1280, height: 800,
+  });
+  const tabId  = win.tabs[0].id;
+  const winId  = win.id;
+  steps.push({ step: 1, ts: ts(), label: 'Window created', detail: `windowId=${winId} tabId=${tabId} state=${win.state}`, ok: true });
+
+  // Step 2 — Wait for page load
+  steps.push({ step: 2, ts: ts(), label: 'Waiting for page load…' });
+  const loadResult = await waitForTabComplete(tabId, 15000);
+  steps.push({ step: 2, ts: ts(), label: 'Page load', detail: `status=${loadResult} elapsed=${Date.now()-t0}ms`, ok: loadResult === 'complete' });
+  await new Promise(r => setTimeout(r, 2000));
+
+  // Step 3 — Probe BEFORE focus (upload handler likely not initialised)
+  steps.push({ step: 3, ts: ts(), label: 'Probing BEFORE focus (baseline)' });
+  let before = {};
+  try {
+    const r = await chrome.scripting.executeScript({
+      target: { tabId }, world: 'MAIN',
+      func: () => {
+        const inp    = document.querySelector('input[type="file"]');
+        const dropEl = document.querySelector('[class*="upload" i],[class*="drag" i]');
+        return {
+          url:            window.location.href,
+          hasFileInput:   !!inp,
+          fileInputAccept: inp?.accept || null,
+          hasDropZone:    !!dropEl,
+          loginRequired:  /login|sign.in/i.test(window.location.href) || !!document.querySelector('[href*="login"]'),
+          domSize:        document.body?.innerHTML?.length || 0,
+        };
+      },
+    });
+    before = r[0]?.result || {};
+    steps.push({ step: 3, ts: ts(), label: 'Before-focus probe', detail: JSON.stringify(before), ok: !before.loginRequired });
+  } catch(e) {
+    steps.push({ step: 3, ts: ts(), label: 'Before-focus probe FAILED', detail: e.message, ok: false });
+    before = { error: e.message };
+  }
+
+  // Step 4 — Briefly focus the window to let TikTok initialise upload handlers
+  steps.push({ step: 4, ts: ts(), label: 'Briefly focusing window (upload handler init)' });
+  await chrome.windows.update(winId, { focused: true });
+  await new Promise(r => setTimeout(r, 2500)); // allow TikTok to initialise
+  steps.push({ step: 4, ts: ts(), label: 'Focus held for 2.5 s — re-minimising', ok: true });
+  await chrome.windows.update(winId, { state: 'minimized' });
+  await new Promise(r => setTimeout(r, 500));
+  steps.push({ step: 4, ts: ts(), label: 'Window re-minimised', ok: true });
+
+  // Step 5 — Probe AFTER focus (upload handler should now be present)
+  steps.push({ step: 5, ts: ts(), label: 'Probing AFTER re-minimise' });
+  let after = {};
+  try {
+    const r = await chrome.scripting.executeScript({
+      target: { tabId }, world: 'MAIN',
+      func: () => {
+        const inp     = document.querySelector('input[type="file"]');
+        const dropEl  = document.querySelector('[class*="upload" i],[class*="drag" i]');
+        const caption = document.querySelector('.public-DraftEditor-content,[data-placeholder*="caption" i],[data-placeholder*="description" i]');
+        // Try DataTransfer injection test (non-destructive — just checks if it throws)
+        let dataTransferWorks = false;
+        try {
+          const dt  = new DataTransfer();
+          const f   = new File(['test'], 'test.mp4', { type:'video/mp4' });
+          dt.items.add(f);
+          dataTransferWorks = dt.files.length === 1;
+        } catch(_) {}
+
+        return {
+          url:             window.location.href,
+          hasFileInput:    !!inp,
+          fileInputAccept: inp?.accept || null,
+          fileInputActive: inp ? !inp.disabled : false,
+          hasDropZone:     !!dropEl,
+          hasCaptionField: !!caption,
+          dataTransferWorks,
+          loginRequired:   /login|sign.in/i.test(window.location.href),
+          domSize:         document.body?.innerHTML?.length || 0,
+        };
+      },
+    });
+    after = r[0]?.result || {};
+    steps.push({ step: 5, ts: ts(), label: 'After-focus probe', detail: JSON.stringify(after),
+      ok: after.hasFileInput && !after.loginRequired });
+  } catch(e) {
+    steps.push({ step: 5, ts: ts(), label: 'After-focus probe FAILED', detail: e.message, ok: false });
+    after = { error: e.message };
+  }
+
+  // Step 6 — Verdict
+  const uploadReady = after.hasFileInput && after.fileInputActive && after.dataTransferWorks;
+  const verdict = after.loginRequired
+    ? 'NOT READY — TikTok login required before silent posting'
+    : uploadReady
+    ? 'FEASIBLE — file input found & active after focus trick; DataTransfer works'
+    : after.hasFileInput
+    ? 'PARTIAL — file input found but may need more init time (increase focus duration)'
+    : 'UNCERTAIN — upload zone not found; page may still be loading or login required';
+
+  steps.push({ step: 6, ts: ts(), label: 'Verdict', detail: verdict, ok: uploadReady });
+
+  // Clean up
+  chrome.tabs.remove(tabId).catch(() => {});
+
+  return { platform: 'tiktok', total_ms: Date.now()-t0, steps,
+    before_focus: before, after_focus: after, verdict };
+}
 
 // ── Social post handler ───────────────────────────────────────────────────────
 

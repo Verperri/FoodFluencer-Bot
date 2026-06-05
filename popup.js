@@ -143,6 +143,66 @@ document.getElementById('settingsShowOnboarding')?.addEventListener('click', () 
   showOnboarding();
 });
 
+// ── Silent mode diagnostic tests ──────────────────────────────────────────────
+
+function renderSilentTestLog(result) {
+  const log = document.getElementById('silentTestLog');
+  if (!log) return;
+  log.classList.remove('hidden');
+
+  const icon = s => s.ok === true ? '✅' : s.ok === false ? '❌' : '⏳';
+  const stepRows = (result.steps || []).map(s => `
+    <div class="stl-step">
+      <span class="stl-icon">${icon(s)}</span>
+      <div class="stl-body">
+        <span class="stl-label"><strong>Step ${s.step}</strong> — ${s.label}</span>
+        ${s.detail ? `<div class="stl-detail">${s.detail.replace(/</g,'&lt;').replace(/>/g,'&gt;')}</div>` : ''}
+      </div>
+    </div>`).join('');
+
+  const vClass = (result.verdict||'').includes('FEASIBLE') ? 'ok'
+               : (result.verdict||'').includes('NOT READY') ? 'fail' : 'warn';
+
+  const platform = result.platform === 'instagram' ? '📸 Instagram' : '🎵 TikTok';
+  log.innerHTML = `
+    <div class="stl-header">${platform} silent test — ${result.total_ms}ms total</div>
+    ${stepRows}
+    <div class="stl-verdict ${vClass}">${result.verdict || 'No verdict'}</div>`;
+}
+
+function runSilentTest(msgType) {
+  const log = document.getElementById('silentTestLog');
+  const platform = msgType === 'TEST_SILENT_IG' ? '📸 Instagram' : '🎵 TikTok';
+  const btnId    = msgType === 'TEST_SILENT_IG' ? 'testSilentIG' : 'testSilentTT';
+  const btn      = document.getElementById(btnId);
+
+  if (log) {
+    log.classList.remove('hidden');
+    log.innerHTML = `
+      <div class="stl-header">${platform} silent test</div>
+      <div class="stl-step">
+        <span class="stl-spinner">⟳</span>
+        <div class="stl-body"><span class="stl-label">Running — please wait (up to 40 s)…</span></div>
+      </div>`;
+  }
+  if (btn) { btn.disabled = true; btn.textContent = '⏳ Running…'; }
+
+  chrome.runtime.sendMessage({ type: msgType }, result => {
+    if (btn) {
+      btn.disabled = false;
+      btn.textContent = msgType === 'TEST_SILENT_IG' ? '🔍 Test Instagram (silent)' : '🔍 Test TikTok (silent)';
+    }
+    if (chrome.runtime.lastError || result?.error) {
+      if (log) log.innerHTML = `<div class="stl-verdict fail">❌ Error: ${chrome.runtime.lastError?.message || result?.error}</div>`;
+      return;
+    }
+    renderSilentTestLog(result);
+  });
+}
+
+document.getElementById('testSilentIG')?.addEventListener('click', () => runSilentTest('TEST_SILENT_IG'));
+document.getElementById('testSilentTT')?.addEventListener('click', () => runSilentTest('TEST_SILENT_TT'));
+
 // ════════════════════════════════════════════════════════════════════════════
 // ONBOARDING
 // ════════════════════════════════════════════════════════════════════════════
