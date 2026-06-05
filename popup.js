@@ -1,8 +1,186 @@
 ﻿// ── Version footer ────────────────────────────────────────────────────────────
+let CURRENT_VERSION = '';
 fetch('version.json').then(r => r.json()).then(v => {
+  CURRENT_VERSION = `${v.branch} · ${v.commit}`;
   const el = document.getElementById('versionFooter');
-  if (el) el.textContent = `${v.branch} · ${v.commit}`;
+  if (el) el.textContent = CURRENT_VERSION;
+  const sv = document.getElementById('settingsVersion');
+  if (sv) sv.textContent = CURRENT_VERSION;
 }).catch(() => {});
+
+// ════════════════════════════════════════════════════════════════════════════
+// SETTINGS PANEL
+// ════════════════════════════════════════════════════════════════════════════
+
+function buildFeatureStatus(hasKey) {
+  return [
+    { label: 'Google Maps photo scraping',  on: true  },
+    { label: 'DuckDuckGo image search',     on: true  },
+    { label: 'Yelp photo scraping',         on: true  },
+    { label: 'Google Places API (source 4)',on: hasKey, note: hasKey ? '' : ' — add API key to enable' },
+    { label: 'Automatic business discovery',on: hasKey, note: hasKey ? '' : ' — add API key to enable' },
+    { label: 'Scheduled auto-posting',      on: hasKey, note: hasKey ? '' : ' — add API key to enable' },
+  ];
+}
+
+function renderFeatureStatus(containerId, hasKey) {
+  const el = document.getElementById(containerId);
+  if (!el) return;
+  el.innerHTML = buildFeatureStatus(hasKey).map(f => `
+    <div class="settings-feature ${f.on ? '' : 'disabled'}">
+      <span class="feat-icon">${f.on ? '✅' : '⚠️'}</span>
+      <span>${f.label}${f.note ? `<em style="font-size:.68rem;color:var(--muted)">${f.note}</em>` : ''}</span>
+    </div>`).join('');
+}
+
+function openSettings() {
+  const panel = document.getElementById('settingsPanel');
+  const backdrop = document.getElementById('settingsBackdrop');
+  if (!panel) return;
+
+  // Populate current API key (masked)
+  chrome.storage.local.get({ googleApiKey: '' }, ({ googleApiKey }) => {
+    const input = document.getElementById('settingsApiKey');
+    if (input) input.value = googleApiKey ? '••••••••••••••••' : '';
+    const status = document.getElementById('settingsKeyStatus');
+    if (status) {
+      status.className = 'settings-key-status ' + (googleApiKey ? 'ok' : 'warn');
+      status.textContent = googleApiKey ? '✓ API key saved' : '⚠ No API key — 3 of 4 image sources active';
+    }
+    renderFeatureStatus('settingsFeatures', !!googleApiKey);
+  });
+
+  const sv = document.getElementById('settingsVersion');
+  if (sv && CURRENT_VERSION) sv.textContent = CURRENT_VERSION;
+
+  panel.classList.remove('hidden');
+  backdrop.classList.remove('hidden');
+}
+
+function closeSettings() {
+  document.getElementById('settingsPanel')?.classList.add('hidden');
+  document.getElementById('settingsBackdrop')?.classList.add('hidden');
+}
+
+// Settings open buttons (selector + both modes)
+['settingsBtnSelector','settingsBtnManual','settingsBtnAuto'].forEach(id => {
+  document.getElementById(id)?.addEventListener('click', openSettings);
+});
+document.getElementById('settingsCloseBtn')?.addEventListener('click', closeSettings);
+document.getElementById('settingsBackdrop')?.addEventListener('click', closeSettings);
+
+// Save API key from settings panel
+document.getElementById('settingsSaveKey')?.addEventListener('click', () => {
+  const input  = document.getElementById('settingsApiKey');
+  const status = document.getElementById('settingsKeyStatus');
+  const val = (input?.value || '').trim();
+  if (!val || val.startsWith('•')) { if (status) { status.className='settings-key-status warn'; status.textContent='Enter a new key to update.'; } return; }
+  chrome.storage.local.set({ googleApiKey: val }, () => {
+    API_KEY = val;
+    if (input)  input.value = '••••••••••••••••';
+    if (status) { status.className='settings-key-status ok'; status.textContent='✓ API key saved'; }
+    renderFeatureStatus('settingsFeatures', true);
+    checkUsageWarning();
+    initAfterKey();
+  });
+});
+
+// Settings action buttons
+document.getElementById('settingsExportLogs')?.addEventListener('click', () => { TechLog.exportCSV(); closeSettings(); });
+document.getElementById('settingsResetActivity')?.addEventListener('click', () => {
+  if (confirm('Reset the activity log? This cannot be undone.')) {
+    chrome.storage.local.set({ activityLog: [] }, () => { refreshActivityLog(); closeSettings(); });
+  }
+});
+document.getElementById('settingsUsageStats')?.addEventListener('click', () => {
+  chrome.storage.local.get({ apiLog: [], totalCost: 0 }, ({ apiLog, totalCost }) => {
+    alert(`📊 API Usage\n\nTotal calls : ${apiLog.length}\nEst. cost   : $${totalCost.toFixed(4)}`);
+  });
+});
+document.getElementById('settingsShowOnboarding')?.addEventListener('click', () => {
+  closeSettings();
+  showOnboarding();
+});
+
+// ════════════════════════════════════════════════════════════════════════════
+// ONBOARDING
+// ════════════════════════════════════════════════════════════════════════════
+
+function showOnboarding() {
+  const ob = document.getElementById('onboarding');
+  if (!ob) return;
+  // Reset to step 1
+  goObStep(1);
+  ob.classList.remove('hidden');
+}
+
+function hideOnboarding() {
+  document.getElementById('onboarding')?.classList.add('hidden');
+  chrome.storage.local.set({ hasSeenOnboarding: true });
+}
+
+function goObStep(n) {
+  [1,2,3,4].forEach(i => {
+    document.getElementById(`ob-step-${i}`)?.classList.toggle('hidden', i !== n);
+    document.querySelector(`.ob-dot[data-step="${i}"]`)?.classList.toggle('active', i === n);
+  });
+}
+
+// "Next" buttons
+document.querySelectorAll('.ob-btn-next').forEach(btn => {
+  btn.addEventListener('click', () => goObStep(parseInt(btn.dataset.to)));
+});
+
+// Skip API key
+document.getElementById('obSkipKey')?.addEventListener('click', () => {
+  showObComplete(false);
+  goObStep(4);
+});
+
+// Save API key in onboarding
+document.getElementById('obSaveKey')?.addEventListener('click', () => {
+  const input  = document.getElementById('obApiKeyInput');
+  const status = document.getElementById('obKeyStatus');
+  const val = (input?.value || '').trim();
+  if (!val) { if (status) { status.className='ob-key-status err'; status.textContent='Please enter an API key.'; } return; }
+  if (status) { status.className='ob-key-status'; status.textContent='Saving…'; }
+  chrome.storage.local.set({ googleApiKey: val }, () => {
+    API_KEY = val;
+    if (status) { status.className='ob-key-status ok'; status.textContent='✓ Key saved!'; }
+    setTimeout(() => { showObComplete(true); goObStep(4); }, 700);
+  });
+});
+
+function showObComplete(hasKey) {
+  const el = document.getElementById('obFeatureStatus');
+  if (!el) return;
+  const features = buildFeatureStatus(hasKey);
+  el.innerHTML = features.map(f => `
+    <div class="ob-feat ${f.on ? 'enabled' : 'disabled'}">
+      ${f.on ? '✅' : '⚠️'} ${f.label}${f.note ? ` <em style="font-size:.67rem">${f.note}</em>` : ''}
+    </div>`).join('');
+}
+
+// Finish onboarding
+document.getElementById('obFinishBtn')?.addEventListener('click', () => {
+  hideOnboarding();
+  // Re-init with potentially new API key
+  chrome.storage.local.get({ googleApiKey: '' }, ({ googleApiKey }) => {
+    if (googleApiKey) { API_KEY = googleApiKey; initAfterKey(); }
+  });
+});
+
+// ── Check on popup open whether to show onboarding ───────────────────────────
+chrome.storage.local.get({ hasSeenOnboarding: false, googleApiKey: '' }, ({ hasSeenOnboarding, googleApiKey }) => {
+  if (!hasSeenOnboarding) {
+    showOnboarding();
+    // Pre-fill step 3 if key already exists (unlikely on first run but safe)
+    if (googleApiKey) {
+      const input = document.getElementById('obApiKeyInput');
+      if (input) input.value = googleApiKey;
+    }
+  }
+});
 
 // ── Constants ─────────────────────────────────────────────────────────────────
 

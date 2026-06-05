@@ -1,4 +1,12 @@
-﻿// ── Auto Bot alarm handler ────────────────────────────────────────────────────
+﻿// ── First-install flag ────────────────────────────────────────────────────────
+// Sets hasSeenOnboarding:false on fresh install so the popup shows onboarding.
+chrome.runtime.onInstalled.addListener((details) => {
+  if (details.reason === 'install') {
+    chrome.storage.local.set({ hasSeenOnboarding: false });
+  }
+});
+
+// ── Auto Bot alarm handler ────────────────────────────────────────────────────
 // Fires when a scheduled post time is reached.
 // Logs the trigger and notifies the popup. Actual posting will be added in V1.5.
 
@@ -378,6 +386,13 @@ async function fetchPhotosWaterfall(businessName, address, entityType, minPics, 
   bgLog('info', `PhotoWaterfall: yelp yielded ${yelpUrls.length} URLs — falling back to Google Places API`);
 
   // ── 4. Google Places API (quota-consuming fallback) ────────────────────────
+  // Skipped entirely if no API key is configured — user has not set one up.
+  if (!apiKey) {
+    bgLog('warn', 'PhotoWaterfall: no API key — skipping Google Places fallback. Only 3 scrape sources available.');
+    TechLog.warn('PHOTO', 'waterfall_result', { source: 'none', note: 'no API key — Google Places step skipped' });
+    return { dataUrls: [], source: 'none', photoLog: [] };
+  }
+
   TechLog.info('PHOTO', 'waterfall_result', { source: 'google_places',
     count: placePhotoObjects.length, note: 'all scrape sources exhausted' });
   bgLog('info', `PhotoWaterfall → google_places (${placePhotoObjects.length} available)`);
