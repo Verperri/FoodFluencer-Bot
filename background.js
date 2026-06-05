@@ -939,13 +939,21 @@ const INJECTORS = {
 };
 
 async function handleSocialPost({ platform, photoDataUrls, caption, songName, location, restaurantName, tiktokAudioDataUrl, autoPost = false }) {
-  bgLog('info', `Opening ${platform}`, { photos: photoDataUrls.length, song: songName, location, autoPost });
-  // TikTok's upload page REQUIRES an active/focused tab to initialise its upload
-  // handlers and process file input injection. Opening in the background (active:false)
-  // throttles timers and prevents TikTok from processing the injected video file.
-  // Always open as active — this was the V1.4 behaviour that worked correctly.
-  const tab = await chrome.tabs.create({ url: PLATFORM_URLS[platform], active: true });
+  bgLog('info', `Opening ${platform} (silent/minimised)`, { photos: photoDataUrls.length, song: songName, location, autoPost });
 
+  // ── Silent window: create unfocused, immediately minimise ────────────────────
+  // chrome.windows.create does not accept width/height with state:'minimized',
+  // so we create unfocused then minimise via a separate update call.
+  const win = await chrome.windows.create({
+    url:     PLATFORM_URLS[platform],
+    focused: false,   // never steals focus from the user's current window
+  });
+  const winId = win.id;
+  const tab   = win.tabs[0];
+  await chrome.windows.update(winId, { state: 'minimized' });
+  bgLog('info', `${platform} window minimised (winId=${winId} tabId=${tab.id})`);
+
+  // Wait for page load
   await new Promise(resolve => {
     function listener(tabId, info) {
       if (tabId !== tab.id || info.status !== "complete") return;
@@ -955,8 +963,20 @@ async function handleSocialPost({ platform, photoDataUrls, caption, songName, lo
     chrome.tabs.onUpdated.addListener(listener);
   });
 
-  // Extra buffer for SPA hydration (Facebook especially needs this)
-  await new Promise(r => setTimeout(r, 3000));
+  // ── TikTok: brief focus to initialise upload handlers ───────────────────────
+  // TikTok's upload page lazy-initialises its file-input handler only when the
+  // window is focused. We focus for 2 s, then immediately re-minimise so the
+  // window stays out of the user's way for the rest of the posting process.
+  if (platform === 'tiktok') {
+    await chrome.windows.update(winId, { focused: true });
+    await new Promise(r => setTimeout(r, 2000));   // let upload handlers init
+    await chrome.windows.update(winId, { state: 'minimized' });
+    bgLog('info', 'TikTok: upload handlers initialised, window re-minimised');
+  }
+
+  // SPA hydration buffer — slightly longer than before because minimised windows
+  // may defer some React initialisation work.
+  await new Promise(r => setTimeout(r, platform === 'tiktok' ? 2000 : 4000));
 
   try {
     // ── Relay script (ISOLATED world) ───────────────────────────────────────
@@ -987,6 +1007,13 @@ async function handleSocialPost({ platform, photoDataUrls, caption, songName, lo
     });
     bgLog('info', `Injected script on ${platform}`);
 
+    // ── Manual mode: restore window so user can see the platform UI ──────────
+    // In auto mode the window stays minimised throughout.
+    // In manual mode the user needs to see the banner and click Share/Post.
+    if (!autoPost) {
+      await chrome.windows.update(winId, { state: 'normal', focused: true });
+    }
+
     // ── Wait for completion signal (60 s fallback) ───────────────────────────
     if (autoPost) {
       const result = await new Promise(resolve => {
@@ -999,13 +1026,14 @@ async function handleSocialPost({ platform, photoDataUrls, caption, songName, lo
         }
         chrome.runtime.onMessage.addListener(listener);
       });
-      setTimeout(() => chrome.tabs.remove(tab.id).catch(() => {}), 3000);
+      // Close the whole window (not just the tab) so no minimised window lingers
+      setTimeout(() => chrome.windows.remove(winId).catch(() => {}), 3000);
       return result;
     }
 
   } catch (err) {
     bgLog('error', `Inject failed on ${platform}`, String(err));
-    if (autoPost) chrome.tabs.remove(tab.id).catch(() => {});
+    if (autoPost) chrome.windows.remove(winId).catch(() => {});
     return { failed: true, error: String(err) };
   }
   return { failed: false };
