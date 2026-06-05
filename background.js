@@ -1056,6 +1056,18 @@ async function handleSocialPost({ platform, photoDataUrls, caption, songName, lo
     // In manual mode the user needs to see the banner and click Share/Post.
     if (!autoPost) {
       await chrome.windows.update(winId, { state: 'normal', focused: true });
+      // Auto-close 4 s after the post confirms so the tab doesn't linger.
+      // 4 s gives the user enough time to read the ✅ success banner.
+      const closeOnDone = (msg, sender) => {
+        if (sender.tab?.id !== tab.id) return;
+        if (msg.type === "PLATFORM_POST_COMPLETE" || msg.type === "PLATFORM_POST_FAILED") {
+          chrome.runtime.onMessage.removeListener(closeOnDone);
+          setTimeout(() => chrome.windows.remove(winId).catch(() => {}), 4000);
+        }
+      };
+      chrome.runtime.onMessage.addListener(closeOnDone);
+      // Safety: remove listener after 10 min in case user navigates away without posting
+      setTimeout(() => chrome.runtime.onMessage.removeListener(closeOnDone), 600000);
     }
 
     // ── Wait for completion signal (60 s fallback) ───────────────────────────
