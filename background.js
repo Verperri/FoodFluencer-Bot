@@ -59,6 +59,33 @@ const AB_BOUNDS_BG = {
   LU: { low:{latitude:49.4,longitude:5.7},  high:{latitude:50.2,longitude:6.5}  },
   NL: { low:{latitude:50.7,longitude:3.3},  high:{latitude:53.6,longitude:7.2}  },
 };
+
+// City pools used when no specific region is selected.
+// Cycling through cities gives genuine variety — the Places API always returns
+// the same top-20 national results for a country-wide query, so we anchor each
+// search to a different city to get a truly different result set every time.
+const AB_CITY_POOL_BG = {
+  BE: ["Bruges","Ghent","Antwerp","Brussels","Liège","Namur","Mons","Leuven",
+       "Mechelen","Hasselt","Kortrijk","Ostend","Aalst","Genk","Sint-Niklaas",
+       "Tournai","Charleroi","Arlon","Dinant","Durbuy","Spa","Bastogne",
+       "Tongeren","Diest","Dendermonde","Roeselare","Ieper","Veurne","Chimay"],
+  FR: ["Paris","Lyon","Marseille","Bordeaux","Toulouse","Nice","Strasbourg",
+       "Nantes","Montpellier","Lille","Rennes","Reims","Tours","Angers",
+       "Metz","Nancy","Dijon","Grenoble","Brest","Perpignan"],
+  DE: ["Berlin","Hamburg","Munich","Cologne","Frankfurt","Stuttgart","Düsseldorf",
+       "Leipzig","Dortmund","Bremen","Hannover","Nuremberg","Dresden","Freiburg",
+       "Heidelberg","Trier","Erfurt","Regensburg","Würzburg","Lübeck"],
+  LU: ["Luxembourg City","Esch-sur-Alzette","Differdange","Dudelange","Ettelbruck",
+       "Diekirch","Wiltz","Echternach","Remich","Vianden"],
+  NL: ["Amsterdam","Rotterdam","The Hague","Utrecht","Eindhoven","Groningen",
+       "Tilburg","Almere","Breda","Nijmegen","Leiden","Maastricht","Haarlem",
+       "Arnhem","Delft","Deventer","Zwolle","Amersfoort","Middelburg"],
+};
+
+function pickRandomCity(countryCode) {
+  const pool = AB_CITY_POOL_BG[countryCode] || AB_CITY_POOL_BG.BE;
+  return pool[Math.floor(Math.random() * pool.length)];
+}
 const AB_ITUNES_CC_BG = { BE:"be", FR:"fr", DE:"de", LU:"be", NL:"nl" };
 
 async function getApiKey() {
@@ -70,7 +97,10 @@ async function searchAutoPlaceBG(config, apiKey) {
   const country = AB_COUNTRY_NAMES_BG[config.country] || "Belgium";
   const bounds  = AB_BOUNDS_BG[config.country] || AB_BOUNDS_BG.BE;
   const region  = config.region || "";
-  const locPart = region ? `${region}, ${country}` : country;
+  // When no specific region is selected, anchor to a random city so each call
+  // returns a completely different result set (country-wide queries always
+  // return the same top-20 popular places).
+  const locPart = region ? `${region}, ${country}` : `${pickRandomCity(config.country)}, ${country}`;
 
   const res = await fetch(AB_PLACES_SEARCH, {
     method: "POST",
@@ -113,6 +143,252 @@ async function fetchAsDataUrl(url) {
   for (let i = 0; i < bytes.length; i += 8192)
     binary += String.fromCharCode(...bytes.slice(i, i + 8192));
   return `data:${blob.type || "image/jpeg"};base64,${btoa(binary)}`;
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// Photo Waterfall — 4 sources tried in order, each with quality threshold
+//
+//  1. Google Maps embedded JSON   (venue-specific, highest quality)
+//  2. DuckDuckGo image search     (broadest coverage, no slug needed)
+//  3. Yelp photo pages            (categorised food/interior photos)
+//  4. Google Places API           (existing fallback — uses API quota)
+//
+// Each scraped photo is tagged with its source for TechLog tracing.
+// ═══════════════════════════════════════════════════════════════════════════════
+
+const SCRAPE_UA  = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36';
+const SCRAPE_MIN = 3;   // minimum usable photos before accepting a source
+
+function raceTimeout(promise, ms) {
+  return Promise.race([promise, new Promise(res => setTimeout(() => res([]), ms))]);
+}
+
+// ── Source 1: Google Maps embedded JSON ──────────────────────────────────────
+// Fetches the Maps search page and extracts lh3.googleusercontent.com photo
+// URLs from the server-rendered JSON blobs. Photos are ordered by engagement
+// (views / quality score) in the embedded data.
+async function scrapeGoogleMapsPhotos(businessName, city) {
+  const query = `${businessName} ${city}`;
+  bgLog('info', 'PhotoScrape[GoogleMaps] start', { query });
+  try {
+    const res = await fetch(
+      `https://www.google.com/maps/search/${encodeURIComponent(query)}`,
+      { headers: { 'User-Agent': SCRAPE_UA, 'Accept-Language': 'en-US,en;q=0.9' } }
+    );
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    const html = await res.text();
+
+    const urls = new Set();
+
+    // Pattern A: direct lh3 URL (already includes photo ID + optional size suffix)
+    for (const m of html.matchAll(/https:\/\/lh3\.googleusercontent\.com\/p\/([A-Za-z0-9_\-]{20,})/g))
+      urls.add(`https://lh3.googleusercontent.com/p/${m[1]}=s1200`);
+
+    // Pattern B: AF1Qip photo IDs embedded in protobuf JSON
+    for (const m of html.matchAll(/AF1Qip([A-Za-z0-9_\-]{20,})/g))
+      urls.add(`https://lh3.googleusercontent.com/p/AF1Qip${m[1]}=s1200`);
+
+    // Pattern C: gps-cs-s sub-path
+    for (const m of html.matchAll(/https:\/\/lh3\.googleusercontent\.com\/gps-cs-s\/([A-Za-z0-9_\-]{20,})/g))
+      urls.add(`https://lh3.googleusercontent.com/gps-cs-s/${m[1]}=s1200`);
+
+    const result = [...urls].slice(0, 12);
+    bgLog('info', `PhotoScrape[GoogleMaps] found ${result.length} URLs`);
+    TechLog.info('PHOTO', 'google_maps_scrape', { business: businessName, city, count: result.length });
+    return result;
+  } catch(e) {
+    bgLog('warn', `PhotoScrape[GoogleMaps] failed: ${e.message}`);
+    TechLog.warn('PHOTO', 'google_maps_scrape_error', { error: e.message });
+    return [];
+  }
+}
+
+// ── Source 2: DuckDuckGo image search (vqd-token flow) ───────────────────────
+// Two-step: get vqd session token, then query the i.js image endpoint.
+// Filters out stock-photo sites and extreme aspect ratios.
+// Returns DDG proxy thumbnail URLs (external-content.duckduckgo.com) which
+// are always fetchable without additional CORS issues.
+async function scrapeDDGPhotos(businessName, city, entityType) {
+  const query = `"${businessName}" ${city} ${entityType} food interior atmosphere`;
+  bgLog('info', 'PhotoScrape[DDG] start', { query });
+  try {
+    // Step 1: obtain vqd session token
+    const initRes = await fetch('https://duckduckgo.com/', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/x-www-form-urlencoded', 'User-Agent': SCRAPE_UA },
+      body: new URLSearchParams({ q: query }).toString(),
+    });
+    if (!initRes.ok) throw new Error(`vqd fetch HTTP ${initRes.status}`);
+    const initHtml = await initRes.text();
+
+    const vqd = (initHtml.match(/vqd=['"]?([\d-]+)['"]?/) || initHtml.match(/vqd=([\d-]+)/) || [])[1];
+    if (!vqd) throw new Error('vqd token not found');
+
+    // Step 2: image search endpoint
+    const params = new URLSearchParams({ q: query, o: 'json', l: 'us-en', vqd, f: ',,,,,', p: '-1', s: '0' });
+    const imgRes = await fetch(`https://duckduckgo.com/i.js?${params}`, {
+      headers: {
+        'User-Agent': SCRAPE_UA,
+        'Referer': 'https://duckduckgo.com/',
+        'Accept': 'application/json, text/javascript, */*; q=0.01',
+        'x-requested-with': 'XMLHttpRequest',
+      },
+    });
+    if (!imgRes.ok) throw new Error(`i.js HTTP ${imgRes.status}`);
+    const data = await imgRes.json();
+
+    const STOCK_RE = /shutterstock|getty|istock|alamy|dreamstime|depositphotos|fotolia|123rf|bigstock/i;
+    const filtered = (data.results || [])
+      .filter(r => r.width >= 800 && r.height >= 600)
+      .filter(r => !STOCK_RE.test(r.url || ''))
+      .filter(r => (r.width / r.height) < 3 && (r.height / r.width) < 3);
+
+    // Use DDG proxy thumbnail — always accessible, avoids arbitrary domain CORS
+    const urls = filtered.map(r => r.thumbnail || r.image).filter(Boolean).slice(0, 12);
+
+    bgLog('info', `PhotoScrape[DDG] ${filtered.length} quality results from ${(data.results||[]).length} total`);
+    TechLog.info('PHOTO', 'ddg_scrape', {
+      business: businessName, city, total: (data.results||[]).length, filtered: filtered.length,
+    });
+    return urls;
+  } catch(e) {
+    bgLog('warn', `PhotoScrape[DDG] failed: ${e.message}`);
+    TechLog.warn('PHOTO', 'ddg_scrape_error', { error: e.message });
+    return [];
+  }
+}
+
+// ── Source 3: Yelp photo pages ────────────────────────────────────────────────
+// Searches Yelp for the business, extracts the slug, then fetches the
+// food + inside photo tabs. Uses Yelp CDN URL regex — robust to class-name churn.
+// Gracefully detects DataDome blocks and returns empty rather than crashing.
+async function scrapeYelpPhotos(businessName, city) {
+  bgLog('info', 'PhotoScrape[Yelp] start', { businessName, city });
+  try {
+    const searchRes = await fetch(
+      `https://www.yelp.com/search?find_desc=${encodeURIComponent(businessName)}&find_loc=${encodeURIComponent(city)}`,
+      { headers: { 'User-Agent': SCRAPE_UA, 'Accept-Language': 'en-US,en;q=0.9' } }
+    );
+    if (!searchRes.ok) throw new Error(`search HTTP ${searchRes.status}`);
+    const searchHtml = await searchRes.text();
+
+    if (/datadome|are you a robot/i.test(searchHtml)) {
+      bgLog('warn', 'PhotoScrape[Yelp] DataDome block detected');
+      TechLog.warn('PHOTO', 'yelp_blocked', { reason: 'DataDome' });
+      return [];
+    }
+
+    const slugM = searchHtml.match(/href="\/biz\/([a-z0-9-]+)(?:[?"][^>]*)?"/);
+    if (!slugM) { bgLog('warn', 'PhotoScrape[Yelp] no slug found'); return []; }
+    const slug = slugM[1];
+    bgLog('info', `PhotoScrape[Yelp] slug: ${slug}`);
+
+    const allPhotos = new Set();
+    for (const tab of ['food', 'inside', 'outside']) {
+      await new Promise(r => setTimeout(r, 600)); // polite crawl delay
+      try {
+        const photoRes = await fetch(`https://www.yelp.com/biz/${slug}/photos?tab=${tab}`, {
+          headers: { 'User-Agent': SCRAPE_UA, 'Referer': 'https://www.yelp.com/' },
+        });
+        if (!photoRes.ok) continue;
+        const html = await photoRes.text();
+        if (/datadome/i.test(html)) continue;
+
+        for (const m of html.matchAll(/https:\/\/s3-media\d+\.fl\.yelpcdn\.com\/bphoto\/([A-Za-z0-9_\-]+)\/[a-z0-9]+\.jpg/g))
+          allPhotos.add(`https://s3-media1.fl.yelpcdn.com/bphoto/${m[1]}/o.jpg`);
+      } catch(_) {}
+    }
+
+    const result = [...allPhotos].slice(0, 12);
+    bgLog('info', `PhotoScrape[Yelp] found ${result.length} photos for "${slug}"`);
+    TechLog.info('PHOTO', 'yelp_scrape', { slug, count: result.length });
+    return result;
+  } catch(e) {
+    bgLog('warn', `PhotoScrape[Yelp] failed: ${e.message}`);
+    TechLog.warn('PHOTO', 'yelp_scrape_error', { error: e.message });
+    return [];
+  }
+}
+
+// ── Waterfall orchestrator ────────────────────────────────────────────────────
+// Tries each source in order. Accepts a source only when it yields ≥ SCRAPE_MIN
+// successfully fetched data-URLs. Falls back to Google Places API last.
+// Every photo is tagged with its source for full TechLog traceability.
+async function fetchPhotosWaterfall(businessName, address, entityType, minPics, apiKey, placePhotoObjects) {
+  const cityM = address.match(/\d{4}\s+([A-Za-zÀ-ÿ\s-]+),/);
+  const city  = (cityM?.[1] || address.split(',')[0] || '').trim();
+  const target = Math.min(Math.max(minPics, SCRAPE_MIN), 5);
+
+  bgLog('info', `PhotoWaterfall start — "${businessName}" ${city}, target=${target}`);
+  TechLog.info('PHOTO', 'waterfall_start', { businessName, city, entityType, target });
+
+  // Convert scraped URLs → data URLs, tag each with source, stop at target count
+  async function toDataUrls(urls, sourceName) {
+    const out = [];
+    for (const url of urls) {
+      if (out.length >= target) break;
+      try {
+        const dataUrl = await Promise.race([
+          fetchAsDataUrl(url),
+          new Promise((_, rej) => setTimeout(() => rej(new Error('timeout')), 9000)),
+        ]);
+        out.push({ dataUrl, sourceUrl: url, source: sourceName });
+      } catch(_) {}
+    }
+    return out;
+  }
+
+  // ── 1. Google Maps ─────────────────────────────────────────────────────────
+  const gmUrls = await raceTimeout(scrapeGoogleMapsPhotos(businessName, city), 10000);
+  if (gmUrls.length >= SCRAPE_MIN) {
+    const photos = await toDataUrls(gmUrls, 'google_maps');
+    if (photos.length >= SCRAPE_MIN) {
+      bgLog('info', `PhotoWaterfall → google_maps (${photos.length} photos)`);
+      TechLog.info('PHOTO', 'waterfall_result', { source: 'google_maps', count: photos.length,
+        urls: photos.map(p => p.sourceUrl) });
+      return { dataUrls: photos.map(p => p.dataUrl), source: 'google_maps', photoLog: photos };
+    }
+  }
+  bgLog('info', `PhotoWaterfall: google_maps yielded ${gmUrls.length} URLs — trying DDG`);
+
+  // ── 2. DuckDuckGo ──────────────────────────────────────────────────────────
+  const ddgUrls = await raceTimeout(scrapeDDGPhotos(businessName, city, entityType), 14000);
+  if (ddgUrls.length >= SCRAPE_MIN) {
+    const photos = await toDataUrls(ddgUrls, 'duckduckgo');
+    if (photos.length >= SCRAPE_MIN) {
+      bgLog('info', `PhotoWaterfall → duckduckgo (${photos.length} photos)`);
+      TechLog.info('PHOTO', 'waterfall_result', { source: 'duckduckgo', count: photos.length,
+        urls: photos.map(p => p.sourceUrl) });
+      return { dataUrls: photos.map(p => p.dataUrl), source: 'duckduckgo', photoLog: photos };
+    }
+  }
+  bgLog('info', `PhotoWaterfall: duckduckgo yielded ${ddgUrls.length} URLs — trying Yelp`);
+
+  // ── 3. Yelp ────────────────────────────────────────────────────────────────
+  const yelpUrls = await raceTimeout(scrapeYelpPhotos(businessName, city), 18000);
+  if (yelpUrls.length >= SCRAPE_MIN) {
+    const photos = await toDataUrls(yelpUrls, 'yelp');
+    if (photos.length >= SCRAPE_MIN) {
+      bgLog('info', `PhotoWaterfall → yelp (${photos.length} photos)`);
+      TechLog.info('PHOTO', 'waterfall_result', { source: 'yelp', count: photos.length,
+        urls: photos.map(p => p.sourceUrl) });
+      return { dataUrls: photos.map(p => p.dataUrl), source: 'yelp', photoLog: photos };
+    }
+  }
+  bgLog('info', `PhotoWaterfall: yelp yielded ${yelpUrls.length} URLs — falling back to Google Places API`);
+
+  // ── 4. Google Places API (quota-consuming fallback) ────────────────────────
+  TechLog.info('PHOTO', 'waterfall_result', { source: 'google_places',
+    count: placePhotoObjects.length, note: 'all scrape sources exhausted' });
+  bgLog('info', `PhotoWaterfall → google_places (${placePhotoObjects.length} available)`);
+
+  const photoUris  = await Promise.all(placePhotoObjects.slice(0, target).map(p => resolvePhotoUriBG(p.name, 900, apiKey)));
+  const dataUrls   = await Promise.all(photoUris.map(fetchAsDataUrl));
+  return {
+    dataUrls,
+    source: 'google_places',
+    photoLog: dataUrls.map((d, i) => ({ dataUrl: d, sourceUrl: photoUris[i], source: 'google_places' })),
+  };
 }
 
 async function getAutoSongBG(genre, country) {
@@ -230,16 +506,20 @@ async function autoPostNow(postIndex) {
     TechLog.info("SEARCH", "search_done", { name, address, duration: Date.now()-t0 });
     bgLog("info", `Auto Bot: found "${name}"`);
 
-    // 2 ── Resolve photos
+    // 2 ── Resolve photos via waterfall (scrape → Places API fallback)
     TechLog.info("MEDIA", "photos_start", { name });
     const allPhotos = (place.photos||[]).sort((a,b)=>(b.width||0)-(a.width||0));
     const minPics   = Math.max(parseInt(config.minPics||"3",10), 3);
-    const numPhotos = Math.min(allPhotos.length, 5, Math.max(minPics, 3));
-    const photoUris = await Promise.all(
-      allPhotos.slice(0, numPhotos).map(p => resolvePhotoUriBG(p.name, 900, apiKey))
+
+    const photoResult = await fetchPhotosWaterfall(
+      name, address, config.type||'restaurant', minPics, apiKey, allPhotos
     );
-    const photoDataUrls = await Promise.all(photoUris.map(fetchAsDataUrl));
-    TechLog.info("MEDIA", "photos_done", { count: photoDataUrls.length });
+    const photoDataUrls = photoResult.dataUrls;
+    TechLog.info("MEDIA", "photos_done", {
+      count: photoDataUrls.length,
+      source: photoResult.source,
+      photoLog: (photoResult.photoLog||[]).map(p => ({ source: p.source, url: p.sourceUrl?.slice(0,80) })),
+    });
 
     // 3 ── Pick a song
     TechLog.info("SONG", "song_start", { genre: config.songGenre });
@@ -1573,10 +1853,12 @@ function injectTikTok(photoDataUrls, caption, songName, location, opts) {
       vedge.addColorStop(1, 'rgba(0,0,0,0.28)');
       ctx.fillStyle = vedge; ctx.fillRect(0, 0, W, H);
 
-      const nameSize   = Math.max(36, Math.round(W * 0.072));
-      const tagSize    = Math.max(18, Math.round(W * 0.028));
-      const cornerSize = Math.max(12, Math.round(W * 0.016));
-      const gap        = Math.round(nameSize * 0.42);
+      // TikTok canvas is always 720×1280 — use W as reference (portrait, width is the constraint)
+      const nameSize   = Math.max(32, Math.round(W * 0.062));
+      const tagSize    = Math.max(16, Math.round(W * 0.024));
+      const cornerSize = Math.max(11, Math.round(W * 0.015));
+      const gap        = Math.round(nameSize * 0.38);
+      const maxTW      = W * 0.82;  // hard limit — prevents text bleeding past the frame edges
 
       const cityM = (address || '').match(/\d{4}\s+([A-Za-zÀ-ÿ\s-]+),\s*Belgium/i);
       const city  = (cityM?.[1] || (address || '').split(',')[0] || '').trim();
@@ -1585,24 +1867,48 @@ function injectTikTok(photoDataUrls, caption, songName, location, opts) {
         ? taglines[Math.abs([...(restaurantName||'')].reduce((a,c)=>a+c.charCodeAt(0),0)) % taglines.length]
         : 'Discover this hidden gem ✨';
 
-      let ty = best.centerY - (tagSize + gap + nameSize) / 2;
+      // Split long names into two balanced lines so no text overflows the frame
+      ctx.font = `400 ${nameSize}px "Cormorant Garamond",Georgia,Palatino,serif`;
+      const nameLines = (() => {
+        const n = restaurantName || '';
+        if (!n || ctx.measureText(n).width <= maxTW) return [n];
+        const words = n.split(' ');
+        let best2 = [n, ''], bestDiff = Infinity;
+        for (let i = 1; i < words.length; i++) {
+          const l1 = words.slice(0,i).join(' '), l2 = words.slice(i).join(' ');
+          const diff = Math.abs(ctx.measureText(l1).width - ctx.measureText(l2).width);
+          if (diff < bestDiff) { bestDiff = diff; best2 = [l1, l2]; }
+        }
+        return best2;
+      })();
+
+      const nameBlockH = nameLines.length > 1 ? nameSize * 2 + Math.round(gap * 0.5) : nameSize;
+      const blockH     = tagSize + gap + nameBlockH;
+
+      let ty = best.centerY - blockH / 2;
       ctx.fillStyle = '#FFF'; ctx.textAlign = 'center'; ctx.textBaseline = 'top';
-      ctx.shadowColor = 'rgba(0,0,0,0.72)'; ctx.shadowOffsetX = 0;
+      ctx.shadowColor = 'rgba(0,0,0,0.68)'; ctx.shadowOffsetX = 0;
 
       ctx.font = `300 italic ${tagSize}px "Cormorant Garamond",Georgia,Palatino,serif`;
-      ctx.shadowBlur = Math.round(tagSize * 0.55); ctx.shadowOffsetY = 1;
-      ctx.fillText(tagline, W/2, ty);
+      ctx.shadowBlur = Math.round(tagSize * 0.5); ctx.shadowOffsetY = 1;
+      ctx.fillText(tagline, W/2, ty, maxTW);
       ty += tagSize + gap;
 
       ctx.font = `400 ${nameSize}px "Cormorant Garamond",Georgia,Palatino,serif`;
-      ctx.shadowBlur = Math.round(nameSize * 0.26); ctx.shadowOffsetY = 2;
-      ctx.fillText(restaurantName || '', W/2, ty);
+      ctx.shadowBlur = Math.round(nameSize * 0.22); ctx.shadowOffsetY = 2;
+      if (nameLines.length > 1) {
+        ctx.fillText(nameLines[0], W/2, ty, maxTW);
+        ty += nameSize + Math.round(gap * 0.5);
+        ctx.fillText(nameLines[1], W/2, ty, maxTW);
+      } else {
+        ctx.fillText(nameLines[0], W/2, ty, maxTW);
+      }
 
       if (city) {
         ctx.font = `300 ${cornerSize}px "Cormorant Garamond",Georgia,Palatino,serif`;
         ctx.textAlign = 'right'; ctx.textBaseline = 'bottom';
-        ctx.shadowBlur = 3; ctx.shadowOffsetY = 0;
-        ctx.fillText(`${city}, Belgium`, W - Math.round(W*0.032), H - Math.round(H*0.025));
+        ctx.shadowBlur = 2; ctx.shadowOffsetY = 0;
+        ctx.fillText(`${city}, Belgium`, W - Math.round(W*0.030), H - Math.round(H*0.022));
       }
     }
 
@@ -2104,15 +2410,20 @@ function injectTikTok(photoDataUrls, caption, songName, location, opts) {
           }
         }
 
-        // Detect actual success (URL leaves /upload) or failure (error on page)
+        // Detect actual success or failure after posting (poll up to 20 s)
+        // Success signals: URL leaves /upload, or TikTok shows "Video published" banner
+        // Failure signals: explicit error text on page
+        const TIKTOK_SUCCESS_RE = /video\s+published|video\s+posted|post\s+published|erfolgreich.*ver.ffentlicht|vid.o.*publi./i;
         let postSuccess = false, postError = null;
-        for (let i = 0; i < 30; i++) {
+        for (let i = 0; i < 40; i++) {
           await sleep(500);
-          if (!window.location.href.includes('/upload')) { postSuccess = true; break; }
-          const err = (document.body.innerText||'').match(/upload.*fail|post.*fail|violat|prohibited|not.*allow/i);
+          const bodyText = document.body.innerText || '';
+          if (!window.location.href.includes('/upload')) { postSuccess = true; dbg('TikTok success: URL left /upload'); break; }
+          if (TIKTOK_SUCCESS_RE.test(bodyText)) { postSuccess = true; dbg('TikTok success: "Video published" detected'); break; }
+          const err = bodyText.match(/upload.*fail|post.*fail|violat|prohibited|not.*allow|content.*removed/i);
           if (err) { postError = err[0]; break; }
         }
-        if (!postSuccess && !postError) { postSuccess = true; } // timeout → assume success
+        if (!postSuccess && !postError) { postSuccess = true; dbg('TikTok post: detection timed out — assuming success'); }
 
         if (postError) {
           banner(5, `⚠️ TikTok post failed: ${postError}`, 'warn');
