@@ -954,43 +954,46 @@ async function handleSocialPost({ platform, photoDataUrls, caption, songName, lo
   bgLog('info', `Opening ${platform} (silent/minimised)`, { photos: photoDataUrls.length, song: songName, location, autoPost });
 
   // ── Silent window: create unfocused, immediately minimise ────────────────────
-  // chrome.windows.create does not accept width/height with state:'minimized',
-  // so we create unfocused then minimise via a separate update call.
   const win = await chrome.windows.create({
     url:     PLATFORM_URLS[platform],
-    focused: false,   // never steals focus from the user's current window
+    focused: false,
   });
   const winId = win.id;
   const tab   = win.tabs[0];
   await chrome.windows.update(winId, { state: 'minimized' });
-  bgLog('info', `${platform} window minimised (winId=${winId} tabId=${tab.id})`);
 
-  // Wait for page load
+  // Flush TechLog immediately — service workers can be killed at any time and
+  // buffered entries are lost. Flushing here ensures the window-open event
+  // survives even if the run is cut short.
+  TechLog.info('POST', 'window_created', { platform, winId, tabId: tab.id, autoPost });
+  TechLog._flush();
+  bgLog('info', `${platform} window created & minimised (winId=${winId} tabId=${tab.id})`);
+
+  // Wait for page load (with 15s safety timeout)
   await new Promise(resolve => {
+    const safety = setTimeout(() => { chrome.tabs.onUpdated.removeListener(listener); resolve(); }, 15000);
     function listener(tabId, info) {
       if (tabId !== tab.id || info.status !== "complete") return;
       chrome.tabs.onUpdated.removeListener(listener);
+      clearTimeout(safety);
       resolve();
     }
     chrome.tabs.onUpdated.addListener(listener);
   });
+  TechLog.info('POST', 'window_page_loaded', { platform, winId });
+  TechLog._flush();
 
-  // ── TikTok: focus window and keep it focused until upload is accepted ────────
-  // TikTok requires an active/focused window for:
-  //  1. Upload handler initialisation (lazy init on focus)
-  //  2. VideoEncoder / WebCodecs (throttled in background tabs)
-  //  3. File injection via DataTransfer (upload zone must be active)
-  //  4. checkUpload DOM polling until TikTok confirms the video
-  // The injector dispatches TIKTOK_READY_TO_MINIMIZE (via __ffbot_event relay)
-  // once checkUpload succeeds — at that point we silently minimise and the
-  // remaining steps (caption, post button) run in the background.
+  // ── TikTok: restore window to NORMAL state so VideoEncoder runs unthrottled ──
+  // chrome.windows.update({ focused:true }) on a minimised window sets focus
+  // but does NOT restore it — Chrome still throttles VideoEncoder in a minimised
+  // window regardless of focus state. Must explicitly set state:'normal'.
+  // Window stays visible until TIKTOK_READY_TO_MINIMIZE (dispatched after
+  // checkUpload succeeds), then minimises for the caption/post steps.
   if (platform === 'tiktok') {
-    // Must restore to 'normal' state, not just focus.
-    // chrome.windows.update({ focused:true }) on a minimised window sets
-    // focus but leaves the window minimised — Chrome still throttles
-    // VideoEncoder/WebCodecs in a minimised window regardless of focus.
     const restored = await chrome.windows.update(winId, { state: 'normal', focused: true });
-    bgLog('info', `TikTok: window restored to normal (state=${restored.state}) — VideoEncoder active until upload accepted`);
+    TechLog.info('POST', 'tiktok_window_restored', { state: restored.state, winId });
+    TechLog._flush();
+    bgLog('info', `TikTok: window restored (state=${restored.state}) — VideoEncoder will run at full speed`);
   }
 
   // SPA hydration buffer
@@ -1034,6 +1037,8 @@ async function handleSocialPost({ platform, photoDataUrls, caption, songName, lo
         throw injectErr;
       }
     }
+    TechLog.info('POST', 'injector_fired', { platform, winId, autoPost });
+    TechLog._flush(); // flush immediately — long TikTok run may outlive buffer
     bgLog('info', `Injected script on ${platform}`);
 
     // ── Manual mode: restore window so user can see the platform UI ──────────
