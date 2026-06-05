@@ -21,6 +21,7 @@
           <h1>FoodFluencer Bot</h1>
           <p class="subtitle">Discover & auto-post restaurants, hotels &amp; bars</p>
         </div>
+        <button class="btn-settings" id="settingsBtnSelector" title="Settings">⚙</button>
       </div>
       <p class="mode-selector-hint">Choose how you'd like to use the bot today</p>
       <div class="mode-cards">
@@ -49,6 +50,7 @@
       <div class="mode-topbar">
         <button class="btn-mode-back" id="manualBackBtn">← Modes</button>
         <span class="mode-topbar-title">✍️ Manual Post</span>
+        <button class="btn-settings" id="settingsBtnManual" title="Settings">⚙</button>
       </div>
 
       <!-- API usage warning -->
@@ -198,6 +200,7 @@
       <div class="mode-topbar">
         <button class="btn-mode-back" id="autoBackBtn">← Modes</button>
         <span class="mode-topbar-title">🤖 Auto Bot</span>
+        <button class="btn-settings" id="settingsBtnAuto" title="Settings">⚙</button>
       </div>
 
       <!-- ── Bot status bar (visible only when active) ──────────── -->
@@ -527,6 +530,162 @@
 
   <!-- Version footer -->
   <div id="versionFooter" class="version-footer"></div>
+
+  <!-- ═══════════════════════════════════════════════════════════════ -->
+  <!-- SETTINGS PANEL (slides in from right, accessible from all modes) -->
+  <!-- ═══════════════════════════════════════════════════════════════ -->
+  <div id="settingsPanel" class="settings-panel hidden" role="dialog" aria-label="Settings">
+    <div class="settings-header">
+      <span class="settings-title">⚙ Settings</span>
+      <button class="settings-close-btn" id="settingsCloseBtn" title="Close settings">✕</button>
+    </div>
+    <div class="settings-body">
+
+      <!-- API Key -->
+      <div class="settings-section">
+        <h3 class="settings-section-title">🔑 Google Places API Key</h3>
+        <p class="settings-desc">Enables automatic business discovery and the 4th image source (Google Places photos).</p>
+        <div class="input-row" style="margin-top:8px">
+          <input id="settingsApiKey" type="password" placeholder="AIza…" autocomplete="off" />
+          <button id="settingsSaveKey" class="btn btn--primary btn--sm">Save</button>
+        </div>
+        <div id="settingsKeyStatus" class="settings-key-status"></div>
+        <div class="settings-api-how">
+          <p class="settings-how-title">📋 How to get a free key:</p>
+          <ol>
+            <li>Go to <strong>console.cloud.google.com</strong></li>
+            <li>Create a project → Enable <strong>Places API (New)</strong></li>
+            <li>Go to <strong>Credentials</strong> → Create API key</li>
+          </ol>
+        </div>
+      </div>
+
+      <!-- Feature status -->
+      <div class="settings-section">
+        <h3 class="settings-section-title">✅ Feature Status</h3>
+        <div id="settingsFeatures" class="settings-features"></div>
+      </div>
+
+      <!-- Logs & Diagnostics -->
+      <div class="settings-section">
+        <h3 class="settings-section-title">📋 Logs &amp; Diagnostics</h3>
+        <div class="settings-action-row">
+          <button id="settingsExportLogs"    class="btn btn--ghost btn--sm">📄 Export Technical Log</button>
+          <button id="settingsResetActivity" class="btn btn--ghost btn--sm">↺ Reset Activity Log</button>
+          <button id="settingsUsageStats"    class="btn btn--ghost btn--sm">📊 API Usage Stats</button>
+        </div>
+      </div>
+
+      <!-- Version -->
+      <div class="settings-section settings-version-row">
+        <span id="settingsVersion" class="settings-version"></span>
+        <button class="btn btn--ghost btn--sm" id="settingsShowOnboarding">👋 Show intro again</button>
+      </div>
+
+    </div>
+  </div>
+  <div id="settingsBackdrop" class="settings-backdrop hidden"></div>
+
+  <!-- ═══════════════════════════════════════════════════════════════ -->
+  <!-- ONBOARDING OVERLAY (shown on first install)                    -->
+  <!-- ═══════════════════════════════════════════════════════════════ -->
+  <div id="onboarding" class="ob-overlay hidden">
+
+    <!-- Progress dots -->
+    <div class="ob-dots">
+      <span class="ob-dot active" data-step="1"></span>
+      <span class="ob-dot" data-step="2"></span>
+      <span class="ob-dot" data-step="3"></span>
+      <span class="ob-dot" data-step="4"></span>
+    </div>
+
+    <!-- Step 1: Welcome -->
+    <div class="ob-step" id="ob-step-1">
+      <div class="ob-logo-wrap">
+        <img src="icons/icon48.png" class="ob-logo" alt="" />
+      </div>
+      <h1 class="ob-title">Welcome to<br>FoodFluencer Bot</h1>
+      <p class="ob-desc">Automatically discover restaurants, hotels &amp; bars and publish them to Instagram, Facebook and TikTok — on your schedule.</p>
+      <ul class="ob-features">
+        <li>🔍 Smart discovery via AI-powered search</li>
+        <li>📸 Automatic cover photo design</li>
+        <li>✍️ Multilingual captions generated for you</li>
+        <li>🤖 Fully scheduled auto-posting</li>
+      </ul>
+      <button class="btn btn--primary ob-btn-next" data-to="2">Get Started →</button>
+    </div>
+
+    <!-- Step 2: How photos work -->
+    <div class="ob-step hidden" id="ob-step-2">
+      <h2 class="ob-title">Finding the best photos</h2>
+      <p class="ob-desc">The bot tries 4 image sources in order, stopping as soon as it finds enough quality photos:</p>
+      <div class="ob-sources">
+        <div class="ob-source">
+          <span class="ob-source-num free">1</span>
+          <div class="ob-source-info">
+            <strong>Google Maps</strong>
+            <span>Venue photos scraped from Google Maps listings</span>
+          </div>
+          <span class="ob-badge ob-badge--free">Free</span>
+        </div>
+        <div class="ob-source">
+          <span class="ob-source-num free">2</span>
+          <div class="ob-source-info">
+            <strong>DuckDuckGo</strong>
+            <span>Web image search filtered for food &amp; atmosphere</span>
+          </div>
+          <span class="ob-badge ob-badge--free">Free</span>
+        </div>
+        <div class="ob-source">
+          <span class="ob-source-num free">3</span>
+          <div class="ob-source-info">
+            <strong>Yelp</strong>
+            <span>Categorised food, interior &amp; exterior photos</span>
+          </div>
+          <span class="ob-badge ob-badge--free">Free</span>
+        </div>
+        <div class="ob-source ob-source--api">
+          <span class="ob-source-num api">4</span>
+          <div class="ob-source-info">
+            <strong>Google Places API</strong>
+            <span>Official high-quality business photos</span>
+          </div>
+          <span class="ob-badge ob-badge--key">API key</span>
+        </div>
+      </div>
+      <button class="btn btn--primary ob-btn-next" data-to="3">Next →</button>
+    </div>
+
+    <!-- Step 3: API Key -->
+    <div class="ob-step hidden" id="ob-step-3">
+      <h2 class="ob-title">Google Places API Key</h2>
+      <p class="ob-desc">The API key unlocks <strong>automatic business discovery</strong> and the <strong>4th image source</strong>. You can skip and add it later in Settings.</p>
+      <div class="ob-api-how">
+        <p><strong>📋 How to get a free key:</strong></p>
+        <ol>
+          <li>Go to <strong>console.cloud.google.com</strong></li>
+          <li>Create a project → Enable <strong>Places API (New)</strong></li>
+          <li>Go to <strong>Credentials</strong> → Create an API key</li>
+        </ol>
+      </div>
+      <div class="input-row" style="margin:12px 0 4px">
+        <input id="obApiKeyInput" type="password" placeholder="AIza…" autocomplete="off" />
+        <button id="obSaveKey" class="btn btn--primary">Save</button>
+      </div>
+      <div id="obKeyStatus" class="ob-key-status"></div>
+      <button class="btn btn--ghost ob-btn-skip" id="obSkipKey">Skip for now →</button>
+    </div>
+
+    <!-- Step 4: Complete -->
+    <div class="ob-step hidden" id="ob-step-4">
+      <div class="ob-done-icon">🎉</div>
+      <h2 class="ob-title">You're all set!</h2>
+      <div id="obFeatureStatus" class="ob-feature-status"></div>
+      <p class="ob-desc" style="margin-top:10px;font-size:.78rem">You can change all settings at any time via the <strong>⚙</strong> icon.</p>
+      <button class="btn btn--primary" id="obFinishBtn">Start using FoodFluencer Bot</button>
+    </div>
+
+  </div>
 
   <script src="config.js"></script>
   <script src="popup.js"></script>
