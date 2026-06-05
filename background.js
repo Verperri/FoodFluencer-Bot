@@ -718,14 +718,17 @@ async function testSilentInstagram() {
   const t0 = Date.now();
 
   // Step 1 — Create minimised window
-  steps.push({ step: 1, ts: ts(), label: 'Creating minimised window', detail: 'state: minimized, url: instagram.com' });
+  // chrome.windows.create does not accept width/height when state is minimized.
+  // Create as normal first, then immediately minimize via update().
+  steps.push({ step: 1, ts: ts(), label: 'Creating window (normal → minimized)', detail: 'url: instagram.com' });
   const win = await chrome.windows.create({
     url: 'https://www.instagram.com/',
-    state: 'minimized',
-    width: 1280, height: 800,
+    focused: false,
   });
+  await chrome.windows.update(win.id, { state: 'minimized' });
   const tabId = win.tabs[0].id;
-  steps.push({ step: 1, ts: ts(), label: 'Window created', detail: `windowId=${win.id} tabId=${tabId} state=${win.state}`, ok: true });
+  const winState = (await chrome.windows.get(win.id)).state;
+  steps.push({ step: 1, ts: ts(), label: 'Window created & minimized', detail: `windowId=${win.id} tabId=${tabId} state=${winState}`, ok: true });
 
   // Step 2 — Wait for page load
   steps.push({ step: 2, ts: ts(), label: 'Waiting for page load…' });
@@ -795,15 +798,18 @@ async function testSilentTikTok() {
   const t0 = Date.now();
 
   // Step 1 — Create minimised window
-  steps.push({ step: 1, ts: ts(), label: 'Creating minimised window', detail: 'state: minimized, url: tiktok.com/upload' });
+  // chrome.windows.create does not accept width/height when state is minimized.
+  // Create as normal first, then immediately minimize via update().
+  steps.push({ step: 1, ts: ts(), label: 'Creating window (normal → minimized)', detail: 'url: tiktok.com/upload' });
   const win = await chrome.windows.create({
     url: 'https://www.tiktok.com/upload',
-    state: 'minimized',
-    width: 1280, height: 800,
+    focused: false,
   });
+  await chrome.windows.update(win.id, { state: 'minimized' });
   const tabId  = win.tabs[0].id;
   const winId  = win.id;
-  steps.push({ step: 1, ts: ts(), label: 'Window created', detail: `windowId=${winId} tabId=${tabId} state=${win.state}`, ok: true });
+  const winState = (await chrome.windows.get(winId)).state;
+  steps.push({ step: 1, ts: ts(), label: 'Window created & minimized', detail: `windowId=${winId} tabId=${tabId} state=${winState}`, ok: true });
 
   // Step 2 — Wait for page load
   steps.push({ step: 2, ts: ts(), label: 'Waiting for page load…' });
