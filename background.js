@@ -963,19 +963,21 @@ async function handleSocialPost({ platform, photoDataUrls, caption, songName, lo
     chrome.tabs.onUpdated.addListener(listener);
   });
 
-  // ── TikTok: brief focus to initialise upload handlers ───────────────────────
-  // TikTok's upload page lazy-initialises its file-input handler only when the
-  // window is focused. We focus for 2 s, then immediately re-minimise so the
-  // window stays out of the user's way for the rest of the posting process.
+  // ── TikTok: focus window and keep it focused until upload is accepted ────────
+  // TikTok requires an active/focused window for:
+  //  1. Upload handler initialisation (lazy init on focus)
+  //  2. VideoEncoder / WebCodecs (throttled in background tabs)
+  //  3. File injection via DataTransfer (upload zone must be active)
+  //  4. checkUpload DOM polling until TikTok confirms the video
+  // The injector dispatches TIKTOK_READY_TO_MINIMIZE (via __ffbot_event relay)
+  // once checkUpload succeeds — at that point we silently minimise and the
+  // remaining steps (caption, post button) run in the background.
   if (platform === 'tiktok') {
     await chrome.windows.update(winId, { focused: true });
-    await new Promise(r => setTimeout(r, 2000));   // let upload handlers init
-    await chrome.windows.update(winId, { state: 'minimized' });
-    bgLog('info', 'TikTok: upload handlers initialised, window re-minimised');
+    bgLog('info', 'TikTok: window focused — staying active until upload accepted');
   }
 
-  // SPA hydration buffer — slightly longer than before because minimised windows
-  // may defer some React initialisation work.
+  // SPA hydration buffer
   await new Promise(r => setTimeout(r, platform === 'tiktok' ? 2000 : 4000));
 
   try {
@@ -1021,6 +1023,12 @@ async function handleSocialPost({ platform, photoDataUrls, caption, songName, lo
         function cleanup() { clearTimeout(timeout); chrome.runtime.onMessage.removeListener(listener); }
         function listener(msg, sender) {
           if (sender.tab?.id !== tab.id) return;
+          // TikTok signals "safe to minimise" once checkUpload succeeds:
+          // VideoEncoder + file injection are done, remaining work is caption/post
+          if (msg.type === "TIKTOK_READY_TO_MINIMIZE") {
+            chrome.windows.update(winId, { state: 'minimized' }).catch(() => {});
+            bgLog('info', 'TikTok: upload accepted — window minimised, posting continues silently');
+          }
           if (msg.type === "PLATFORM_POST_COMPLETE") { cleanup(); resolve({ failed: false }); }
           if (msg.type === "PLATFORM_POST_FAILED")   { cleanup(); resolve({ failed: true, error: msg.error }); }
         }
@@ -2576,6 +2584,9 @@ function injectTikTok(photoDataUrls, caption, songName, location, opts) {
       return;
     }
     dbg('Upload accepted');
+    // Signal the background: video is uploaded, safe to minimise the window now.
+    // VideoEncoder + file injection are complete; caption/post steps work fine in background.
+    document.dispatchEvent(new CustomEvent('__ffbot_event', { detail: { type: 'TIKTOK_READY_TO_MINIMIZE' } }));
     await sleep(2000);
 
     // ── Step 4: Fill Description ─────────────────────────────────────────
