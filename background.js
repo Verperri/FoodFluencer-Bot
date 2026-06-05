@@ -465,7 +465,9 @@ function getAutoCaptionBG(name, address, type, language, captionOpts, songInfo) 
   return parts.join("\n").trim();
 }
 
-async function updateRunLogStatus(postIndex, status) {
+// platforms param: pass explicitly from autoPostNow so we don't depend on
+// re-reading the schedule (which may have changed since the run started).
+async function updateRunLogStatus(postIndex, status, platforms = null) {
   // 1. Update the per-schedule run log
   const d = await chrome.storage.local.get({ autoBotRunLog:[], autoBotSchedule:null });
   const log = d.autoBotRunLog;
@@ -475,20 +477,27 @@ async function updateRunLogStatus(postIndex, status) {
 
   // 2. On completion, append to the persistent activityLog (survives deactivation)
   if (status === "done") {
-    const post = d.autoBotSchedule?.posts?.[postIndex];
-    if (post?.platforms?.length) {
-      const newEntries = post.platforms.map(platform => ({
-        id:        `al-${Date.now()}-${platform}`,
-        ts:        new Date().toISOString(),
-        platform,
-        postIndex,
-        status:    "done",
+    // Use the platforms passed directly — avoids stale schedule re-read
+    const resolvedPlatforms = platforms
+      || d.autoBotSchedule?.posts?.[postIndex]?.platforms
+      || [];
+
+    if (resolvedPlatforms.length) {
+      const newEntries = resolvedPlatforms.map(platform => ({
+        id:       `al-${Date.now()}-${platform}`,
+        ts:       new Date().toISOString(),
+        platform, postIndex, status: "done",
       }));
       const al = await chrome.storage.local.get({ activityLog:[] });
       await chrome.storage.local.set({
         activityLog: [...al.activityLog, ...newEntries].slice(-2000),
       });
-      TechLog.info("LOG", "activity_log_written", { postIndex, platforms: post.platforms });
+      TechLog.info("LOG", "activity_log_written", { postIndex, platforms: resolvedPlatforms });
+      TechLog._flush(); // flush immediately so it survives even if worker is killed
+    } else {
+      TechLog.warn("LOG", "activity_log_skipped", { postIndex,
+        reason: "no platforms resolved — schedule may have been regenerated" });
+      TechLog._flush();
     }
   }
 
@@ -600,7 +609,8 @@ async function autoPostNow(postIndex) {
 
     const finalStatus       = anyFailed ? "failed" : "done";
     const total_duration_ms = Date.now()-runStart;
-    await updateRunLogStatus(postIndex, finalStatus);
+    // Pass post.platforms directly — prevents silent skip when schedule is stale
+    await updateRunLogStatus(postIndex, finalStatus, post.platforms);
     TechLog.info("POST", "run_complete", { run_id: runId, run_type: "auto",
       postIndex, name, platforms: post.platforms, status: finalStatus, total_duration_ms });
     TechLog._flush();
