@@ -687,6 +687,10 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
     testSilentTikTok().then(r => sendResponse(r)).catch(e => sendResponse({ error: e.message }));
     return true;
   }
+  if (msg.type === "GET_SILENT_RESULTS") {
+    chrome.storage.local.get({ silentTestResults: {} }, d => sendResponse(d.silentTestResults));
+    return true;
+  }
 });
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -788,7 +792,12 @@ async function testSilentInstagram() {
   // Clean up
   chrome.tabs.remove(tabId).catch(() => {});
 
-  return { platform: 'instagram', total_ms: Date.now()-t0, steps, probe, verdict };
+  const result = { platform: 'instagram', total_ms: Date.now()-t0, steps, probe, verdict, ts: new Date().toISOString() };
+  // Persist so results can be read back even after popup closes
+  chrome.storage.local.get({ silentTestResults: {} }, d => {
+    chrome.storage.local.set({ silentTestResults: { ...d.silentTestResults, instagram: result } });
+  });
+  return result;
 }
 
 // ── Test 2: TikTok in a minimised window (with focus trick) ───────────────────
@@ -907,8 +916,12 @@ async function testSilentTikTok() {
   // Clean up
   chrome.tabs.remove(tabId).catch(() => {});
 
-  return { platform: 'tiktok', total_ms: Date.now()-t0, steps,
-    before_focus: before, after_focus: after, verdict };
+  const result = { platform: 'tiktok', total_ms: Date.now()-t0, steps,
+    before_focus: before, after_focus: after, verdict, ts: new Date().toISOString() };
+  chrome.storage.local.get({ silentTestResults: {} }, d => {
+    chrome.storage.local.set({ silentTestResults: { ...d.silentTestResults, tiktok: result } });
+  });
+  return result;
 }
 
 // ── Social post handler ───────────────────────────────────────────────────────

@@ -55,6 +55,9 @@ function openSettings() {
 
   panel.classList.remove('hidden');
   backdrop.classList.remove('hidden');
+
+  // Load any previously saved silent test results
+  setTimeout(loadStoredSilentResults, 50);
 }
 
 function closeSettings() {
@@ -202,6 +205,32 @@ function runSilentTest(msgType) {
 
 document.getElementById('testSilentIG')?.addEventListener('click', () => runSilentTest('TEST_SILENT_IG'));
 document.getElementById('testSilentTT')?.addEventListener('click', () => runSilentTest('TEST_SILENT_TT'));
+
+// Load previously saved results when settings opens
+function loadStoredSilentResults() {
+  chrome.runtime.sendMessage({ type: 'GET_SILENT_RESULTS' }, results => {
+    if (chrome.runtime.lastError || !results) return;
+    const log = document.getElementById('silentTestLog');
+    if (!log || (!results.instagram && !results.tiktok)) return;
+
+    // Show the most recent result (or both)
+    const toShow = results.tiktok || results.instagram;
+    if (toShow) renderSilentTestLog(toShow);
+
+    // If both exist, append the other one
+    if (results.instagram && results.tiktok) {
+      const other = toShow === results.tiktok ? results.instagram : results.tiktok;
+      const extra = document.createElement('div');
+      extra.style.marginTop = '8px';
+      const platform = other.platform === 'instagram' ? '📸 Instagram' : '🎵 TikTok';
+      const vClass = (other.verdict||'').includes('FEASIBLE') ? 'ok'
+                   : (other.verdict||'').includes('NOT READY') ? 'fail' : 'warn';
+      extra.innerHTML = `<div class="stl-header">${platform} — ${other.ts?.slice(0,19).replace('T',' ')} (${other.total_ms}ms)</div>
+        <div class="stl-verdict ${vClass}">${other.verdict}</div>`;
+      log.appendChild(extra);
+    }
+  });
+}
 
 // ════════════════════════════════════════════════════════════════════════════
 // ONBOARDING
