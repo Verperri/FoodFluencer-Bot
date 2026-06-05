@@ -950,3 +950,28 @@ h1 { font-size: 0.95rem; font-weight: 700; line-height: 1.2; }
 }
 .ob-feat.enabled  { background: #f0fdf4; color: #15803d; border: 1px solid #bbf7d0; }
 .ob-feat.disabled { background: #fff7ed; color: #c2410c; border: 1px solid #fed7aa; }
+
+/* ── Silent mode test log ────────────────────────────────────────────────── */
+.silent-test-log {
+  margin-top: 10px; background: #0f172a; border-radius: 6px;
+  padding: 10px; font-family: 'Courier New', monospace; font-size: .67rem;
+  max-height: 260px; overflow-y: auto; color: #e2e8f0;
+}
+.stl-header {
+  font-weight: 700; font-size: .72rem; color: #7dd3fc;
+  margin-bottom: 8px; border-bottom: 1px solid #1e293b; padding-bottom: 5px;
+}
+.stl-step { display: flex; gap: 6px; align-items: flex-start; margin-bottom: 4px; line-height: 1.4; }
+.stl-icon { flex-shrink: 0; }
+.stl-body { min-width: 0; }
+.stl-label { color: #e2e8f0; }
+.stl-detail { color: #94a3b8; font-size: .64rem; word-break: break-all; margin-top: 1px; }
+.stl-verdict {
+  margin-top: 8px; padding: 6px 8px; border-radius: 5px;
+  font-size: .7rem; font-weight: 600;
+}
+.stl-verdict.ok  { background: #14532d; color: #bbf7d0; }
+.stl-verdict.warn { background: #713f12; color: #fde68a; }
+.stl-verdict.fail { background: #7f1d1d; color: #fecaca; }
+.stl-spinner { color: #7dd3fc; animation: spin 1s linear infinite; display: inline-block; }
+@keyframes spin { to { transform: rotate(360deg); } }

@@ -465,7 +465,9 @@ function getAutoCaptionBG(name, address, type, language, captionOpts, songInfo) 
   return parts.join("\n").trim();
 }
 
-async function updateRunLogStatus(postIndex, status) {
+// platforms param: pass explicitly from autoPostNow so we don't depend on
+// re-reading the schedule (which may have changed since the run started).
+async function updateRunLogStatus(postIndex, status, platforms = null) {
   // 1. Update the per-schedule run log
   const d = await chrome.storage.local.get({ autoBotRunLog:[], autoBotSchedule:null });
   const log = d.autoBotRunLog;
@@ -475,20 +477,27 @@ async function updateRunLogStatus(postIndex, status) {
 
   // 2. On completion, append to the persistent activityLog (survives deactivation)
   if (status === "done") {
-    const post = d.autoBotSchedule?.posts?.[postIndex];
-    if (post?.platforms?.length) {
-      const newEntries = post.platforms.map(platform => ({
-        id:        `al-${Date.now()}-${platform}`,
-        ts:        new Date().toISOString(),
-        platform,
-        postIndex,
-        status:    "done",
+    // Use the platforms passed directly — avoids stale schedule re-read
+    const resolvedPlatforms = platforms
+      || d.autoBotSchedule?.posts?.[postIndex]?.platforms
+      || [];
+
+    if (resolvedPlatforms.length) {
+      const newEntries = resolvedPlatforms.map(platform => ({
+        id:       `al-${Date.now()}-${platform}`,
+        ts:       new Date().toISOString(),
+        platform, postIndex, status: "done",
       }));
       const al = await chrome.storage.local.get({ activityLog:[] });
       await chrome.storage.local.set({
         activityLog: [...al.activityLog, ...newEntries].slice(-2000),
       });
-      TechLog.info("LOG", "activity_log_written", { postIndex, platforms: post.platforms });
+      TechLog.info("LOG", "activity_log_written", { postIndex, platforms: resolvedPlatforms });
+      TechLog._flush(); // flush immediately so it survives even if worker is killed
+    } else {
+      TechLog.warn("LOG", "activity_log_skipped", { postIndex,
+        reason: "no platforms resolved — schedule may have been regenerated" });
+      TechLog._flush();
     }
   }
 
@@ -600,7 +609,8 @@ async function autoPostNow(postIndex) {
 
     const finalStatus       = anyFailed ? "failed" : "done";
     const total_duration_ms = Date.now()-runStart;
-    await updateRunLogStatus(postIndex, finalStatus);
+    // Pass post.platforms directly — prevents silent skip when schedule is stale
+    await updateRunLogStatus(postIndex, finalStatus, post.platforms);
     TechLog.info("POST", "run_complete", { run_id: runId, run_type: "auto",
       postIndex, name, platforms: post.platforms, status: finalStatus, total_duration_ms });
     TechLog._flush();
@@ -658,6 +668,18 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
     TechLog.info("POST", "tiktok_video_injected", { sizeMB: msg.sizeMB, mimeType: msg.mimeType, hasAudio: msg.hasAudio });
     return;
   }
+  if (msg.type === "TIKTOK_ENCODE_START") {
+    TechLog.info("ENCODE", "video_encode_start", { codec: msg.codec, width: msg.width, height: msg.height, slides: msg.slides, fps: msg.fps });
+    return;
+  }
+  if (msg.type === "TIKTOK_ENCODE_DONE") {
+    TechLog.info("ENCODE", "video_encode_done", { chunks: msg.chunks, duration_ms: msg.duration_ms });
+    return;
+  }
+  if (msg.type === "TIKTOK_READY_TO_MINIMIZE") {
+    TechLog.info("POST", "tiktok_minimise_triggered", { note: "checkUpload accepted — window minimised" });
+    return;
+  }
   if (msg.type === "TIKTOK_UPLOAD_ERROR") {
     TechLog.error("POST", "tiktok_upload_rejected", {
       matched:     msg.matched,
@@ -679,7 +701,250 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
     handleSocialPost(msg).then(() => sendResponse({ ok: true })).catch(console.error);
     return true;
   }
+  if (msg.type === "TEST_SILENT_IG") {
+    testSilentInstagram().then(r => sendResponse(r)).catch(e => sendResponse({ error: e.message }));
+    return true;
+  }
+  if (msg.type === "TEST_SILENT_TT") {
+    testSilentTikTok().then(r => sendResponse(r)).catch(e => sendResponse({ error: e.message }));
+    return true;
+  }
+  if (msg.type === "GET_SILENT_RESULTS") {
+    chrome.storage.local.get({ silentTestResults: {} }, d => sendResponse(d.silentTestResults));
+    return true;
+  }
 });
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// Silent-mode diagnostic tests
+// Opens the platform in a minimised window (no visible tab), probes whether
+// key DOM elements are reachable, and returns a step-by-step log.
+// These are read-only — nothing is posted.
+// ═══════════════════════════════════════════════════════════════════════════════
+
+async function waitForTabComplete(tabId, timeoutMs = 15000) {
+  return new Promise(resolve => {
+    const t = setTimeout(() => { chrome.tabs.onUpdated.removeListener(fn); resolve('timeout'); }, timeoutMs);
+    function fn(id, info) {
+      if (id !== tabId || info.status !== 'complete') return;
+      chrome.tabs.onUpdated.removeListener(fn);
+      clearTimeout(t);
+      resolve('complete');
+    }
+    chrome.tabs.onUpdated.addListener(fn);
+    // Also check if already complete
+    chrome.tabs.get(tabId, t => { if (t?.status === 'complete') { chrome.tabs.onUpdated.removeListener(fn); clearTimeout(t); resolve('complete'); } });
+  });
+}
+
+// ── Test 1: Instagram in a minimised window ───────────────────────────────────
+async function testSilentInstagram() {
+  const steps = [];
+  const ts = () => new Date().toISOString();
+  const t0 = Date.now();
+
+  // Step 1 — Create minimised window
+  // chrome.windows.create does not accept width/height when state is minimized.
+  // Create as normal first, then immediately minimize via update().
+  steps.push({ step: 1, ts: ts(), label: 'Creating window (normal → minimized)', detail: 'url: instagram.com' });
+  const win = await chrome.windows.create({
+    url: 'https://www.instagram.com/',
+    focused: false,
+  });
+  await chrome.windows.update(win.id, { state: 'minimized' });
+  const tabId = win.tabs[0].id;
+  const winState = (await chrome.windows.get(win.id)).state;
+  steps.push({ step: 1, ts: ts(), label: 'Window created & minimized', detail: `windowId=${win.id} tabId=${tabId} state=${winState}`, ok: true });
+
+  // Step 2 — Wait for page load
+  steps.push({ step: 2, ts: ts(), label: 'Waiting for page load…' });
+  const loadResult = await waitForTabComplete(tabId, 15000);
+  steps.push({ step: 2, ts: ts(), label: 'Page load', detail: `status=${loadResult} elapsed=${Date.now()-t0}ms`, ok: loadResult === 'complete' });
+
+  // Extra hydration buffer (SPA)
+  await new Promise(r => setTimeout(r, 4000));
+  steps.push({ step: 2, ts: ts(), label: 'SPA hydration wait (4 s)', ok: true });
+
+  // Step 3 — Inject relay + probe
+  steps.push({ step: 3, ts: ts(), label: 'Injecting diagnostic probe (MAIN world)' });
+  let probe;
+  try {
+    const res = await chrome.scripting.executeScript({
+      target: { tabId },
+      world: 'MAIN',
+      func: () => {
+        const nav        = document.querySelector('nav, [role="navigation"]');
+        const createBtn  = document.querySelector('[aria-label="New post"],[aria-label="Create"]')
+                        || [...document.querySelectorAll('[role="button"],a')]
+                             .find(el => /^create$/i.test((el.innerText||'').trim()));
+        const loginForm  = document.querySelector('input[name="username"],input[type="email"]');
+        const storyBtn   = document.querySelector('[aria-label*="story" i]');
+
+        return {
+          url:          window.location.href,
+          title:        document.title,
+          loggedIn:     !loginForm,
+          hasNav:       !!nav,
+          hasCreateBtn: !!createBtn,
+          createBtnTag: createBtn ? `<${createBtn.tagName}> aria="${createBtn.getAttribute('aria-label')}" text="${(createBtn.innerText||'').trim().slice(0,30)}"` : null,
+          hasStoryBtn:  !!storyBtn,
+          domSize:      document.body?.innerHTML?.length || 0,
+        };
+      },
+    });
+    probe = res[0]?.result || {};
+    steps.push({ step: 3, ts: ts(), label: 'Probe result', detail: JSON.stringify(probe), ok: probe.hasNav && probe.loggedIn });
+  } catch(e) {
+    steps.push({ step: 3, ts: ts(), label: 'Probe FAILED', detail: e.message, ok: false });
+    probe = { error: e.message };
+  }
+
+  // Step 4 — Summary
+  const verdict = probe.loggedIn && probe.hasCreateBtn
+    ? 'FEASIBLE — logged in and Create button found in minimised window'
+    : probe.loggedIn && probe.hasNav
+    ? 'LIKELY FEASIBLE — logged in, nav found; Create button not yet visible (may need scroll/wait)'
+    : !probe.loggedIn
+    ? 'NOT READY — user is logged out; login required before silent posting'
+    : 'UNCERTAIN — see probe details above';
+
+  steps.push({ step: 4, ts: ts(), label: 'Verdict', detail: verdict,
+    ok: probe.loggedIn && (probe.hasCreateBtn || probe.hasNav) });
+
+  // Clean up
+  chrome.tabs.remove(tabId).catch(() => {});
+
+  const result = { platform: 'instagram', total_ms: Date.now()-t0, steps, probe, verdict, ts: new Date().toISOString() };
+  // Persist so results can be read back even after popup closes
+  chrome.storage.local.get({ silentTestResults: {} }, d => {
+    chrome.storage.local.set({ silentTestResults: { ...d.silentTestResults, instagram: result } });
+  });
+  return result;
+}
+
+// ── Test 2: TikTok in a minimised window (with focus trick) ───────────────────
+async function testSilentTikTok() {
+  const steps = [];
+  const ts = () => new Date().toISOString();
+  const t0 = Date.now();
+
+  // Step 1 — Create minimised window
+  // chrome.windows.create does not accept width/height when state is minimized.
+  // Create as normal first, then immediately minimize via update().
+  steps.push({ step: 1, ts: ts(), label: 'Creating window (normal → minimized)', detail: 'url: tiktok.com/upload' });
+  const win = await chrome.windows.create({
+    url: 'https://www.tiktok.com/upload',
+    focused: false,
+  });
+  await chrome.windows.update(win.id, { state: 'minimized' });
+  const tabId  = win.tabs[0].id;
+  const winId  = win.id;
+  const winState = (await chrome.windows.get(winId)).state;
+  steps.push({ step: 1, ts: ts(), label: 'Window created & minimized', detail: `windowId=${winId} tabId=${tabId} state=${winState}`, ok: true });
+
+  // Step 2 — Wait for page load
+  steps.push({ step: 2, ts: ts(), label: 'Waiting for page load…' });
+  const loadResult = await waitForTabComplete(tabId, 15000);
+  steps.push({ step: 2, ts: ts(), label: 'Page load', detail: `status=${loadResult} elapsed=${Date.now()-t0}ms`, ok: loadResult === 'complete' });
+  await new Promise(r => setTimeout(r, 2000));
+
+  // Step 3 — Probe BEFORE focus (upload handler likely not initialised)
+  steps.push({ step: 3, ts: ts(), label: 'Probing BEFORE focus (baseline)' });
+  let before = {};
+  try {
+    const r = await chrome.scripting.executeScript({
+      target: { tabId }, world: 'MAIN',
+      func: () => {
+        const inp    = document.querySelector('input[type="file"]');
+        const dropEl = document.querySelector('[class*="upload" i],[class*="drag" i]');
+        return {
+          url:            window.location.href,
+          hasFileInput:   !!inp,
+          fileInputAccept: inp?.accept || null,
+          hasDropZone:    !!dropEl,
+          loginRequired:  /login|sign.in/i.test(window.location.href) || !!document.querySelector('[href*="login"]'),
+          domSize:        document.body?.innerHTML?.length || 0,
+        };
+      },
+    });
+    before = r[0]?.result || {};
+    steps.push({ step: 3, ts: ts(), label: 'Before-focus probe', detail: JSON.stringify(before), ok: !before.loginRequired });
+  } catch(e) {
+    steps.push({ step: 3, ts: ts(), label: 'Before-focus probe FAILED', detail: e.message, ok: false });
+    before = { error: e.message };
+  }
+
+  // Step 4 — Briefly focus the window to let TikTok initialise upload handlers
+  steps.push({ step: 4, ts: ts(), label: 'Briefly focusing window (upload handler init)' });
+  await chrome.windows.update(winId, { focused: true });
+  await new Promise(r => setTimeout(r, 2500)); // allow TikTok to initialise
+  steps.push({ step: 4, ts: ts(), label: 'Focus held for 2.5 s — re-minimising', ok: true });
+  await chrome.windows.update(winId, { state: 'minimized' });
+  await new Promise(r => setTimeout(r, 500));
+  steps.push({ step: 4, ts: ts(), label: 'Window re-minimised', ok: true });
+
+  // Step 5 — Probe AFTER focus (upload handler should now be present)
+  steps.push({ step: 5, ts: ts(), label: 'Probing AFTER re-minimise' });
+  let after = {};
+  try {
+    const r = await chrome.scripting.executeScript({
+      target: { tabId }, world: 'MAIN',
+      func: () => {
+        const inp     = document.querySelector('input[type="file"]');
+        const dropEl  = document.querySelector('[class*="upload" i],[class*="drag" i]');
+        const caption = document.querySelector('.public-DraftEditor-content,[data-placeholder*="caption" i],[data-placeholder*="description" i]');
+        // Try DataTransfer injection test (non-destructive — just checks if it throws)
+        let dataTransferWorks = false;
+        try {
+          const dt  = new DataTransfer();
+          const f   = new File(['test'], 'test.mp4', { type:'video/mp4' });
+          dt.items.add(f);
+          dataTransferWorks = dt.files.length === 1;
+        } catch(_) {}
+
+        return {
+          url:             window.location.href,
+          hasFileInput:    !!inp,
+          fileInputAccept: inp?.accept || null,
+          fileInputActive: inp ? !inp.disabled : false,
+          hasDropZone:     !!dropEl,
+          hasCaptionField: !!caption,
+          dataTransferWorks,
+          loginRequired:   /login|sign.in/i.test(window.location.href),
+          domSize:         document.body?.innerHTML?.length || 0,
+        };
+      },
+    });
+    after = r[0]?.result || {};
+    steps.push({ step: 5, ts: ts(), label: 'After-focus probe', detail: JSON.stringify(after),
+      ok: after.hasFileInput && !after.loginRequired });
+  } catch(e) {
+    steps.push({ step: 5, ts: ts(), label: 'After-focus probe FAILED', detail: e.message, ok: false });
+    after = { error: e.message };
+  }
+
+  // Step 6 — Verdict
+  const uploadReady = after.hasFileInput && after.fileInputActive && after.dataTransferWorks;
+  const verdict = after.loginRequired
+    ? 'NOT READY — TikTok login required before silent posting'
+    : uploadReady
+    ? 'FEASIBLE — file input found & active after focus trick; DataTransfer works'
+    : after.hasFileInput
+    ? 'PARTIAL — file input found but may need more init time (increase focus duration)'
+    : 'UNCERTAIN — upload zone not found; page may still be loading or login required';
+
+  steps.push({ step: 6, ts: ts(), label: 'Verdict', detail: verdict, ok: uploadReady });
+
+  // Clean up
+  chrome.tabs.remove(tabId).catch(() => {});
+
+  const result = { platform: 'tiktok', total_ms: Date.now()-t0, steps,
+    before_focus: before, after_focus: after, verdict, ts: new Date().toISOString() };
+  chrome.storage.local.get({ silentTestResults: {} }, d => {
+    chrome.storage.local.set({ silentTestResults: { ...d.silentTestResults, tiktok: result } });
+  });
+  return result;
+}
 
 // ── Social post handler ───────────────────────────────────────────────────────
 
@@ -696,24 +961,53 @@ const INJECTORS = {
 };
 
 async function handleSocialPost({ platform, photoDataUrls, caption, songName, location, restaurantName, tiktokAudioDataUrl, autoPost = false }) {
-  bgLog('info', `Opening ${platform}`, { photos: photoDataUrls.length, song: songName, location, autoPost });
-  // TikTok's upload page REQUIRES an active/focused tab to initialise its upload
-  // handlers and process file input injection. Opening in the background (active:false)
-  // throttles timers and prevents TikTok from processing the injected video file.
-  // Always open as active — this was the V1.4 behaviour that worked correctly.
-  const tab = await chrome.tabs.create({ url: PLATFORM_URLS[platform], active: true });
+  bgLog('info', `Opening ${platform} (silent/minimised)`, { photos: photoDataUrls.length, song: songName, location, autoPost });
 
+  // ── Silent window: create unfocused, immediately minimise ────────────────────
+  const win = await chrome.windows.create({
+    url:     PLATFORM_URLS[platform],
+    focused: false,
+  });
+  const winId = win.id;
+  const tab   = win.tabs[0];
+  await chrome.windows.update(winId, { state: 'minimized' });
+
+  // Flush TechLog immediately — service workers can be killed at any time and
+  // buffered entries are lost. Flushing here ensures the window-open event
+  // survives even if the run is cut short.
+  TechLog.info('POST', 'window_created', { platform, winId, tabId: tab.id, autoPost });
+  TechLog._flush();
+  bgLog('info', `${platform} window created & minimised (winId=${winId} tabId=${tab.id})`);
+
+  // Wait for page load (with 15s safety timeout)
   await new Promise(resolve => {
+    const safety = setTimeout(() => { chrome.tabs.onUpdated.removeListener(listener); resolve(); }, 15000);
     function listener(tabId, info) {
       if (tabId !== tab.id || info.status !== "complete") return;
       chrome.tabs.onUpdated.removeListener(listener);
+      clearTimeout(safety);
       resolve();
     }
     chrome.tabs.onUpdated.addListener(listener);
   });
+  TechLog.info('POST', 'window_page_loaded', { platform, winId });
+  TechLog._flush();
 
-  // Extra buffer for SPA hydration (Facebook especially needs this)
-  await new Promise(r => setTimeout(r, 3000));
+  // ── TikTok: restore window to NORMAL state so VideoEncoder runs unthrottled ──
+  // chrome.windows.update({ focused:true }) on a minimised window sets focus
+  // but does NOT restore it — Chrome still throttles VideoEncoder in a minimised
+  // window regardless of focus state. Must explicitly set state:'normal'.
+  // Window stays visible until TIKTOK_READY_TO_MINIMIZE (dispatched after
+  // checkUpload succeeds), then minimises for the caption/post steps.
+  if (platform === 'tiktok') {
+    const restored = await chrome.windows.update(winId, { state: 'normal', focused: true });
+    TechLog.info('POST', 'tiktok_window_restored', { state: restored.state, winId });
+    TechLog._flush();
+    bgLog('info', `TikTok: window restored (state=${restored.state}) — VideoEncoder will run at full speed`);
+  }
+
+  // SPA hydration buffer
+  await new Promise(r => setTimeout(r, platform === 'tiktok' ? 2000 : 4000));
 
   try {
     // ── Relay script (ISOLATED world) ───────────────────────────────────────
@@ -736,13 +1030,45 @@ async function handleSocialPost({ platform, photoDataUrls, caption, songName, lo
     });
 
     // ── Main injector (MAIN world) ───────────────────────────────────────────
-    await chrome.scripting.executeScript({
-      target: { tabId: tab.id },
-      func:   INJECTORS[platform],
-      args:   [photoDataUrls, caption, songName || "", location || "", { restaurantName: restaurantName || "", tiktokAudioDataUrl: tiktokAudioDataUrl || null, autoPost: autoPost }],
-      world:  "MAIN",
-    });
+    // Guard against "Unserializable argument passed" — can happen if a data URL
+    // is malformed or the structured-clone fails transiently. On failure we
+    // retry once without the audio URL (video-only fallback).
+    const injectorArgs = [photoDataUrls, caption, songName || "", location || "",
+      { restaurantName: restaurantName || "", tiktokAudioDataUrl: tiktokAudioDataUrl || null, autoPost }];
+    try {
+      await chrome.scripting.executeScript({ target: { tabId: tab.id }, func: INJECTORS[platform], args: injectorArgs, world: "MAIN" });
+    } catch(injectErr) {
+      if (String(injectErr).includes('Unserializable') && tiktokAudioDataUrl) {
+        bgLog('warn', `${platform} inject failed (Unserializable) — retrying without audio`, injectErr.message);
+        TechLog.warn('POST', 'inject_retry_no_audio', { platform, error: injectErr.message });
+        injectorArgs[4] = { ...injectorArgs[4], tiktokAudioDataUrl: null };
+        await chrome.scripting.executeScript({ target: { tabId: tab.id }, func: INJECTORS[platform], args: injectorArgs, world: "MAIN" });
+      } else {
+        throw injectErr;
+      }
+    }
+    TechLog.info('POST', 'injector_fired', { platform, winId, autoPost });
+    TechLog._flush(); // flush immediately — long TikTok run may outlive buffer
     bgLog('info', `Injected script on ${platform}`);
+
+    // ── Manual mode: restore window so user can see the platform UI ──────────
+    // In auto mode the window stays minimised throughout.
+    // In manual mode the user needs to see the banner and click Share/Post.
+    if (!autoPost) {
+      await chrome.windows.update(winId, { state: 'normal', focused: true });
+      // Auto-close 4 s after the post confirms so the tab doesn't linger.
+      // 4 s gives the user enough time to read the ✅ success banner.
+      const closeOnDone = (msg, sender) => {
+        if (sender.tab?.id !== tab.id) return;
+        if (msg.type === "PLATFORM_POST_COMPLETE" || msg.type === "PLATFORM_POST_FAILED") {
+          chrome.runtime.onMessage.removeListener(closeOnDone);
+          setTimeout(() => chrome.windows.remove(winId).catch(() => {}), 4000);
+        }
+      };
+      chrome.runtime.onMessage.addListener(closeOnDone);
+      // Safety: remove listener after 10 min in case user navigates away without posting
+      setTimeout(() => chrome.runtime.onMessage.removeListener(closeOnDone), 600000);
+    }
 
     // ── Wait for completion signal (60 s fallback) ───────────────────────────
     if (autoPost) {
@@ -751,18 +1077,25 @@ async function handleSocialPost({ platform, photoDataUrls, caption, songName, lo
         function cleanup() { clearTimeout(timeout); chrome.runtime.onMessage.removeListener(listener); }
         function listener(msg, sender) {
           if (sender.tab?.id !== tab.id) return;
+          // TikTok signals "safe to minimise" once checkUpload succeeds:
+          // VideoEncoder + file injection are done, remaining work is caption/post
+          if (msg.type === "TIKTOK_READY_TO_MINIMIZE") {
+            chrome.windows.update(winId, { state: 'minimized' }).catch(() => {});
+            bgLog('info', 'TikTok: upload accepted — window minimised, posting continues silently');
+          }
           if (msg.type === "PLATFORM_POST_COMPLETE") { cleanup(); resolve({ failed: false }); }
           if (msg.type === "PLATFORM_POST_FAILED")   { cleanup(); resolve({ failed: true, error: msg.error }); }
         }
         chrome.runtime.onMessage.addListener(listener);
       });
-      setTimeout(() => chrome.tabs.remove(tab.id).catch(() => {}), 3000);
+      // Close the whole window (not just the tab) so no minimised window lingers
+      setTimeout(() => chrome.windows.remove(winId).catch(() => {}), 3000);
       return result;
     }
 
   } catch (err) {
     bgLog('error', `Inject failed on ${platform}`, String(err));
-    if (autoPost) chrome.tabs.remove(tab.id).catch(() => {});
+    if (autoPost) chrome.windows.remove(winId).catch(() => {});
     return { failed: true, error: String(err) };
   }
   return { failed: false };
@@ -1952,9 +2285,13 @@ function injectTikTok(photoDataUrls, caption, songName, location, opts) {
       } catch(_) {}
     }
     if (!codec) throw new Error('No H.264 codec supported');
-    dbg(`Video codec: ${codec}`);
+    dbg(`Video codec: ${codec} | canvas: ${W}×${H} | ${FPS}fps | ${images.length} slides`);
+    document.dispatchEvent(new CustomEvent('__ffbot_event', { detail: {
+      type: 'TIKTOK_ENCODE_START', codec, width: W, height: H, slides: images.length, fps: FPS,
+    }}));
 
     const vChunks = []; let vDcfg = null; let vErr = null;
+    const tEncStart = Date.now();
     const vEnc = new VideoEncoder({
       output: (chunk, meta) => {
         if (meta?.decoderConfig) vDcfg = meta.decoderConfig;
@@ -1981,7 +2318,11 @@ function injectTikTok(photoDataUrls, caption, songName, location, opts) {
     }
     await vEnc.flush(); vEnc.close();
     if (vErr) throw new Error('VideoEncoder: ' + vErr.message);
-    dbg(`Video: ${vChunks.length} chunks`);
+    const encMs = Date.now() - tEncStart;
+    dbg(`Video encoded: ${vChunks.length} chunks in ${encMs}ms`);
+    document.dispatchEvent(new CustomEvent('__ffbot_event', { detail: {
+      type: 'TIKTOK_ENCODE_DONE', chunks: vChunks.length, duration_ms: encMs,
+    }}));
 
     // ── Encode audio with WebCodecs (AAC-LC) ────────────────────────────────
     let aChunks = [];
@@ -2305,6 +2646,9 @@ function injectTikTok(photoDataUrls, caption, songName, location, opts) {
       return;
     }
     dbg('Upload accepted');
+    // Signal the background: video is uploaded, safe to minimise the window now.
+    // VideoEncoder + file injection are complete; caption/post steps work fine in background.
+    document.dispatchEvent(new CustomEvent('__ffbot_event', { detail: { type: 'TIKTOK_READY_TO_MINIMIZE' } }));
     await sleep(2000);
 
     // ── Step 4: Fill Description ─────────────────────────────────────────

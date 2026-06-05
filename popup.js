@@ -143,6 +143,11 @@ document.getElementById('settingsShowOnboarding')?.addEventListener('click', () 
   showOnboarding();
 });
 
+// ── Diagnostics (placeholder — full E2E test suite coming later) ─────────────
+// The "Run Diagnostic Test" button is currently disabled in the UI.
+// When implemented it will run a full end-to-end pipeline check without
+// writing to the activity log, verifying each platform silently.
+
 // ════════════════════════════════════════════════════════════════════════════
 // ONBOARDING
 // ════════════════════════════════════════════════════════════════════════════
