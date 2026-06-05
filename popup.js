@@ -94,9 +94,50 @@ document.getElementById('settingsResetActivity')?.addEventListener('click', () =
 });
 document.getElementById('settingsUsageStats')?.addEventListener('click', () => {
   chrome.storage.local.get({ apiLog: [], totalCost: 0 }, ({ apiLog, totalCost }) => {
-    alert(`📊 API Usage\n\nTotal calls : ${apiLog.length}\nEst. cost   : $${totalCost.toFixed(4)}`);
+    // Build per-day breakdown for the last 7 days
+    const dayMap = {};
+    apiLog.forEach(entry => {
+      const day = (entry.ts || entry.timestamp || '').slice(0, 10);
+      if (day) { dayMap[day] = (dayMap[day] || 0) + 1; }
+    });
+    const days = Object.keys(dayMap).sort().slice(-7);
+    const dayRows = days.length
+      ? days.map(d => `  ${d}: ${dayMap[d]} call${dayMap[d]>1?'s':''}`).join('\n')
+      : '  No data yet';
+
+    // Call type breakdown
+    const typeMap = {};
+    apiLog.forEach(e => { const t = e.type || e.callType || 'search'; typeMap[t] = (typeMap[t]||0)+1; });
+    const typeRows = Object.entries(typeMap).map(([t,n]) => `  ${t}: ${n}`).join('\n') || '  —';
+
+    const msg = [
+      `📊 Google Places API Usage`,
+      ``,
+      `Total calls : ${apiLog.length}`,
+      `Est. cost   : $${totalCost.toFixed(4)}`,
+      ``,
+      `Last 7 days:`,
+      dayRows,
+      ``,
+      `By type:`,
+      typeRows,
+      ``,
+      `⚠ These are estimates. For exact usage, visit Google Cloud Console (see the "View in Console" button).`,
+    ].join('\n');
+    alert(msg);
   });
 });
+
+// Cloud Console link — opens the actual API metrics dashboard
+const consoleBtn = document.createElement('button');
+consoleBtn.className = 'btn btn--ghost btn--sm';
+consoleBtn.style.cssText = 'margin-top:6px;width:100%;';
+consoleBtn.textContent = '🔗 View in Google Cloud Console';
+consoleBtn.addEventListener('click', () => {
+  chrome.tabs.create({ url: 'https://console.cloud.google.com/apis/api/places.googleapis.com/metrics' });
+  closeSettings();
+});
+document.getElementById('settingsUsageStats')?.parentElement?.appendChild(consoleBtn);
 document.getElementById('settingsShowOnboarding')?.addEventListener('click', () => {
   closeSettings();
   showOnboarding();
@@ -249,7 +290,12 @@ const TechLog = {
 
   exportCSV() {
     chrome.storage.local.get({ techLog: [] }, ({ techLog }) => {
-      const cols = ["id","ts","session","level","source","category","action","platform","status","details","error"];
+      // Comprehensive columns including all new fields added in V1.8
+      const cols = [
+        "ts","run_type","run_id","level","source","category","action",
+        "duration_ms","name","platform","status","photo_source","photo_count",
+        "source_breakdown","song","artist","language","error","session","id"
+      ];
       const rows = techLog.map(e => cols.map(c => {
         const v = e[c];
         if (v === undefined || v === null) return "";
@@ -1009,11 +1055,18 @@ async function exportAndPost() {
   const timestamp = new Date().toISOString().replace(/[:.]/g, "-").slice(0, 19);
   const platforms = [...activePlatforms];
 
+  const runId    = `manual-${Date.now()}`;
+  const runStart = Date.now();
+  TechLog.info("POST", "run_start", { run_id: runId, run_type: "manual",
+    restaurant: name, address, platforms, song: songName });
+
   $("exportBtn").disabled = true;
   AppLog.info("Export & Post started", { restaurant: name, photos: photos.length, platforms, song: songName });
   setStatus("Resolving photos…");
 
   // ── 1. Resolve full-res photo URIs from Google Places CDN ─────────────────
+  const t_photos = Date.now();
+  TechLog.info("MEDIA", "photos_start", { run_id: runId, run_type: "manual", name });
   const photoUris = [];
   for (const photo of photos) {
     try {
@@ -1023,6 +1076,10 @@ async function exportAndPost() {
       console.warn("Photo resolve failed:", e);
     }
   }
+  TechLog.info("MEDIA", "photos_done", { run_id: runId, run_type: "manual",
+    photo_source: "google_places_manual", photo_count: photoUris.length,
+    source_breakdown: { google_places_manual: photoUris.length },
+    duration_ms: Date.now()-t_photos });
   AppLog.info(`Resolved ${photoUris.length}/${photos.length} photo URIs`);
 
   // ── 2. Log the export (no local file download) ────────────────────────────
@@ -1089,6 +1146,8 @@ async function exportAndPost() {
       }
 
       for (const platform of platforms) {
+        const t_plat = Date.now();
+        TechLog.info("POST", "platform_start", { run_id: runId, run_type: "manual", platform });
         setStatus(`Opening ${platform}…`);
         chrome.runtime.sendMessage({
           type: "OPEN_SOCIAL", platform, photoDataUrls, caption, songName,
@@ -1097,7 +1156,12 @@ async function exportAndPost() {
           tiktokAudioDataUrl: platform === "tiktok" ? (tiktokAudioDataUrl || null) : null,
         });
         await new Promise(r => setTimeout(r, 900));
+        TechLog.info("POST", "platform_opened", { run_id: runId, run_type: "manual",
+          platform, duration_ms: Date.now()-t_plat });
       }
+      TechLog.info("POST", "run_complete", { run_id: runId, run_type: "manual",
+        name, platforms, photo_count: photoDataUrls.length, total_duration_ms: Date.now()-runStart });
+      TechLog._flush();
       setStatus(`✅ Opening ${platforms.join(", ")} — ${photoDataUrls.length} photos & caption ready!`, "success");
     } else {
       AppLog.error("All photo resizes failed — cannot post to social media");
@@ -1628,7 +1692,12 @@ async function previewExamplePost() {
   const content = document.getElementById("autoPreviewContent");
   if (!panel || !content) return;
 
-  const settings = getAutoBotSettings();
+  const settings  = getAutoBotSettings();
+  const runId     = `demo-${Date.now()}`;
+  const runStart  = Date.now();
+  TechLog.info("POST", "run_start", { run_id: runId, run_type: "demo",
+    type: settings.type, country: settings.country, region: settings.region || "all",
+    language: settings.language });
 
   panel.classList.remove("hidden");
   content.innerHTML = `<div class="auto-preview-loading">🔍 Searching for ${settings.type}s · 🎵 Finding song…</div>`;
@@ -1636,6 +1705,10 @@ async function previewExamplePost() {
 
   try {
     // Run entity search and song search in parallel — one Places call + one iTunes call
+    const t_search = Date.now();
+    TechLog.info("SEARCH", "search_start", { run_id: runId, run_type: "demo",
+      type: settings.type, country: settings.country, region: settings.region || "all" });
+
     const [place, songInfo] = await Promise.all([
       searchAutoPlace(settings.type, settings.country, settings.region,
                       settings.minRatings, settings.minStars, settings.minPics),
@@ -1649,6 +1722,10 @@ async function previewExamplePost() {
     const address     = place.formattedAddress  || "";
     const rating      = place.rating;
     const ratingCount = place.userRatingCount || 0;
+    TechLog.info("SEARCH", "search_done", { run_id: runId, run_type: "demo",
+      name, address, duration_ms: Date.now()-t_search });
+    TechLog.info("SONG", songInfo ? "song_found" : "song_skipped", { run_id: runId, run_type: "demo",
+      song: songInfo?.name, artist: songInfo?.artist });
 
     // Photo count: random between minPics and min(available, 5)
     const allPhotos = (place.photos || []).sort((a, b) => (b.width || 0) - (a.width || 0));
@@ -1710,8 +1787,17 @@ async function previewExamplePost() {
       }
     }
 
+    TechLog.info("MEDIA", "photos_done", { run_id: runId, run_type: "demo",
+      photo_source: "google_places_preview", photo_count: photos.length,
+      source_breakdown: { google_places_preview: photos.length } });
+    TechLog.info("POST", "run_complete", { run_id: runId, run_type: "demo",
+      name, status: "rendered", total_duration_ms: Date.now()-runStart });
+    TechLog._flush();
     AppLog.info("Auto Bot preview rendered", { name, type: settings.type, song: songInfo?.name, lang: settings.language });
   } catch(err) {
+    TechLog.error("POST", "run_failed", { run_id: runId, run_type: "demo",
+      error: err.message, total_duration_ms: Date.now()-runStart });
+    TechLog._flush();
     content.innerHTML = `<div class="auto-preview-error">⚠️ ${err.message}</div>`;
     AppLog.error("Auto Bot preview failed", err.message);
   }

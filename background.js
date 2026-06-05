@@ -508,67 +508,74 @@ async function autoPostNow(postIndex) {
   if (!apiKey) { bgLog("error","Auto Bot: no API key configured"); return; }
 
   await updateRunLogStatus(postIndex, "triggered");
-  TechLog.info("POST", "post_start", { postIndex, platforms: post.platforms });
+
+  const runId    = `auto-${postIndex}-${Date.now()}`;
+  const runStart = Date.now();
+  TechLog.info("POST", "run_start", { run_id: runId, run_type: "auto", postIndex, platforms: post.platforms });
 
   try {
-    // 1 ── Find an entity
-    TechLog.info("SEARCH", "search_start", { type: config.type, country: config.country, region: config.region });
+    // 1 ── Find an entity ─────────────────────────────────────────────────────
+    const t_search = Date.now();
+    TechLog.info("SEARCH", "search_start", { run_id: runId, run_type: "auto",
+      type: config.type, country: config.country, region: config.region || "all" });
     bgLog("info", `Auto Bot post ${postIndex}: searching for ${config.type||"restaurant"}…`);
-    const t0    = Date.now();
-    const place = await searchAutoPlaceBG(config, apiKey);
+
+    const place   = await searchAutoPlaceBG(config, apiKey);
     const name    = place.displayName?.text || "";
     const address = place.formattedAddress  || "";
-    TechLog.info("SEARCH", "search_done", { name, address, duration: Date.now()-t0 });
+    TechLog.info("SEARCH", "search_done", { run_id: runId, run_type: "auto",
+      name, address, duration_ms: Date.now()-t_search });
     bgLog("info", `Auto Bot: found "${name}"`);
 
-    // 2 ── Resolve photos via waterfall (scrape → Places API fallback)
-    TechLog.info("MEDIA", "photos_start", { name });
+    // 2 ── Resolve photos via waterfall ───────────────────────────────────────
+    const t_photos = Date.now();
+    TechLog.info("MEDIA", "photos_start", { run_id: runId, run_type: "auto", name });
     const allPhotos = (place.photos||[]).sort((a,b)=>(b.width||0)-(a.width||0));
     const minPics   = Math.max(parseInt(config.minPics||"3",10), 3);
 
-    const photoResult = await fetchPhotosWaterfall(
-      name, address, config.type||'restaurant', minPics, apiKey, allPhotos
-    );
+    const photoResult = await fetchPhotosWaterfall(name, address, config.type||"restaurant", minPics, apiKey, allPhotos);
     const photoDataUrls = photoResult.dataUrls;
-    TechLog.info("MEDIA", "photos_done", {
-      count: photoDataUrls.length,
-      source: photoResult.source,
-      photoLog: (photoResult.photoLog||[]).map(p => ({ source: p.source, url: p.sourceUrl?.slice(0,80) })),
-    });
+    // Tally how many photos came from each source
+    const sourceBreakdown = (photoResult.photoLog||[]).reduce((acc,p) => {
+      acc[p.source] = (acc[p.source]||0)+1; return acc;
+    }, {});
+    TechLog.info("MEDIA", "photos_done", { run_id: runId, run_type: "auto",
+      photo_source: photoResult.source, photo_count: photoDataUrls.length,
+      source_breakdown: sourceBreakdown, duration_ms: Date.now()-t_photos });
 
-    // 3 ── Pick a song
-    TechLog.info("SONG", "song_start", { genre: config.songGenre });
+    // 3 ── Pick a song ────────────────────────────────────────────────────────
+    const t_song = Date.now();
     const songInfo = await getAutoSongBG(config.songGenre||"top100", config.country||"BE").catch(() => null);
-    TechLog.info("SONG", songInfo ? "song_found" : "song_skipped", { song: songInfo?.name, artist: songInfo?.artist });
+    TechLog.info("SONG", songInfo ? "song_found" : "song_skipped", { run_id: runId, run_type: "auto",
+      song: songInfo?.name, artist: songInfo?.artist, duration_ms: Date.now()-t_song });
 
-    // 4 ── Build caption
-    const captionOpts = {
-      catchy:   config.capCatchy   ?? true,
-      name:     config.capName     ?? true,
-      address:  config.capAddr     ?? true,
-      hashtags: config.capHash     ?? true,
-      song:     config.capSong     ?? true,
-    };
+    // 4 ── Build caption ──────────────────────────────────────────────────────
+    const captionOpts = { catchy: config.capCatchy ?? true, name: config.capName ?? true,
+      address: config.capAddr ?? true, hashtags: config.capHash ?? true, song: config.capSong ?? true };
     const caption = getAutoCaptionBG(name, address, config.type||"restaurant",
                                       config.language||"nl", captionOpts, songInfo);
-    TechLog.info("CAPTION", "caption_built", { language: config.language, length: caption.length });
+    TechLog.info("CAPTION", "caption_built", { run_id: runId, run_type: "auto",
+      language: config.language, length: caption.length });
 
-    // 5 ── Fetch audio for TikTok
+    // 5 ── Fetch audio for TikTok ─────────────────────────────────────────────
     let tiktokAudioDataUrl = null;
     if (post.platforms.includes("tiktok") && songInfo?.previewUrl) {
-      TechLog.info("MEDIA", "audio_fetch_start", { previewUrl: songInfo.previewUrl });
+      const t_audio = Date.now();
       tiktokAudioDataUrl = await fetchAsDataUrl(songInfo.previewUrl).catch(e => {
-        TechLog.warn("MEDIA", "audio_fetch_failed", { error: e.message });
-        return null;
+        TechLog.warn("MEDIA", "audio_fetch_failed", { run_id: runId, run_type: "auto", error: e.message }); return null;
       });
-      if (tiktokAudioDataUrl) TechLog.info("MEDIA", "audio_fetch_done", { sizeKB: Math.round(tiktokAudioDataUrl.length * 0.75 / 1024) });
+      if (tiktokAudioDataUrl) TechLog.info("MEDIA", "audio_fetch_done", { run_id: runId, run_type: "auto",
+        sizeKB: Math.round(tiktokAudioDataUrl.length*0.75/1024), duration_ms: Date.now()-t_audio });
     }
 
-    // 6 ── Post to each platform
+    // 6 ── Post to each platform ──────────────────────────────────────────────
     let anyFailed = false;
     for (const platform of post.platforms) {
-      TechLog.info("POST", "platform_start", { platform, postIndex });
+      const t_platform = Date.now();
+      TechLog.info("POST", "platform_start", { run_id: runId, run_type: "auto",
+        platform, step: post.platforms.indexOf(platform)+1, total_platforms: post.platforms.length });
       bgLog("info", `Auto Bot: posting to ${platform}…`);
+
       const result = await handleSocialPost({
         platform, photoDataUrls, caption,
         songName:           songInfo?.name || "",
@@ -577,25 +584,31 @@ async function autoPostNow(postIndex) {
         tiktokAudioDataUrl: platform === "tiktok" ? tiktokAudioDataUrl : null,
         autoPost:           true,
       });
+
       if (result?.failed) {
         anyFailed = true;
-        TechLog.error("POST", "platform_post_failed", { platform, postIndex, error: result.error });
+        TechLog.error("POST", "platform_failed", { run_id: runId, run_type: "auto",
+          platform, error: result.error, duration_ms: Date.now()-t_platform });
         bgLog("error", `Auto Bot: ${platform} failed — ${result.error}`);
       } else {
-        TechLog.info("POST", "platform_post_complete", { platform, postIndex });
+        TechLog.info("POST", "platform_success", { run_id: runId, run_type: "auto",
+          platform, duration_ms: Date.now()-t_platform });
       }
       if (post.platforms.indexOf(platform) < post.platforms.length - 1)
         await new Promise(r => setTimeout(r, 4000));
     }
 
-    const finalStatus = anyFailed ? "failed" : "done";
+    const finalStatus       = anyFailed ? "failed" : "done";
+    const total_duration_ms = Date.now()-runStart;
     await updateRunLogStatus(postIndex, finalStatus);
-    TechLog.info("POST", "post_complete", { postIndex, name, platforms: post.platforms, status: finalStatus });
+    TechLog.info("POST", "run_complete", { run_id: runId, run_type: "auto",
+      postIndex, name, platforms: post.platforms, status: finalStatus, total_duration_ms });
     TechLog._flush();
-    bgLog("info", `Auto Bot post ${postIndex} ${finalStatus}`, { name });
+    bgLog("info", `Auto Bot post ${postIndex} ${finalStatus} (${total_duration_ms}ms)`, { name });
 
   } catch(err) {
-    TechLog.error("POST", "post_failed", { postIndex, error: err.message });
+    TechLog.error("POST", "run_failed", { run_id: runId, run_type: "auto",
+      postIndex, error: err.message, total_duration_ms: Date.now()-runStart });
     TechLog._flush();
     bgLog("error", `Auto Bot post ${postIndex} failed`, err.message);
     await updateRunLogStatus(postIndex, "failed");
