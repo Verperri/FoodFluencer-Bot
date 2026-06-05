@@ -1001,12 +1001,23 @@ async function handleSocialPost({ platform, photoDataUrls, caption, songName, lo
     });
 
     // ── Main injector (MAIN world) ───────────────────────────────────────────
-    await chrome.scripting.executeScript({
-      target: { tabId: tab.id },
-      func:   INJECTORS[platform],
-      args:   [photoDataUrls, caption, songName || "", location || "", { restaurantName: restaurantName || "", tiktokAudioDataUrl: tiktokAudioDataUrl || null, autoPost: autoPost }],
-      world:  "MAIN",
-    });
+    // Guard against "Unserializable argument passed" — can happen if a data URL
+    // is malformed or the structured-clone fails transiently. On failure we
+    // retry once without the audio URL (video-only fallback).
+    const injectorArgs = [photoDataUrls, caption, songName || "", location || "",
+      { restaurantName: restaurantName || "", tiktokAudioDataUrl: tiktokAudioDataUrl || null, autoPost }];
+    try {
+      await chrome.scripting.executeScript({ target: { tabId: tab.id }, func: INJECTORS[platform], args: injectorArgs, world: "MAIN" });
+    } catch(injectErr) {
+      if (String(injectErr).includes('Unserializable') && tiktokAudioDataUrl) {
+        bgLog('warn', `${platform} inject failed (Unserializable) — retrying without audio`, injectErr.message);
+        TechLog.warn('POST', 'inject_retry_no_audio', { platform, error: injectErr.message });
+        injectorArgs[4] = { ...injectorArgs[4], tiktokAudioDataUrl: null };
+        await chrome.scripting.executeScript({ target: { tabId: tab.id }, func: INJECTORS[platform], args: injectorArgs, world: "MAIN" });
+      } else {
+        throw injectErr;
+      }
+    }
     bgLog('info', `Injected script on ${platform}`);
 
     // ── Manual mode: restore window so user can see the platform UI ──────────
