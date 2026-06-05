@@ -59,6 +59,33 @@ const AB_BOUNDS_BG = {
   LU: { low:{latitude:49.4,longitude:5.7},  high:{latitude:50.2,longitude:6.5}  },
   NL: { low:{latitude:50.7,longitude:3.3},  high:{latitude:53.6,longitude:7.2}  },
 };
+
+// City pools used when no specific region is selected.
+// Cycling through cities gives genuine variety — the Places API always returns
+// the same top-20 national results for a country-wide query, so we anchor each
+// search to a different city to get a truly different result set every time.
+const AB_CITY_POOL_BG = {
+  BE: ["Bruges","Ghent","Antwerp","Brussels","Liège","Namur","Mons","Leuven",
+       "Mechelen","Hasselt","Kortrijk","Ostend","Aalst","Genk","Sint-Niklaas",
+       "Tournai","Charleroi","Arlon","Dinant","Durbuy","Spa","Bastogne",
+       "Tongeren","Diest","Dendermonde","Roeselare","Ieper","Veurne","Chimay"],
+  FR: ["Paris","Lyon","Marseille","Bordeaux","Toulouse","Nice","Strasbourg",
+       "Nantes","Montpellier","Lille","Rennes","Reims","Tours","Angers",
+       "Metz","Nancy","Dijon","Grenoble","Brest","Perpignan"],
+  DE: ["Berlin","Hamburg","Munich","Cologne","Frankfurt","Stuttgart","Düsseldorf",
+       "Leipzig","Dortmund","Bremen","Hannover","Nuremberg","Dresden","Freiburg",
+       "Heidelberg","Trier","Erfurt","Regensburg","Würzburg","Lübeck"],
+  LU: ["Luxembourg City","Esch-sur-Alzette","Differdange","Dudelange","Ettelbruck",
+       "Diekirch","Wiltz","Echternach","Remich","Vianden"],
+  NL: ["Amsterdam","Rotterdam","The Hague","Utrecht","Eindhoven","Groningen",
+       "Tilburg","Almere","Breda","Nijmegen","Leiden","Maastricht","Haarlem",
+       "Arnhem","Delft","Deventer","Zwolle","Amersfoort","Middelburg"],
+};
+
+function pickRandomCity(countryCode) {
+  const pool = AB_CITY_POOL_BG[countryCode] || AB_CITY_POOL_BG.BE;
+  return pool[Math.floor(Math.random() * pool.length)];
+}
 const AB_ITUNES_CC_BG = { BE:"be", FR:"fr", DE:"de", LU:"be", NL:"nl" };
 
 async function getApiKey() {
@@ -70,7 +97,10 @@ async function searchAutoPlaceBG(config, apiKey) {
   const country = AB_COUNTRY_NAMES_BG[config.country] || "Belgium";
   const bounds  = AB_BOUNDS_BG[config.country] || AB_BOUNDS_BG.BE;
   const region  = config.region || "";
-  const locPart = region ? `${region}, ${country}` : country;
+  // When no specific region is selected, anchor to a random city so each call
+  // returns a completely different result set (country-wide queries always
+  // return the same top-20 popular places).
+  const locPart = region ? `${region}, ${country}` : `${pickRandomCity(config.country)}, ${country}`;
 
   const res = await fetch(AB_PLACES_SEARCH, {
     method: "POST",
@@ -1823,10 +1853,12 @@ function injectTikTok(photoDataUrls, caption, songName, location, opts) {
       vedge.addColorStop(1, 'rgba(0,0,0,0.28)');
       ctx.fillStyle = vedge; ctx.fillRect(0, 0, W, H);
 
-      const nameSize   = Math.max(36, Math.round(W * 0.072));
-      const tagSize    = Math.max(18, Math.round(W * 0.028));
-      const cornerSize = Math.max(12, Math.round(W * 0.016));
-      const gap        = Math.round(nameSize * 0.42);
+      // TikTok canvas is always 720×1280 — use W as reference (portrait, width is the constraint)
+      const nameSize   = Math.max(32, Math.round(W * 0.062));
+      const tagSize    = Math.max(16, Math.round(W * 0.024));
+      const cornerSize = Math.max(11, Math.round(W * 0.015));
+      const gap        = Math.round(nameSize * 0.38);
+      const maxTW      = W * 0.82;  // hard limit — prevents text bleeding past the frame edges
 
       const cityM = (address || '').match(/\d{4}\s+([A-Za-zÀ-ÿ\s-]+),\s*Belgium/i);
       const city  = (cityM?.[1] || (address || '').split(',')[0] || '').trim();
@@ -1835,24 +1867,48 @@ function injectTikTok(photoDataUrls, caption, songName, location, opts) {
         ? taglines[Math.abs([...(restaurantName||'')].reduce((a,c)=>a+c.charCodeAt(0),0)) % taglines.length]
         : 'Discover this hidden gem ✨';
 
-      let ty = best.centerY - (tagSize + gap + nameSize) / 2;
+      // Split long names into two balanced lines so no text overflows the frame
+      ctx.font = `400 ${nameSize}px "Cormorant Garamond",Georgia,Palatino,serif`;
+      const nameLines = (() => {
+        const n = restaurantName || '';
+        if (!n || ctx.measureText(n).width <= maxTW) return [n];
+        const words = n.split(' ');
+        let best2 = [n, ''], bestDiff = Infinity;
+        for (let i = 1; i < words.length; i++) {
+          const l1 = words.slice(0,i).join(' '), l2 = words.slice(i).join(' ');
+          const diff = Math.abs(ctx.measureText(l1).width - ctx.measureText(l2).width);
+          if (diff < bestDiff) { bestDiff = diff; best2 = [l1, l2]; }
+        }
+        return best2;
+      })();
+
+      const nameBlockH = nameLines.length > 1 ? nameSize * 2 + Math.round(gap * 0.5) : nameSize;
+      const blockH     = tagSize + gap + nameBlockH;
+
+      let ty = best.centerY - blockH / 2;
       ctx.fillStyle = '#FFF'; ctx.textAlign = 'center'; ctx.textBaseline = 'top';
-      ctx.shadowColor = 'rgba(0,0,0,0.72)'; ctx.shadowOffsetX = 0;
+      ctx.shadowColor = 'rgba(0,0,0,0.68)'; ctx.shadowOffsetX = 0;
 
       ctx.font = `300 italic ${tagSize}px "Cormorant Garamond",Georgia,Palatino,serif`;
-      ctx.shadowBlur = Math.round(tagSize * 0.55); ctx.shadowOffsetY = 1;
-      ctx.fillText(tagline, W/2, ty);
+      ctx.shadowBlur = Math.round(tagSize * 0.5); ctx.shadowOffsetY = 1;
+      ctx.fillText(tagline, W/2, ty, maxTW);
       ty += tagSize + gap;
 
       ctx.font = `400 ${nameSize}px "Cormorant Garamond",Georgia,Palatino,serif`;
-      ctx.shadowBlur = Math.round(nameSize * 0.26); ctx.shadowOffsetY = 2;
-      ctx.fillText(restaurantName || '', W/2, ty);
+      ctx.shadowBlur = Math.round(nameSize * 0.22); ctx.shadowOffsetY = 2;
+      if (nameLines.length > 1) {
+        ctx.fillText(nameLines[0], W/2, ty, maxTW);
+        ty += nameSize + Math.round(gap * 0.5);
+        ctx.fillText(nameLines[1], W/2, ty, maxTW);
+      } else {
+        ctx.fillText(nameLines[0], W/2, ty, maxTW);
+      }
 
       if (city) {
         ctx.font = `300 ${cornerSize}px "Cormorant Garamond",Georgia,Palatino,serif`;
         ctx.textAlign = 'right'; ctx.textBaseline = 'bottom';
-        ctx.shadowBlur = 3; ctx.shadowOffsetY = 0;
-        ctx.fillText(`${city}, Belgium`, W - Math.round(W*0.032), H - Math.round(H*0.025));
+        ctx.shadowBlur = 2; ctx.shadowOffsetY = 0;
+        ctx.fillText(`${city}, Belgium`, W - Math.round(W*0.030), H - Math.round(H*0.022));
       }
     }
 
@@ -2354,15 +2410,20 @@ function injectTikTok(photoDataUrls, caption, songName, location, opts) {
           }
         }
 
-        // Detect actual success (URL leaves /upload) or failure (error on page)
+        // Detect actual success or failure after posting (poll up to 20 s)
+        // Success signals: URL leaves /upload, or TikTok shows "Video published" banner
+        // Failure signals: explicit error text on page
+        const TIKTOK_SUCCESS_RE = /video\s+published|video\s+posted|post\s+published|erfolgreich.*ver.ffentlicht|vid.o.*publi./i;
         let postSuccess = false, postError = null;
-        for (let i = 0; i < 30; i++) {
+        for (let i = 0; i < 40; i++) {
           await sleep(500);
-          if (!window.location.href.includes('/upload')) { postSuccess = true; break; }
-          const err = (document.body.innerText||'').match(/upload.*fail|post.*fail|violat|prohibited|not.*allow/i);
+          const bodyText = document.body.innerText || '';
+          if (!window.location.href.includes('/upload')) { postSuccess = true; dbg('TikTok success: URL left /upload'); break; }
+          if (TIKTOK_SUCCESS_RE.test(bodyText)) { postSuccess = true; dbg('TikTok success: "Video published" detected'); break; }
+          const err = bodyText.match(/upload.*fail|post.*fail|violat|prohibited|not.*allow|content.*removed/i);
           if (err) { postError = err[0]; break; }
         }
-        if (!postSuccess && !postError) { postSuccess = true; } // timeout → assume success
+        if (!postSuccess && !postError) { postSuccess = true; dbg('TikTok post: detection timed out — assuming success'); }
 
         if (postError) {
           banner(5, `⚠️ TikTok post failed: ${postError}`, 'warn');

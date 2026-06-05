@@ -1262,6 +1262,32 @@ const AB_COUNTRY_NAMES = {
   NL: "The Netherlands",
 };
 
+// City pools — used when "All regions" is selected so each search is anchored
+// to a different city rather than the whole country (country-wide queries always
+// return the same top-20 nationally popular places from the Places API).
+const AB_CITY_POOL = {
+  BE: ["Bruges","Ghent","Antwerp","Brussels","Liège","Namur","Mons","Leuven",
+       "Mechelen","Hasselt","Kortrijk","Ostend","Aalst","Genk","Sint-Niklaas",
+       "Tournai","Charleroi","Arlon","Dinant","Durbuy","Spa","Bastogne",
+       "Tongeren","Diest","Dendermonde","Roeselare","Ieper","Veurne","Chimay"],
+  FR: ["Paris","Lyon","Marseille","Bordeaux","Toulouse","Nice","Strasbourg",
+       "Nantes","Montpellier","Lille","Rennes","Reims","Tours","Angers",
+       "Metz","Nancy","Dijon","Grenoble","Brest","Perpignan"],
+  DE: ["Berlin","Hamburg","Munich","Cologne","Frankfurt","Stuttgart","Düsseldorf",
+       "Leipzig","Dortmund","Bremen","Hannover","Nuremberg","Dresden","Freiburg",
+       "Heidelberg","Trier","Erfurt","Regensburg","Würzburg","Lübeck"],
+  LU: ["Luxembourg City","Esch-sur-Alzette","Differdange","Dudelange","Ettelbruck",
+       "Diekirch","Wiltz","Echternach","Remich","Vianden"],
+  NL: ["Amsterdam","Rotterdam","The Hague","Utrecht","Eindhoven","Groningen",
+       "Tilburg","Almere","Breda","Nijmegen","Leiden","Maastricht","Haarlem",
+       "Arnhem","Delft","Deventer","Zwolle","Amersfoort","Middelburg"],
+};
+
+function pickRandomCity(cc) {
+  const pool = AB_CITY_POOL[cc] || AB_CITY_POOL.BE;
+  return pool[Math.floor(Math.random() * pool.length)];
+}
+
 // Bounding boxes used as locationRestriction for each country
 const AB_COUNTRY_BOUNDS = {
   BE: { low: { latitude: 49.5,  longitude:  2.5 }, high: { latitude: 51.5,  longitude:  6.4 } },
@@ -1316,7 +1342,8 @@ async function searchAutoPlace(type, country, region, minRatings = 0, minStars =
   const countryName = AB_COUNTRY_NAMES[country] || "Belgium";
   const bounds      = AB_COUNTRY_BOUNDS[country] || AB_COUNTRY_BOUNDS.BE;
 
-  const locationPart = region ? `${region}, ${countryName}` : countryName;
+  // When no region is selected, anchor to a random city for genuine variety.
+  const locationPart = region ? `${region}, ${countryName}` : `${pickRandomCity(country)}, ${countryName}`;
   const q = `${typeQuery} in ${locationPart}`;
 
   trackApiCall("search", q);
