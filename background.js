@@ -658,6 +658,18 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
     TechLog.info("POST", "tiktok_video_injected", { sizeMB: msg.sizeMB, mimeType: msg.mimeType, hasAudio: msg.hasAudio });
     return;
   }
+  if (msg.type === "TIKTOK_ENCODE_START") {
+    TechLog.info("ENCODE", "video_encode_start", { codec: msg.codec, width: msg.width, height: msg.height, slides: msg.slides, fps: msg.fps });
+    return;
+  }
+  if (msg.type === "TIKTOK_ENCODE_DONE") {
+    TechLog.info("ENCODE", "video_encode_done", { chunks: msg.chunks, duration_ms: msg.duration_ms });
+    return;
+  }
+  if (msg.type === "TIKTOK_READY_TO_MINIMIZE") {
+    TechLog.info("POST", "tiktok_minimise_triggered", { note: "checkUpload accepted — window minimised" });
+    return;
+  }
   if (msg.type === "TIKTOK_UPLOAD_ERROR") {
     TechLog.error("POST", "tiktok_upload_rejected", {
       matched:     msg.matched,
@@ -973,8 +985,12 @@ async function handleSocialPost({ platform, photoDataUrls, caption, songName, lo
   // once checkUpload succeeds — at that point we silently minimise and the
   // remaining steps (caption, post button) run in the background.
   if (platform === 'tiktok') {
-    await chrome.windows.update(winId, { focused: true });
-    bgLog('info', 'TikTok: window focused — staying active until upload accepted');
+    // Must restore to 'normal' state, not just focus.
+    // chrome.windows.update({ focused:true }) on a minimised window sets
+    // focus but leaves the window minimised — Chrome still throttles
+    // VideoEncoder/WebCodecs in a minimised window regardless of focus.
+    const restored = await chrome.windows.update(winId, { state: 'normal', focused: true });
+    bgLog('info', `TikTok: window restored to normal (state=${restored.state}) — VideoEncoder active until upload accepted`);
   }
 
   // SPA hydration buffer
@@ -2242,9 +2258,13 @@ function injectTikTok(photoDataUrls, caption, songName, location, opts) {
       } catch(_) {}
     }
     if (!codec) throw new Error('No H.264 codec supported');
-    dbg(`Video codec: ${codec}`);
+    dbg(`Video codec: ${codec} | canvas: ${W}×${H} | ${FPS}fps | ${images.length} slides`);
+    document.dispatchEvent(new CustomEvent('__ffbot_event', { detail: {
+      type: 'TIKTOK_ENCODE_START', codec, width: W, height: H, slides: images.length, fps: FPS,
+    }}));
 
     const vChunks = []; let vDcfg = null; let vErr = null;
+    const tEncStart = Date.now();
     const vEnc = new VideoEncoder({
       output: (chunk, meta) => {
         if (meta?.decoderConfig) vDcfg = meta.decoderConfig;
@@ -2271,7 +2291,11 @@ function injectTikTok(photoDataUrls, caption, songName, location, opts) {
     }
     await vEnc.flush(); vEnc.close();
     if (vErr) throw new Error('VideoEncoder: ' + vErr.message);
-    dbg(`Video: ${vChunks.length} chunks`);
+    const encMs = Date.now() - tEncStart;
+    dbg(`Video encoded: ${vChunks.length} chunks in ${encMs}ms`);
+    document.dispatchEvent(new CustomEvent('__ffbot_event', { detail: {
+      type: 'TIKTOK_ENCODE_DONE', chunks: vChunks.length, duration_ms: encMs,
+    }}));
 
     // ── Encode audio with WebCodecs (AAC-LC) ────────────────────────────────
     let aChunks = [];

@@ -576,15 +576,14 @@
         </div>
       </div>
 
-      <!-- Silent Mode Test -->
+      <!-- E2E Diagnostics -->
       <div class="settings-section">
-        <h3 class="settings-section-title">🔇 Silent Mode Diagnostic</h3>
-        <p class="settings-desc">Tests whether each platform works in a minimised window (no visible tab). A window will briefly appear in your taskbar — nothing will be posted.</p>
+        <h3 class="settings-section-title">🧪 Diagnostics</h3>
+        <p class="settings-desc">End-to-end posting test — verifies the full pipeline without saving to the activity log.</p>
         <div class="settings-action-row">
-          <button id="testSilentIG" class="btn btn--ghost btn--sm">🔍 Test Instagram (silent)</button>
-          <button id="testSilentTT" class="btn btn--ghost btn--sm">🔍 Test TikTok (silent)</button>
+          <button id="runDiagnosticBtn" class="btn btn--ghost btn--sm" disabled title="Coming soon">🧪 Run Diagnostic Test</button>
         </div>
-        <div id="silentTestLog" class="silent-test-log hidden"></div>
+        <p class="settings-desc" style="margin-top:6px;font-size:.68rem;color:var(--muted)">Full E2E test suite coming in a future release.</p>
       </div>
 
       <!-- Version -->

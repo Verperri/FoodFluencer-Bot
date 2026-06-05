@@ -55,9 +55,6 @@ function openSettings() {
 
   panel.classList.remove('hidden');
   backdrop.classList.remove('hidden');
-
-  // Load any previously saved silent test results
-  setTimeout(loadStoredSilentResults, 50);
 }
 
 function closeSettings() {
@@ -146,91 +143,10 @@ document.getElementById('settingsShowOnboarding')?.addEventListener('click', () 
   showOnboarding();
 });
 
-// ── Silent mode diagnostic tests ──────────────────────────────────────────────
-
-function renderSilentTestLog(result) {
-  const log = document.getElementById('silentTestLog');
-  if (!log) return;
-  log.classList.remove('hidden');
-
-  const icon = s => s.ok === true ? '✅' : s.ok === false ? '❌' : '⏳';
-  const stepRows = (result.steps || []).map(s => `
-    <div class="stl-step">
-      <span class="stl-icon">${icon(s)}</span>
-      <div class="stl-body">
-        <span class="stl-label"><strong>Step ${s.step}</strong> — ${s.label}</span>
-        ${s.detail ? `<div class="stl-detail">${s.detail.replace(/</g,'&lt;').replace(/>/g,'&gt;')}</div>` : ''}
-      </div>
-    </div>`).join('');
-
-  const vClass = (result.verdict||'').includes('FEASIBLE') ? 'ok'
-               : (result.verdict||'').includes('NOT READY') ? 'fail' : 'warn';
-
-  const platform = result.platform === 'instagram' ? '📸 Instagram' : '🎵 TikTok';
-  log.innerHTML = `
-    <div class="stl-header">${platform} silent test — ${result.total_ms}ms total</div>
-    ${stepRows}
-    <div class="stl-verdict ${vClass}">${result.verdict || 'No verdict'}</div>`;
-}
-
-function runSilentTest(msgType) {
-  const log = document.getElementById('silentTestLog');
-  const platform = msgType === 'TEST_SILENT_IG' ? '📸 Instagram' : '🎵 TikTok';
-  const btnId    = msgType === 'TEST_SILENT_IG' ? 'testSilentIG' : 'testSilentTT';
-  const btn      = document.getElementById(btnId);
-
-  if (log) {
-    log.classList.remove('hidden');
-    log.innerHTML = `
-      <div class="stl-header">${platform} silent test</div>
-      <div class="stl-step">
-        <span class="stl-spinner">⟳</span>
-        <div class="stl-body"><span class="stl-label">Running — please wait (up to 40 s)…</span></div>
-      </div>`;
-  }
-  if (btn) { btn.disabled = true; btn.textContent = '⏳ Running…'; }
-
-  chrome.runtime.sendMessage({ type: msgType }, result => {
-    if (btn) {
-      btn.disabled = false;
-      btn.textContent = msgType === 'TEST_SILENT_IG' ? '🔍 Test Instagram (silent)' : '🔍 Test TikTok (silent)';
-    }
-    if (chrome.runtime.lastError || result?.error) {
-      if (log) log.innerHTML = `<div class="stl-verdict fail">❌ Error: ${chrome.runtime.lastError?.message || result?.error}</div>`;
-      return;
-    }
-    renderSilentTestLog(result);
-  });
-}
-
-document.getElementById('testSilentIG')?.addEventListener('click', () => runSilentTest('TEST_SILENT_IG'));
-document.getElementById('testSilentTT')?.addEventListener('click', () => runSilentTest('TEST_SILENT_TT'));
-
-// Load previously saved results when settings opens
-function loadStoredSilentResults() {
-  chrome.runtime.sendMessage({ type: 'GET_SILENT_RESULTS' }, results => {
-    if (chrome.runtime.lastError || !results) return;
-    const log = document.getElementById('silentTestLog');
-    if (!log || (!results.instagram && !results.tiktok)) return;
-
-    // Show the most recent result (or both)
-    const toShow = results.tiktok || results.instagram;
-    if (toShow) renderSilentTestLog(toShow);
-
-    // If both exist, append the other one
-    if (results.instagram && results.tiktok) {
-      const other = toShow === results.tiktok ? results.instagram : results.tiktok;
-      const extra = document.createElement('div');
-      extra.style.marginTop = '8px';
-      const platform = other.platform === 'instagram' ? '📸 Instagram' : '🎵 TikTok';
-      const vClass = (other.verdict||'').includes('FEASIBLE') ? 'ok'
-                   : (other.verdict||'').includes('NOT READY') ? 'fail' : 'warn';
-      extra.innerHTML = `<div class="stl-header">${platform} — ${other.ts?.slice(0,19).replace('T',' ')} (${other.total_ms}ms)</div>
-        <div class="stl-verdict ${vClass}">${other.verdict}</div>`;
-      log.appendChild(extra);
-    }
-  });
-}
+// ── Diagnostics (placeholder — full E2E test suite coming later) ─────────────
+// The "Run Diagnostic Test" button is currently disabled in the UI.
+// When implemented it will run a full end-to-end pipeline check without
+// writing to the activity log, verifying each platform silently.
 
 // ════════════════════════════════════════════════════════════════════════════
 // ONBOARDING
