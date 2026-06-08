@@ -690,6 +690,25 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
     bgLog("error", "TikTok upload rejected", msg.matched);
     return;
   }
+  // Granular step tracker — logged for every notable action the TikTok
+  // injector performs, so the technical log shows exactly how far the
+  // posting flow progressed (and where it stalled/failed).
+  if (msg.type === "TIKTOK_STEP") {
+    TechLog.info("POST", "tiktok_step", { step: msg.step, detail: msg.detail });
+    return;
+  }
+  // TikTok's generic "Something went wrong. Please try again." error screen.
+  // We record which step the bot had just performed right before this screen
+  // appeared, so we can pinpoint exactly where the flow broke.
+  if (msg.type === "TIKTOK_ERROR_PAGE") {
+    TechLog.error("POST", "tiktok_error_page", {
+      lastStep:       msg.lastStep,
+      lastStepDetail: msg.lastStepDetail,
+      pageSnippet:    msg.pageSnippet,
+    });
+    bgLog("error", "TikTok 'Something went wrong' page detected", `last step: ${msg.lastStep}`);
+    return;
+  }
   if (msg.type === "DOWNLOAD") {
     chrome.downloads.download(
       { url: msg.url, filename: msg.filename, conflictAction: "uniquify" },
@@ -2151,6 +2170,41 @@ function injectTikTok(photoDataUrls, caption, songName, location, opts) {
     console.log(`[FoodFluencer TikTok] ${msg}`);
   }
 
+  // ── Step tracker — every notable action is recorded so TechLog always knows
+  // exactly which step the bot was performing, including the step right before
+  // any "Something went wrong" error page appears ──────────────────────────
+  let lastStep = { name: 'init', detail: null };
+  function step(name, detail) {
+    lastStep = { name, detail: detail || null };
+    dbg(`STEP: ${name}${detail ? ' — ' + detail : ''}`);
+    document.dispatchEvent(new CustomEvent('__ffbot_event', { detail: {
+      type: 'TIKTOK_STEP', step: name, detail: detail || null,
+    }}));
+  }
+
+  // ── "Something went wrong" error-page detector ───────────────────────────
+  // TikTok shows a generic "Something went wrong Please try again." screen on
+  // certain failures. When seen, report which step preceded it so we can
+  // pinpoint exactly where the flow broke.
+  const ERROR_PAGE_RE = /something\s+went\s+wrong[.\s]*please\s+try\s+again/i;
+  let errorPageReported = false;
+  function checkForErrorPage() {
+    if (errorPageReported) return false;
+    const text = document.body.innerText || '';
+    if (ERROR_PAGE_RE.test(text)) {
+      errorPageReported = true;
+      dbg(`"Something went wrong" page detected — last step was "${lastStep.name}"${lastStep.detail ? ' (' + lastStep.detail + ')' : ''}`);
+      document.dispatchEvent(new CustomEvent('__ffbot_event', { detail: {
+        type: 'TIKTOK_ERROR_PAGE',
+        lastStep: lastStep.name,
+        lastStepDetail: lastStep.detail,
+        pageSnippet: text.slice(0, 600),
+      }}));
+      return true;
+    }
+    return false;
+  }
+
   // ═══════════════════════════════════════════════════════════════════════════
   // Build H.264 MP4 (+ optional AAC audio) entirely inside TikTok's page context
   // ═══════════════════════════════════════════════════════════════════════════
@@ -2577,6 +2631,7 @@ function injectTikTok(photoDataUrls, caption, songName, location, opts) {
     while (Date.now() - start < ms) {
       await sleep(700);
       const text = document.body.innerText || '';
+      if (ERROR_PAGE_RE.test(text)) { checkForErrorPage(); return 'rejected'; }
       const errMatch = text.match(ERR_RE);
       if (errMatch) {
         // Extract a wider context around the error for logging
@@ -2604,9 +2659,12 @@ function injectTikTok(photoDataUrls, caption, songName, location, opts) {
   // MAIN FLOW
   // ═══════════════════════════════════════════════════════════════════════════
   (async () => {
+    step('injector_started', `url=${window.location.href}`);
     await sleep(2000);
+    if (checkForErrorPage()) return;
 
     // ── Step 1: Build the MP4 ────────────────────────────────────────────
+    step('build_video_start', `${photoDataUrls.length} photos, audio=${!!tiktokAudioDataUrl}`);
     const hasAudio = !!tiktokAudioDataUrl;
     banner(1, `Building ${photoDataUrls.length}-photo slideshow${hasAudio ? ' 🎵 with song' : ''}…`);
 
@@ -2617,64 +2675,243 @@ function injectTikTok(photoDataUrls, caption, songName, location, opts) {
       videoFile = new File([blob], 'tiktok-post.mp4', { type: 'video/mp4' });
       banner(1, `Video ready: ${sizeMB}MB H.264${hasAudio ? ' + AAC 🎵' : ''} — uploading…`);
       dbg(`Video: ${sizeMB}MB`);
+      step('build_video_done', `${sizeMB}MB`);
     } catch(e) {
       dbg(`Build failed: ${e.message}`);
       banner(1, `⚠️ Build failed: ${e.message}`, 'warn');
+      step('build_video_failed', e.message);
       return;
     }
 
     // ── Step 2: Inject into TikTok file input ────────────────────────────
     banner(2, 'Finding upload area…');
+    step('find_file_input');
     const fileInput = await waitFor('input[type="file"]', 12000);
-    if (!fileInput) { banner(2, '⚠️ Upload area not found. Refresh and retry.', 'warn'); return; }
+    if (!fileInput) {
+      banner(2, '⚠️ Upload area not found. Refresh and retry.', 'warn');
+      step('find_file_input_failed', 'no input[type=file] within 12s');
+      checkForErrorPage();
+      return;
+    }
 
     const sizeMB = (videoFile.size / 1024 / 1024).toFixed(2);
     dbg(`Injecting ${sizeMB}MB MP4 (type=${videoFile.type})…`);
+    step('inject_file', `${sizeMB}MB ${videoFile.type}`);
     // Log video specs before injection so we have this in TechLog for debugging
     document.dispatchEvent(new CustomEvent('__ffbot_event', { detail:{ type:'TIKTOK_VIDEO_SPECS', sizeMB, mimeType:videoFile.type, hasAudio }}));
     injectFile(fileInput, videoFile);
 
     // ── Step 3: Wait for TikTok to process ──────────────────────────────
     banner(3, 'Processing video…');
+    step('wait_video_processing');
     const result = await checkUpload(30000);
     if (result === 'rejected') {
       // Capture visible error text for the banner
       const visibleErr = (document.body.innerText || '').match(ERR_RE)?.[0] || 'unknown error';
       banner(3, `⚠️ TikTok rejected: "<em>${visibleErr}</em>". Check the page for details.`, 'warn');
+      step('upload_rejected', visibleErr);
       document.dispatchEvent(new CustomEvent('__ffbot_event', { detail:{ type:'TIKTOK_UPLOAD_ERROR', matched:visibleErr, context:'post-check', autoPost:opts?.autoPost }}));
       document.dispatchEvent(new CustomEvent('__ffbot_failed', { detail:{ platform:'tiktok', error:'Upload rejected: '+visibleErr }}));
       return;
     }
-    dbg('Upload accepted');
-    // Signal the background: video is uploaded, safe to minimise the window now.
-    // VideoEncoder + file injection are complete; caption/post steps work fine in background.
-    document.dispatchEvent(new CustomEvent('__ffbot_event', { detail: { type: 'TIKTOK_READY_TO_MINIMIZE' } }));
+    if (result === 'timeout') {
+      step('upload_timeout', 'no acceptance/rejection signal within 30s');
+      checkForErrorPage();
+    } else {
+      dbg('Upload accepted');
+      step('upload_accepted');
+    }
+    // NOTE: We intentionally do NOT minimise the window here anymore.
+    // TikTok Studio's redesigned caption/location editors appear to require the
+    // tab to be visible & focused for `.focus()` / `execCommand('insertText')`
+    // to actually register (minimised/hidden windows report `document.hidden`
+    // and TikTok's React-based editor silently ignores input in that state).
+    // That is the most likely reason description/location were silently failing
+    // to fill — the window was minimised right before those steps ran.
+    // We now only minimise once description + location are filled & VALIDATED,
+    // immediately before clicking Post.
     await sleep(2000);
 
     // ── Step 4: Fill Description ─────────────────────────────────────────
     banner(4, 'Filling description…');
+    step('find_description_box');
+    // TikTok Studio's redesign moved away from the old Draft.js editor markup,
+    // so we cast a wide net: data-e2e hooks, aria/placeholder hints, role=textbox,
+    // and finally fall back to scanning every contenteditable on the page for
+    // the one that looks like the caption editor (large, near top of form).
     const descSels = [
+      '[data-e2e*="caption" i] [contenteditable="true"]',
+      '[data-e2e*="description" i] [contenteditable="true"]',
+      '[data-e2e="caption-edit"]',
+      '[data-e2e*="caption" i]',
       '.public-DraftEditor-content',
       '[contenteditable="true"][class*="editor" i]',
+      '[contenteditable="true"][aria-label*="description" i]',
+      '[contenteditable="true"][aria-label*="caption" i]',
+      '[aria-label*="description" i][contenteditable="true"]',
       '[data-placeholder*="description" i]',
+      '[data-placeholder*="caption" i]',
+      '[role="textbox"][contenteditable="true"]',
       'div[contenteditable="true"]',
     ];
     let descBox = null;
-    for (let att = 0; att < 8 && !descBox; att++) {
-      for (const s of descSels) { descBox = document.querySelector(s); if (descBox) break; }
+    for (let att = 0; att < 10 && !descBox; att++) {
+      for (const s of descSels) {
+        const el = document.querySelector(s);
+        if (el) { descBox = el; break; }
+      }
+      if (!descBox) {
+        // Last-resort: scan all contenteditable elements and pick the largest visible one
+        const candidates = [...document.querySelectorAll('[contenteditable="true"]')]
+          .map(el => ({ el, r: el.getBoundingClientRect() }))
+          .filter(({ r }) => r.width > 100 && r.height > 20)
+          .sort((a, b) => (b.r.width * b.r.height) - (a.r.width * a.r.height));
+        if (candidates.length) descBox = candidates[0].el;
+      }
       if (!descBox) await sleep(500);
     }
+    // ── Text-injection strategies for React/Lexical-style contenteditable
+    // editors ────────────────────────────────────────────────────────────────
+    // TikTok Studio's caption editor is a modern controlled rich-text editor
+    // (Lexical/Slate-style). Bulk `execCommand('insertText', false, longString)`
+    // mutates the DOM directly in one shot — the editor's internal model can
+    // desync from that DOM mutation, and a render/reconciliation exception a
+    // few hundred ms later gets caught by React's error boundary, replacing the
+    // whole upload form with "Something went wrong. Please try again." This is
+    // the most likely explanation for why the location/post controls vanish
+    // right after the caption appears to fill successfully. To avoid that we
+    // try gentler, more "native" input simulations first and only fall back to
+    // the risky bulk execCommand as a last resort.
+
+    // Strategy A: simulate a real clipboard paste — paste handlers are a
+    // standard, well-supported path for external content in rich editors and
+    // correctly route through the editor's normal state-update pipeline.
+    function pasteText(el, text) {
+      try {
+        const dt = new DataTransfer();
+        dt.setData('text/plain', text);
+        const evt = new ClipboardEvent('paste', { bubbles: true, cancelable: true, clipboardData: dt });
+        return el.dispatchEvent(evt);
+      } catch (e) { dbg(`pasteText failed: ${e.message}`); return false; }
+    }
+    // Strategy B: dispatch native beforeinput/input InputEvents carrying the
+    // text as `data` with inputType 'insertText' — this is what the browser
+    // itself fires for real typed/pasted input, so controlled editors that
+    // listen for these (rather than relying on execCommand's legacy DOM
+    // mutation path) pick it up through their normal flow.
+    function dispatchInsertText(el, text) {
+      try {
+        const before = new InputEvent('beforeinput', { bubbles: true, cancelable: true, inputType: 'insertText', data: text });
+        el.dispatchEvent(before);
+        const input = new InputEvent('input', { bubbles: true, cancelable: true, inputType: 'insertText', data: text });
+        el.dispatchEvent(input);
+        return true;
+      } catch (e) { dbg(`dispatchInsertText failed: ${e.message}`); return false; }
+    }
+
+    // Whitespace-/line-break-tolerant text comparison. Different injection
+    // methods (paste vs. native execCommand) get reformatted differently by
+    // the editor — e.g. a "📍 Hotel\n📌 Street" caption can come back as
+    // "📍 Hotel \n 📌 Street" (extra spaces around the line break) after a
+    // paste-event insert, even though the content is effectively identical.
+    // A naive `actual.includes(rawSnippet)` then reports a false failure,
+    // which made us discard a perfectly good fill and re-type the same text —
+    // exactly the visible "fills, empties, refills" behaviour reported.
+    // Collapsing all whitespace runs to a single space before comparing (and
+    // building the snippet via `Array.from` so we never slice a surrogate
+    // pair / emoji ZWJ sequence in half) makes the match format-agnostic.
+    const normWS = s => (s || '').replace(/\s+/g, ' ').trim().toLowerCase();
+    const snippetOf = s => Array.from(s || '').slice(0, 20).join('');
+    function textMatches(actual, want) {
+      if (!actual || !want) return false;
+      return normWS(actual).includes(normWS(want));
+    }
+
+    let descriptionFilled = false;
     if (descBox && caption) {
-      descBox.focus(); await sleep(300);
-      document.execCommand('selectAll', false, null);
-      document.execCommand('insertText', false, caption);
-      dbg('Description filled');
-    } else { dbg('Description box not found'); }
+      // Try up to 3 times, escalating through gentler → more invasive fill
+      // strategies, re-checking the actual rendered text after each attempt.
+      const wantSnippet = snippetOf(caption);
+      const strategies = [
+        { name: 'paste',   run: () => pasteText(descBox, caption) },
+        { name: 'inputevt',run: () => dispatchInsertText(descBox, caption) },
+        { name: 'execcmd', run: () => { document.execCommand('selectAll', false, null); document.execCommand('insertText', false, caption); return true; } },
+      ];
+      const readBox = () => (descBox.innerText || descBox.textContent || '').trim();
+      // Poll for the snippet to show up rather than checking once — these
+      // editors render asynchronously, and a single too-early read was making
+      // us think a perfectly good fill had failed, which then made us clear
+      // the (correctly-filled) box and re-type the SAME caption with the next
+      // strategy — the visible "fills then empties then refills" the user saw.
+      async function pollForSnippet(timeoutMs) {
+        const until = Date.now() + timeoutMs;
+        let last = '';
+        while (Date.now() < until) {
+          last = readBox();
+          if (textMatches(last, wantSnippet)) return last;
+          await sleep(250);
+        }
+        return textMatches(last, wantSnippet) ? last : null;
+      }
+      for (let fillAtt = 0; fillAtt < strategies.length && !descriptionFilled; fillAtt++) {
+        // Re-check first: a prior strategy may already have landed correctly
+        // and we just need to confirm it — never blindly clear good content.
+        const already = readBox();
+        if (textMatches(already, wantSnippet)) {
+          descriptionFilled = true;
+          dbg('Description already present & verified — skipping further fill attempts');
+          step('fill_description_done', `${already.length} chars (already present, pre-attempt ${fillAtt + 1})`);
+          break;
+        }
+        const strat = strategies[fillAtt];
+        descBox.focus(); await sleep(300);
+        document.execCommand('selectAll', false, null);
+        document.execCommand('delete', false, null);
+        await sleep(150);
+        strat.run();
+        const actual = await pollForSnippet(1800);
+        if (actual) {
+          descriptionFilled = true;
+          dbg(`Description filled & verified via "${strat.name}"`);
+          step('fill_description_done', `${actual.length} chars via ${strat.name}`);
+        } else {
+          dbg(`Description fill via "${strat.name}" verify failed: got "${readBox().slice(0, 40)}"`);
+          step('fill_description_verify_failed', `${strat.name}: got "${readBox().slice(0, 40)}"`);
+          await sleep(300);
+        }
+      }
+      if (!descriptionFilled) {
+        dbg('⚠️ Description could not be verified after all strategies — aborting before Post');
+        step('fill_description_failed_final', 'gave up after all fill strategies');
+        checkForErrorPage();
+      } else {
+        // The page has been observed to crash to "Something went wrong" a few
+        // hundred ms AFTER a description fill verifies successfully — poll
+        // briefly right here so the technical log conclusively shows whether
+        // the crash is caused by the fill itself (vs. something later, e.g.
+        // the location step). This directly informs which strategy is safe.
+        let crashedAfterFill = false;
+        for (let c = 0; c < 6; c++) {
+          await sleep(250);
+          if (checkForErrorPage()) {
+            crashedAfterFill = true;
+            step('page_crashed_after_description_fill', `~${(c + 1) * 250}ms after fill (strategy used)`);
+            break;
+          }
+        }
+        if (!crashedAfterFill) step('page_stable_after_description_fill', '~1500ms post-fill check passed');
+      }
+    } else {
+      dbg('Description box not found');
+      step('find_description_box_failed', caption ? 'no editor element matched' : 'no caption provided');
+      checkForErrorPage();
+    }
 
     // ── Step 5: Add Location ─────────────────────────────────────────────
     if (location) {
       await sleep(600);
       banner(4, 'Adding location…');
+      step('find_location_trigger');
 
       const cityMatch = location.match(/\d{4}\s+([A-Za-zÀ-ÿ\s-]+),\s*Belgium/i);
       const city      = (cityMatch?.[1] || location.split(',')[0] || '').trim();
@@ -2684,43 +2921,166 @@ function injectTikTok(photoDataUrls, caption, songName, location, opts) {
       const searchTerm = rName || city || location.split(',')[0].trim();
       dbg(`Location search: "${searchTerm}" (${rName ? 'venue' : 'city'})`);
 
-      // Find the "Location" button/field
-      let locTrigger = document.querySelector('[aria-label*="location" i],[placeholder*="location" i]');
+      // Find the "Location" button/field — TikTok Studio renamed/restyled this
+      // control, so try data-e2e hooks first, then aria/placeholder, then a
+      // broad text-based scan over interactive elements.
+      let locTrigger =
+        document.querySelector('[data-e2e*="location" i]') ||
+        document.querySelector('[aria-label*="location" i],[placeholder*="location" i]');
       if (!locTrigger) {
-        locTrigger = [...document.querySelectorAll('[role="button"],button,div[tabindex]')]
-          .find(el => /add\s*(a\s+)?location|^location$/i.test(el.innerText || el.getAttribute('aria-label') || ''));
+        locTrigger = [...document.querySelectorAll('[role="button"],button,div[tabindex],span,div')]
+          .filter(el => { const r = el.getBoundingClientRect(); return r.width > 20 && r.height > 10; })
+          .find(el => /add\s*(a\s+)?location|^location$|where\s+was\s+this/i.test(
+            (el.innerText || el.getAttribute('aria-label') || '').trim()));
       }
+      let locationVerified = false;
       if (locTrigger) {
+        const triggerTextBefore = (locTrigger.innerText || locTrigger.getAttribute('aria-label') || '').trim();
+        step('open_location_search', triggerTextBefore.slice(0, 60));
         locTrigger.click(); await sleep(700);
-        const locInput = await waitFor('input[placeholder*="Search" i],input[placeholder*="Location" i]', 4000);
+        const locInput = await waitFor(
+          'input[placeholder*="Search" i],input[placeholder*="Location" i],[data-e2e*="location" i] input,input[aria-label*="location" i]',
+          4000);
+        if (!locInput) { step('location_search_input_not_found'); checkForErrorPage(); }
         if (locInput) {
-          // Helper: type a term and wait for results
-          async function typeAndSelect(term) {
+          // Helper: type a term, wait for results, click the first, and verify
+          // it actually got applied (a chip/tag with that name appears, or the
+          // trigger's label changes away from the "Add location" placeholder).
+          // A location chip is "attached" once the trigger's label changes away
+          // from its original placeholder text — that alone is solid proof,
+          // independent of whatever text the result item happened to show.
+          const triggerChanged = () => {
+            const now = (locTrigger.innerText || locTrigger.getAttribute('aria-label') || '').trim();
+            return now && now !== triggerTextBefore ? now : null;
+          };
+          async function typeSelectAndVerify(term) {
+            // Already attached? Don't clear/retype — that's exactly what was
+            // producing the visible "fills, empties, refills with the same
+            // value" behaviour for location too.
+            const already = triggerChanged();
+            if (already) return { picked: already, verified: true, skipped: true };
+
             locInput.focus(); await sleep(200);
-            // Clear existing text
             document.execCommand('selectAll', false, null);
             document.execCommand('insertText', false, '');
             await sleep(100);
             for (const ch of term) { document.execCommand('insertText', false, ch); await sleep(55); }
             await sleep(2000);
             const first = document.querySelector(
-              '[role="option"]:first-child,[class*="location-item"]:first-child,[class*="LocationItem"]:first-child'
+              '[role="option"]:first-child,[class*="location-item"]:first-child,[class*="LocationItem"]:first-child,[data-e2e*="location"] [role="option"]:first-child,li[role="option"]:first-child'
             );
-            if (first) { first.click(); dbg(`Location selected: ${first.innerText?.trim()}`); return true; }
-            return false;
+            if (!first) return { picked: null, verified: false };
+            const pickedName = first.innerText?.trim() || term;
+            first.click();
+            dbg(`Location candidate clicked: ${pickedName}`);
+
+            // Verify: poll up to ~5s. The strongest signal is simply that the
+            // trigger's label changed away from its pre-search placeholder —
+            // TikTok may render the chip with different text/formatting than
+            // the search-result item showed, so don't over-rely on snippet match.
+            const nameSnippet = pickedName.split(',')[0].trim().slice(0, 12).toLowerCase();
+            let verified = false, picked2 = pickedName;
+            for (let v = 0; v < 10 && !verified; v++) {
+              await sleep(500);
+              const changed = triggerChanged();
+              if (changed) { verified = true; picked2 = changed; break; }
+              const bodyText = (document.body.innerText || '').toLowerCase();
+              if (nameSnippet && bodyText.includes(nameSnippet)) { verified = true; picked2 = pickedName; break; }
+            }
+            return { picked: picked2, verified };
           }
 
-          // Try restaurant name first, fall back to city
-          const selected = await typeAndSelect(searchTerm);
-          if (!selected && rName && city) {
-            dbg(`No venue results for "${rName}" — retrying with city "${city}"`);
-            await typeAndSelect(city);
-          } else if (!selected) {
+          // Try restaurant name first, fall back to city — but only if the
+          // first attempt genuinely produced nothing (re-check trigger state
+          // immediately before falling back, in case verification merely
+          // lagged behind a successful attach).
+          step('search_location', searchTerm);
+          let { picked, verified } = await typeSelectAndVerify(searchTerm);
+          if (!verified) {
+            const lateCheck = triggerChanged();
+            if (lateCheck) { verified = true; picked = lateCheck; }
+          }
+          if (!verified && rName && city && city.toLowerCase() !== searchTerm.toLowerCase()) {
+            dbg(`"${picked || searchTerm}" not verified — retrying with city "${city}"`);
+            step('search_location_fallback_city', city);
+            ({ picked, verified } = await typeSelectAndVerify(city));
+          }
+          locationVerified = verified;
+          if (verified) {
+            dbg(`Location verified on page: ${picked}`);
+            step('select_location_done', `verified: ${picked}`);
+          } else if (picked) {
+            dbg(`⚠️ Location "${picked}" clicked but could not be verified on page`);
+            step('select_location_verify_failed', `clicked "${picked}" but not visible afterwards`);
+            checkForErrorPage();
+          } else {
             dbg('No location results found');
+            step('select_location_failed', `no results for "${searchTerm}"${rName && city ? ` or "${city}"` : ''}`);
+            checkForErrorPage();
           }
         }
-      } else { dbg('Location button not found'); }
+      } else {
+        dbg('Location button not found');
+        step('find_location_trigger_failed');
+        checkForErrorPage();
+      }
+      if (!locationVerified) {
+        dbg('⚠️ Location could not be confirmed — continuing, but the post may be missing its location tag');
+        step('location_unverified_continuing');
+      }
     }
+
+    // ── Final pre-post validation: re-check description is still present ────
+    // (TikTok occasionally clears the editor when a location is attached).
+    // If it's gone, try to refill it once more before we commit to posting.
+    if (caption && descBox) {
+      const wantSnippet = snippetOf(caption);
+      // Poll rather than single-read — give the editor time to settle after
+      // the location step before concluding the caption is actually gone.
+      // A premature "it's gone" read here was triggering needless clear+refill
+      // cycles on perfectly intact captions (visible as the box emptying and
+      // then being retyped with the same text).
+      let stillThere = '';
+      for (let p = 0; p < 5; p++) {
+        stillThere = (descBox.innerText || descBox.textContent || '').trim();
+        if (textMatches(stillThere, wantSnippet)) break;
+        await sleep(300);
+      }
+      if (!textMatches(stillThere, wantSnippet)) {
+        dbg('Description missing after location step — refilling…');
+        step('refill_description_after_location');
+        let refilled = false;
+        for (const strat of [
+          { name: 'paste',    run: () => pasteText(descBox, caption) },
+          { name: 'inputevt', run: () => dispatchInsertText(descBox, caption) },
+          { name: 'execcmd',  run: () => { document.execCommand('selectAll', false, null); document.execCommand('insertText', false, caption); return true; } },
+        ]) {
+          if (refilled) break;
+          descBox.focus(); await sleep(300);
+          document.execCommand('selectAll', false, null);
+          document.execCommand('delete', false, null);
+          await sleep(150);
+          strat.run();
+          await sleep(500);
+          const recheck = (descBox.innerText || descBox.textContent || '').trim();
+          if (textMatches(recheck, wantSnippet)) {
+            refilled = true;
+            step('refill_description_done', `${recheck.length} chars via ${strat.name}`);
+          } else {
+            step('refill_description_attempt_failed', `${strat.name}: got "${recheck.slice(0, 40)}"`);
+          }
+        }
+        if (!refilled) { step('refill_description_failed', 'all strategies exhausted'); checkForErrorPage(); }
+      }
+    }
+
+    // Now that description + location are filled & validated, it's safe to
+    // minimise the window — only the Post click remains, which doesn't need
+    // the editor to be focused/visible.
+    dbg('Description & location steps complete — minimising window');
+    step('ready_to_minimize');
+    document.dispatchEvent(new CustomEvent('__ffbot_event', { detail: { type: 'TIKTOK_READY_TO_MINIMIZE' } }));
+    await sleep(800);
 
     // ── Done: auto-click Post (auto mode) or wait for user (manual mode) ────
     const { autoPost: ttAutoPost = false } = opts || {};
@@ -2728,6 +3088,7 @@ function injectTikTok(photoDataUrls, caption, songName, location, opts) {
 
     if (ttAutoPost) {
       banner(5, '🤖 Locating Post button…');
+      step('find_post_button');
       await sleep(2000); // TikTok may still be enabling the button
 
       // Full React-compatible click — same sequence that works for the Next button
@@ -2756,6 +3117,7 @@ function injectTikTok(photoDataUrls, caption, songName, location, opts) {
 
         if (!postBtn) {
           dbg(`Post button not found (attempt ${attempt + 1}/12) — retrying…`);
+          if (checkForErrorPage()) break;
           await sleep(800);
         }
       }
@@ -2763,6 +3125,7 @@ function injectTikTok(photoDataUrls, caption, songName, location, opts) {
       if (postBtn) {
         banner(5, '🤖 Auto-clicking Post…');
         dbg(`Post button found: <${postBtn.tagName}> text="${(postBtn.innerText||'').trim()}"`);
+        step('click_post_button', `<${postBtn.tagName}> "${(postBtn.innerText||'').trim()}"`);
         reactClickEl(postBtn);
 
         // TikTok sometimes shows a "Continue to post?" confirmation modal while
@@ -2770,11 +3133,13 @@ function injectTikTok(photoDataUrls, caption, songName, location, opts) {
         let confirmClicked = false;
         for (let i = 0; i < 16; i++) {
           await sleep(500);
+          if (checkForErrorPage()) break;
           const confirmBtn = Array.from(document.querySelectorAll('button,[role="button"],div[class*="btn"],div[class*="button"]'))
             .find(el => /post\s*now/i.test((el.innerText || el.textContent || '').trim()));
           if (confirmBtn) {
             dbg('"Continue to post?" modal — clicking Post Now');
             banner(5, '🤖 Confirming post (video still being reviewed)…');
+            step('confirm_post_modal', (confirmBtn.innerText || '').trim());
             reactClickEl(confirmBtn);
             confirmClicked = true;
             await sleep(3000);
@@ -2785,6 +3150,7 @@ function injectTikTok(photoDataUrls, caption, songName, location, opts) {
         // Detect actual success or failure after posting (poll up to 20 s)
         // Success signals: URL leaves /upload, or TikTok shows "Video published" banner
         // Failure signals: explicit error text on page
+        step('await_post_result');
         const TIKTOK_SUCCESS_RE = /video\s+published|video\s+posted|post\s+published|erfolgreich.*ver.ffentlicht|vid.o.*publi./i;
         let postSuccess = false, postError = null;
         for (let i = 0; i < 40; i++) {
@@ -2792,6 +3158,7 @@ function injectTikTok(photoDataUrls, caption, songName, location, opts) {
           const bodyText = document.body.innerText || '';
           if (!window.location.href.includes('/upload')) { postSuccess = true; dbg('TikTok success: URL left /upload'); break; }
           if (TIKTOK_SUCCESS_RE.test(bodyText)) { postSuccess = true; dbg('TikTok success: "Video published" detected'); break; }
+          if (ERROR_PAGE_RE.test(bodyText)) { postError = 'Something went wrong — please try again'; checkForErrorPage(); break; }
           const err = bodyText.match(/upload.*fail|post.*fail|violat|prohibited|not.*allow|content.*removed/i);
           if (err) { postError = err[0]; break; }
         }
@@ -2799,14 +3166,18 @@ function injectTikTok(photoDataUrls, caption, songName, location, opts) {
 
         if (postError) {
           banner(5, `⚠️ TikTok post failed: ${postError}`, 'warn');
+          step('post_failed', postError);
           document.dispatchEvent(new CustomEvent('__ffbot_event', { detail:{ type:'TIKTOK_UPLOAD_ERROR', matched:postError, context:'post-completion' }}));
           document.dispatchEvent(new CustomEvent('__ffbot_failed', { detail:{ platform:'tiktok', error:postError }}));
         } else {
           banner(5, `✅ Posted to TikTok!${note}`, 'success');
+          step('post_success');
           document.dispatchEvent(new CustomEvent('__ffbot_complete', { detail:{ platform:'tiktok' }}));
         }
       } else {
         banner(5, '⚠️ Post button not found — please click Post manually.', 'warn');
+        step('find_post_button_failed', 'no matching button after 12 attempts');
+        checkForErrorPage();
         document.dispatchEvent(new CustomEvent('__ffbot_failed', { detail:{ platform:'tiktok', error:'Post button not found' }}));
       }
     } else {

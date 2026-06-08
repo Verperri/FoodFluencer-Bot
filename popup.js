@@ -295,11 +295,16 @@ const TechLog = {
 
   exportCSV() {
     chrome.storage.local.get({ techLog: [] }, ({ techLog }) => {
-      // Comprehensive columns including all new fields added in V1.8
+      // Comprehensive columns including all new fields added in V1.8 / V2.0.
+      // V2.0 adds the TikTok step-tracker fields (step/detail) plus the
+      // upload-error / "Something went wrong" diagnostic fields (matched,
+      // context, lastStep, lastStepDetail, pageSnippet) so the exported CSV
+      // actually shows *which* step the bot was on and what it found.
       const cols = [
         "ts","run_type","run_id","level","source","category","action",
         "duration_ms","name","platform","status","photo_source","photo_count",
-        "source_breakdown","song","artist","language","error","session","id"
+        "source_breakdown","song","artist","language","error","session","id",
+        "step","detail","matched","context","lastStep","lastStepDetail","pageSnippet"
       ];
       const rows = techLog.map(e => cols.map(c => {
         const v = e[c];
