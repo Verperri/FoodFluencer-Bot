@@ -1,0 +1,27 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>FoodFluencer — Diagnostics</title>
+  <link rel="stylesheet" href="popup.css" />
+  <style>
+    /* This page runs as a normal browser tab (not the extension popup), so it
+       survives the platform windows stealing OS focus during the probes — the
+       popup auto-closes on blur, a regular tab does not. */
+    body { width: auto; max-width: 640px; margin: 0 auto; padding: 18px; }
+    h1 { font-size: 1.05rem; margin-bottom: 4px; }
+    .sub { color: var(--muted); font-size: .8rem; margin-bottom: 14px; }
+  </style>
+</head>
+<body>
+  <div class="container">
+    <h1>🧪 Diagnostic Test</h1>
+    <p class="sub">Runs read-only feasibility checks for Instagram &amp; TikTok posting. Nothing is ever posted —
+      this tab can be left open (or closed and reopened) at any time; progress is saved automatically.</p>
+    <button id="runDiagnosticBtn" class="btn btn--primary">🧪 Run Diagnostic Test</button>
+    <div id="diagnosticResults" class="settings-desc hidden" style="margin-top:10px;font-size:.78rem"></div>
+  </div>
+  <script src="diagnostics.js"></script>
+</body>
+</html>
