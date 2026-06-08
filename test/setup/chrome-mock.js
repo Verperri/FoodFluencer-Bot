@@ -7,6 +7,16 @@ function listenerSet() {
   return { addListener: jest.fn(), removeListener: jest.fn(), hasListener: jest.fn() };
 }
 
+// jsdom doesn't implement `document.execCommand` at all, but the Facebook
+// injector calls it (legacy contenteditable insertion fallback) and the
+// tests need to `jest.spyOn(document, 'execCommand')` — spyOn requires the
+// property to already exist on the object. Stub it as a no-op returning
+// `true` (the "command succeeded" signal) so both the injector and the spies
+// work the same way they do in a real browser.
+if (typeof document !== 'undefined' && typeof document.execCommand !== 'function') {
+  document.execCommand = () => true;
+}
+
 global.chrome = {
   runtime: {
     onInstalled: listenerSet(),
