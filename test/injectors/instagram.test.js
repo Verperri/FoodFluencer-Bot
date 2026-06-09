@@ -142,7 +142,11 @@ function buildFixture({ omit = new Set(), restaurantName = '', withLocation = tr
     // Do NOT use clickable() here — that would overwrite role="option" with
     // role="button", breaking the injector's [role="option"] selector.
     opt.tabIndex = 0;
-    opt.addEventListener('click', () => {});
+    // Mark as selected when the injector clicks — persists after the final
+    // banner overwrites the "📍 Location set" step message with "All ready!".
+    opt.addEventListener('click', () => {
+      opt.setAttribute('data-ffbot-location-selected', 'true');
+    });
     dialog.appendChild(opt);
   }
 
@@ -273,7 +277,9 @@ describe('Instagram injector — step 6: add location', () => {
 
     expect(document.querySelector('[aria-label="Add location"]')).not.toBeNull(); // trigger was found & opened
     expect(document.querySelector('[role="option"].location-result')).not.toBeNull();
-    expect(bannerMsg()).toMatch(/location set/i);
+    // bannerMsg() can't be used here — the final "All ready!" step overwrites the
+    // "📍 Location set" banner.  Use the persistent click-signal instead.
+    expect(document.querySelector('[role="option"].location-result[data-ffbot-location-selected]')).not.toBeNull();
   });
 
   test('skips gracefully and logs when no location results are found', async () => {
