@@ -70,13 +70,18 @@
 
       <!-- API key setup (first run only) -->
       <section id="keySetup" class="key-setup hidden">
-        <p>Paste your <strong>Google Places API key</strong> to get started:</p>
+        <p>Paste your <strong>Google Places API key</strong> to unlock business discovery &amp; Google photos:</p>
         <div class="input-row">
           <input id="apiKeyInput" type="password" placeholder="AIza…" autocomplete="off" />
           <button id="saveKeyBtn" class="btn btn--primary">Save</button>
         </div>
-        <p class="hint">Stored locally in your browser only.<br>
-          Get a free key at <strong>console.cloud.google.com → Places API</strong>.</p>
+        <p class="hint">Get a free key at <strong>console.cloud.google.com → Places API</strong>.</p>
+        <p style="margin-top:10px">Optionally paste your <strong>Foursquare API key</strong> for an extra photo source (950 free calls/day):</p>
+        <div class="input-row">
+          <input id="fsqKeyInput" type="password" placeholder="fsq3…" autocomplete="off" />
+          <button id="saveFsqKeyBtn" class="btn btn--primary">Save</button>
+        </div>
+        <p class="hint">Get a free key at <strong>foursquare.com/developers</strong>.</p>
       </section>
 
       <!-- ① Search -->
@@ -541,52 +546,174 @@
     </div>
     <div class="settings-body">
 
-      <!-- API Key -->
+      <!-- ── API Keys ─────────────────────────────────────────────── -->
       <div class="settings-section">
-        <h3 class="settings-section-title">🔑 Google Places API Key</h3>
-        <p class="settings-desc">Enables automatic business discovery and the 4th image source (Google Places photos).</p>
-        <div class="input-row" style="margin-top:8px">
-          <input id="settingsApiKey" type="password" placeholder="AIza…" autocomplete="off" />
-          <button id="settingsSaveKey" class="btn btn--primary btn--sm">Save</button>
+        <div class="st-drawer-hdr collapsed" id="stApiKeysHdr">
+          <span class="st-drawer-title">🔑 API Keys</span>
+          <span class="st-drawer-arrow">▼</span>
         </div>
-        <div id="settingsKeyStatus" class="settings-key-status"></div>
-        <div class="settings-api-how">
-          <p class="settings-how-title">📋 How to get a free key:</p>
-          <ol>
-            <li>Go to <strong>console.cloud.google.com</strong></li>
-            <li>Create a project → Enable <strong>Places API (New)</strong></li>
-            <li>Go to <strong>Credentials</strong> → Create API key</li>
-          </ol>
+        <div class="st-drawer-body collapsed" id="stApiKeysBody">
+
+          <!-- Google Places sub-drawer -->
+          <div class="st-sub-drawer">
+            <div class="st-sub-hdr collapsed" id="stGoogleHdr">
+              <span class="st-sub-title">🔵 Google Places API</span>
+              <span class="st-sub-badge st-sub-badge--none" id="stGoogleBadge">Not set</span>
+              <span class="st-sub-arrow">▼</span>
+            </div>
+            <div class="st-sub-body collapsed" id="stGoogleBody">
+              <p class="settings-desc">Enables automatic business discovery and the Google Places photo source.</p>
+              <div class="input-row" style="margin-top:6px">
+                <input id="settingsApiKey" type="password" placeholder="AIza…" autocomplete="off" />
+                <button id="settingsSaveKey" class="btn btn--primary btn--sm">Save</button>
+              </div>
+              <div id="settingsKeyStatus" class="settings-key-status"></div>
+              <div class="settings-api-how" style="margin-top:8px">
+                <p class="settings-how-title">📋 How to get a free key:</p>
+                <ol>
+                  <li>Go to <strong>console.cloud.google.com</strong></li>
+                  <li>Create a project → Enable <strong>Places API (New)</strong></li>
+                  <li>Go to <strong>Credentials</strong> → Create API key</li>
+                </ol>
+              </div>
+            </div>
+          </div>
+
+          <!-- Foursquare sub-drawer -->
+          <div class="st-sub-drawer">
+            <div class="st-sub-hdr collapsed" id="stFsqHdr">
+              <span class="st-sub-title">🟡 Foursquare API</span>
+              <span class="st-sub-badge st-sub-badge--none" id="stFsqBadge">Not set</span>
+              <span class="st-sub-arrow">▼</span>
+            </div>
+            <div class="st-sub-body collapsed" id="stFsqBody">
+              <p class="settings-desc">Extra photo source — 950 free calls/day. Optional.</p>
+              <div class="input-row" style="margin-top:6px">
+                <input id="settingsFsqKey" type="password" placeholder="fsq3…" autocomplete="off" />
+                <button id="settingsSaveFsqKey" class="btn btn--primary btn--sm">Save</button>
+              </div>
+              <div id="settingsFsqKeyStatus" class="settings-key-status"></div>
+              <div class="settings-api-how" style="margin-top:8px">
+                <p class="settings-how-title">📋 How to get a free key:</p>
+                <ol>
+                  <li>Go to <strong>foursquare.com/developers</strong></li>
+                  <li>Create a project → copy the <strong>API Key</strong></li>
+                </ol>
+              </div>
+            </div>
+          </div>
+
         </div>
       </div>
 
-      <!-- Feature status -->
+      <!-- ── Feature Status ────────────────────────────────────────── -->
       <div class="settings-section">
-        <h3 class="settings-section-title">✅ Feature Status</h3>
-        <div id="settingsFeatures" class="settings-features"></div>
-      </div>
-
-      <!-- Logs & Diagnostics -->
-      <div class="settings-section">
-        <h3 class="settings-section-title">📋 Logs &amp; Diagnostics</h3>
-        <div class="settings-action-row">
-          <button id="settingsExportLogs"    class="btn btn--ghost btn--sm">📄 Export Technical Log</button>
-          <button id="settingsResetActivity" class="btn btn--ghost btn--sm">↺ Reset Activity Log</button>
-          <button id="settingsUsageStats"    class="btn btn--ghost btn--sm">📊 API Usage Stats</button>
+        <div class="st-drawer-hdr collapsed" id="stFeaturesHdr">
+          <span class="st-drawer-title">✅ Feature Status</span>
+          <span class="st-drawer-arrow">▼</span>
+        </div>
+        <div class="st-drawer-body collapsed" id="stFeaturesBody">
+          <div id="settingsFeatures" class="settings-features"></div>
         </div>
       </div>
 
-      <!-- E2E Diagnostics -->
+      <!-- ── Logs & Statistics ─────────────────────────────────────── -->
       <div class="settings-section">
-        <h3 class="settings-section-title">🧪 Diagnostics</h3>
-        <p class="settings-desc">Read-only health check for Instagram &amp; TikTok posting — opens a results tab with an expandable "Test Case #N" checklist per platform. Nothing is ever posted.</p>
-        <div class="settings-action-row">
-          <button id="runDiagnosticBtn" class="btn btn--ghost btn--sm">🧪 Run Diagnostic Test</button>
+        <div class="st-drawer-hdr collapsed" id="stLogsHdr">
+          <span class="st-drawer-title">📋 Logs &amp; Statistics</span>
+          <span class="st-drawer-arrow">▼</span>
+        </div>
+        <div class="st-drawer-body collapsed" id="stLogsBody">
+
+          <!-- Technical Log sub-drawer -->
+          <div class="st-sub-drawer">
+            <div class="st-sub-hdr collapsed" id="stTechLogHdr">
+              <span class="st-sub-title">📄 Technical Log</span>
+              <span class="st-sub-badge st-sub-badge--none" id="stTechLogBadge">—</span>
+              <span class="st-sub-arrow">▼</span>
+            </div>
+            <div class="st-sub-body collapsed" id="stTechLogBody">
+              <div class="stl-filters" id="stTechLogFilters">
+                <div class="stl-filter-group" id="stTechLogLevels">
+                  <button class="stl-filter-btn active" data-level="all">All</button>
+                  <button class="stl-filter-btn stl-info"  data-level="info">Info</button>
+                  <button class="stl-filter-btn stl-warn"  data-level="warn">Warn</button>
+                  <button class="stl-filter-btn stl-error" data-level="error">Error</button>
+                </div>
+                <select class="stl-cat-select" id="stTechLogCat">
+                  <option value="all">All categories</option>
+                  <option value="POST">POST</option>
+                  <option value="PHOTO">PHOTO</option>
+                  <option value="SEARCH">SEARCH</option>
+                  <option value="MEDIA">MEDIA</option>
+                  <option value="LOG">LOG</option>
+                  <option value="SCHEDULE">SCHEDULE</option>
+                  <option value="NAV">NAV</option>
+                </select>
+              </div>
+              <div class="stl-entries" id="stTechLogEntries"></div>
+              <button id="settingsExportLogs" class="btn btn--ghost btn--sm" style="margin-top:8px;width:100%">📄 Export as CSV</button>
+            </div>
+          </div>
+
+          <!-- Activity Summary sub-drawer -->
+          <div class="st-sub-drawer">
+            <div class="st-sub-hdr collapsed" id="stActivityHdr">
+              <span class="st-sub-title">📅 Activity</span>
+              <span class="st-sub-badge st-sub-badge--none" id="stActivityBadge">—</span>
+              <span class="st-sub-arrow">▼</span>
+            </div>
+            <div class="st-sub-body collapsed" id="stActivityBody">
+              <div class="stl-platform-row" id="stActivityPlatforms"></div>
+              <div class="stl-sparkline-wrap">
+                <div class="stl-sparkline" id="stActivitySparkline"></div>
+                <div class="stl-sparkline-labels" id="stActivitySparklineLabels"></div>
+              </div>
+              <button id="settingsResetActivity" class="btn btn--ghost btn--sm" style="margin-top:8px;width:100%">↺ Reset Activity Log</button>
+            </div>
+          </div>
+
+          <!-- API Usage sub-drawer -->
+          <div class="st-sub-drawer">
+            <div class="st-sub-hdr collapsed" id="stApiUsageHdr">
+              <span class="st-sub-title">📊 API Usage</span>
+              <span class="st-sub-badge st-sub-badge--none" id="stApiUsageBadge">—</span>
+              <span class="st-sub-arrow">▼</span>
+            </div>
+            <div class="st-sub-body collapsed" id="stApiUsageBody">
+              <div id="stApiUsageCards"></div>
+            </div>
+          </div>
+
+          <!-- Console deep-links -->
+          <div class="stl-console-links">
+            <button class="btn btn--ghost btn--sm stl-console-btn" id="stGoogleConsoleBtn">
+              🔗 Google Cloud Console
+            </button>
+            <button class="btn btn--ghost btn--sm stl-console-btn" id="stFsqConsoleBtn">
+              🔗 Foursquare Developer Console
+            </button>
+          </div>
+
         </div>
       </div>
 
-      <!-- Version -->
-      <div class="settings-section settings-version-row">
+      <!-- ── Tests ───────────────────────────────────────────────── -->
+      <div class="settings-section">
+        <div class="st-drawer-hdr collapsed" id="stDiagHdr">
+          <span class="st-drawer-title">🧪 Tests</span>
+          <span class="st-drawer-summary" id="stDiagSummary"></span>
+          <span class="st-drawer-arrow">▼</span>
+        </div>
+        <div class="st-drawer-body collapsed" id="stDiagBody">
+          <p class="settings-desc" style="margin-bottom:8px">Read-only feasibility checks for Instagram &amp; TikTok. Nothing is ever posted. The popup may close when a test window opens — results are saved and shown here when you reopen.</p>
+          <button id="runDiagnosticBtn" class="btn btn--ghost btn--sm">🧪 Run Tests</button>
+          <div id="stDiagResults" style="margin-top:10px"></div>
+        </div>
+      </div>
+
+      <!-- ── Version ───────────────────────────────────────────────── -->
+      <div class="settings-section settings-version-row" style="padding:12px 16px">
         <span id="settingsVersion" class="settings-version"></span>
         <button class="btn btn--ghost btn--sm" id="settingsShowOnboarding">👋 Show intro again</button>
       </div>
@@ -627,7 +754,7 @@
     <!-- Step 2: How photos work -->
     <div class="ob-step hidden" id="ob-step-2">
       <h2 class="ob-title">Finding the best photos</h2>
-      <p class="ob-desc">The bot tries 4 image sources in order, stopping as soon as it finds enough quality photos:</p>
+      <p class="ob-desc">The bot tries 6 image sources in order, accumulating quality photos until it has enough:</p>
       <div class="ob-sources">
         <div class="ob-source">
           <span class="ob-source-num free">1</span>
@@ -653,8 +780,24 @@
           </div>
           <span class="ob-badge ob-badge--free">Free</span>
         </div>
+        <div class="ob-source">
+          <span class="ob-source-num free">4</span>
+          <div class="ob-source-info">
+            <strong>TripAdvisor</strong>
+            <span>Scraped from TripAdvisor listing photo pages</span>
+          </div>
+          <span class="ob-badge ob-badge--free">Free</span>
+        </div>
         <div class="ob-source ob-source--api">
-          <span class="ob-source-num api">4</span>
+          <span class="ob-source-num api">5</span>
+          <div class="ob-source-info">
+            <strong>Foursquare API</strong>
+            <span>Venue photos via Foursquare Places (950 free/day)</span>
+          </div>
+          <span class="ob-badge ob-badge--key">API key</span>
+        </div>
+        <div class="ob-source ob-source--api">
+          <span class="ob-source-num api">6</span>
           <div class="ob-source-info">
             <strong>Google Places API</strong>
             <span>Official high-quality business photos</span>
@@ -665,24 +808,42 @@
       <button class="btn btn--primary ob-btn-next" data-to="3">Next →</button>
     </div>
 
-    <!-- Step 3: API Key -->
+    <!-- Step 3: API Keys -->
     <div class="ob-step hidden" id="ob-step-3">
-      <h2 class="ob-title">Google Places API Key</h2>
-      <p class="ob-desc">The API key unlocks <strong>automatic business discovery</strong> and the <strong>4th image source</strong>. You can skip and add it later in Settings.</p>
-      <div class="ob-api-how">
-        <p><strong>📋 How to get a free key:</strong></p>
+      <h2 class="ob-title">API Keys <em style="font-size:.7em;font-weight:400">(optional)</em></h2>
+      <p class="ob-desc">Add API keys to unlock extra photo sources and automatic business discovery. You can skip and add them later in Settings.</p>
+
+      <div class="ob-api-how" style="margin-bottom:10px">
+        <p><strong>🔵 Google Places</strong> — business discovery + photo source #6</p>
         <ol>
           <li>Go to <strong>console.cloud.google.com</strong></li>
           <li>Create a project → Enable <strong>Places API (New)</strong></li>
           <li>Go to <strong>Credentials</strong> → Create an API key</li>
         </ol>
       </div>
-      <div class="input-row" style="margin:12px 0 4px">
+      <div class="input-row" style="margin:6px 0 4px">
         <input id="obApiKeyInput" type="password" placeholder="AIza…" autocomplete="off" />
         <button id="obSaveKey" class="btn btn--primary">Save</button>
       </div>
       <div id="obKeyStatus" class="ob-key-status"></div>
-      <button class="btn btn--ghost ob-btn-skip" id="obSkipKey">Skip for now →</button>
+
+      <div class="ob-api-how" style="margin-top:14px;margin-bottom:10px">
+        <p><strong>🟡 Foursquare</strong> — photo source #5, 950 free calls/day</p>
+        <ol>
+          <li>Go to <strong>foursquare.com/developers</strong></li>
+          <li>Create a project → copy the <strong>API Key</strong></li>
+        </ol>
+      </div>
+      <div class="input-row" style="margin:6px 0 4px">
+        <input id="obFsqKeyInput" type="password" placeholder="fsq3…" autocomplete="off" />
+        <button id="obSaveFsqKey" class="btn btn--primary">Save</button>
+      </div>
+      <div id="obFsqKeyStatus" class="ob-key-status"></div>
+
+      <div style="display:flex;gap:8px;margin-top:14px">
+        <button class="btn btn--primary ob-btn-next" data-to="4" id="obKeyContinue">Continue →</button>
+        <button class="btn btn--ghost ob-btn-skip" id="obSkipKey">Skip for now →</button>
+      </div>
     </div>
 
     <!-- Step 4: Complete -->

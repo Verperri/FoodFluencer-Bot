@@ -585,6 +585,122 @@ async function scrapeYelpPhotos(businessName, city) {
   }
 }
 
+// Searches TripAdvisor for the business and scrapes the photo page.
+// Follows same pattern as scrapeYelpPhotos — polite delays, graceful fallback.
+async function scrapeTripAdvisorPhotos(businessName, city) {
+  bgLog('info', 'PhotoScrape[TripAdvisor] start', { businessName, city });
+  try {
+    const searchRes = await fetch(
+      `https://www.tripadvisor.com/Search?q=${encodeURIComponent(businessName + ' ' + city)}&searchSessionId=&sid=&blockRedirect=true`,
+      { headers: { 'User-Agent': SCRAPE_UA, 'Accept-Language': 'en-US,en;q=0.9' } }
+    );
+    if (!searchRes.ok) throw new Error(`search HTTP ${searchRes.status}`);
+    const searchHtml = await searchRes.text();
+
+    if (/are you a human|captcha|blocked/i.test(searchHtml)) {
+      bgLog('warn', 'PhotoScrape[TripAdvisor] bot-detection block');
+      TechLog.warn('PHOTO', 'tripadvisor_blocked', { reason: 'bot-detection' });
+      return [];
+    }
+
+    // Match Restaurant_Review or Hotel_Review or Attraction_Review slugs
+    const slugM = searchHtml.match(/href="(\/(?:Restaurant|Hotel|Attraction)_Review-[^"]+)"/);
+    if (!slugM) { bgLog('warn', 'PhotoScrape[TripAdvisor] no review slug found'); return []; }
+    const slug = slugM[1].split('?')[0]; // strip query params
+    bgLog('info', `PhotoScrape[TripAdvisor] slug: ${slug}`);
+
+    await new Promise(r => setTimeout(r, 800)); // polite crawl delay
+
+    // Fetch the /Photos sub-page for this listing
+    const photoPageUrl = `https://www.tripadvisor.com${slug.replace(/-Reviews-/, '-Photos-')}`;
+    const photoRes = await fetch(photoPageUrl, {
+      headers: { 'User-Agent': SCRAPE_UA, 'Referer': 'https://www.tripadvisor.com/' },
+    });
+    if (!photoRes.ok) throw new Error(`photos HTTP ${photoRes.status}`);
+    const photoHtml = await photoRes.text();
+
+    if (/are you a human|captcha/i.test(photoHtml)) {
+      bgLog('warn', 'PhotoScrape[TripAdvisor] bot-detection on photos page');
+      return [];
+    }
+
+    const allPhotos = new Set();
+    // data-src on <img> tags (lazy-loaded CDN images)
+    for (const m of photoHtml.matchAll(/data-src="(https:\/\/(?:dynamic-media|media)[-a-z0-9.]*\.tripadvisor\.com\/[^"]+\.(?:jpg|jpeg|png))"/gi))
+      allPhotos.add(m[1].replace(/\/\d+x\d+(\/|$)/, '/0x0$1')); // request max resolution
+    // Also capture standard src URLs from TripAdvisor CDN
+    for (const m of photoHtml.matchAll(/src="(https:\/\/(?:dynamic-media|media)[-a-z0-9.]*\.tripadvisor\.com\/[^"]+\.(?:jpg|jpeg|png))"/gi))
+      allPhotos.add(m[1]);
+
+    const result = [...allPhotos].slice(0, 12);
+    bgLog('info', `PhotoScrape[TripAdvisor] found ${result.length} photos for "${slug}"`);
+    TechLog.info('PHOTO', 'tripadvisor_scrape', { slug, count: result.length });
+    return result;
+  } catch(e) {
+    bgLog('warn', `PhotoScrape[TripAdvisor] failed: ${e.message}`);
+    TechLog.warn('PHOTO', 'tripadvisor_scrape_error', { error: e.message });
+    return [];
+  }
+}
+
+const FOURSQUARE_QUOTA_KEY = 'foursquareQuota';
+const FOURSQUARE_DAILY_LIMIT = 950;
+
+// Returns Foursquare venue photo URLs for the business.
+// Tracks daily call count in chrome.storage.local; skips if limit reached.
+async function fetchFoursquarePhotos(businessName, city, apiKey) {
+  if (!apiKey) return [];
+
+  // Check / reset daily quota
+  const today = new Date().toISOString().slice(0, 10); // YYYY-MM-DD
+  const stored = await chrome.storage.local.get({ [FOURSQUARE_QUOTA_KEY]: { count: 0, date: '' } });
+  let quota = stored[FOURSQUARE_QUOTA_KEY];
+  if (quota.date !== today) quota = { count: 0, date: today };
+  if (quota.count >= FOURSQUARE_DAILY_LIMIT) {
+    bgLog('warn', `PhotoScrape[Foursquare] daily limit reached (${quota.count}/${FOURSQUARE_DAILY_LIMIT})`);
+    TechLog.warn('PHOTO', 'foursquare_quota_exceeded', { count: quota.count, limit: FOURSQUARE_DAILY_LIMIT });
+    return [];
+  }
+
+  bgLog('info', 'PhotoScrape[Foursquare] start', { businessName, city, quota: quota.count });
+  try {
+    // Search for the venue
+    const searchUrl = `https://api.foursquare.com/v3/places/search?query=${encodeURIComponent(businessName)}&near=${encodeURIComponent(city)}&limit=1`;
+    const searchRes = await fetch(searchUrl, {
+      headers: { Authorization: apiKey, Accept: 'application/json' },
+    });
+    quota.count++;
+    await chrome.storage.local.set({ [FOURSQUARE_QUOTA_KEY]: quota });
+
+    if (!searchRes.ok) throw new Error(`search HTTP ${searchRes.status}`);
+    const searchData = await searchRes.json();
+    const venue = searchData.results?.[0];
+    if (!venue) { bgLog('warn', 'PhotoScrape[Foursquare] no venue found'); return []; }
+    const fsqId = venue.fsq_id;
+    bgLog('info', `PhotoScrape[Foursquare] venue: ${venue.name} (${fsqId})`);
+
+    // Fetch photos for the venue
+    const photosUrl = `https://api.foursquare.com/v3/places/${fsqId}/photos?limit=10&sort=POPULAR`;
+    const photosRes = await fetch(photosUrl, {
+      headers: { Authorization: apiKey, Accept: 'application/json' },
+    });
+    quota.count++;
+    await chrome.storage.local.set({ [FOURSQUARE_QUOTA_KEY]: quota });
+
+    if (!photosRes.ok) throw new Error(`photos HTTP ${photosRes.status}`);
+    const photosData = await photosRes.json();
+
+    const urls = (photosData || []).map(p => `${p.prefix}original${p.suffix}`);
+    bgLog('info', `PhotoScrape[Foursquare] found ${urls.length} photos (quota: ${quota.count}/${FOURSQUARE_DAILY_LIMIT})`);
+    TechLog.info('PHOTO', 'foursquare_photos', { fsqId, count: urls.length, quota: quota.count });
+    return urls;
+  } catch(e) {
+    bgLog('warn', `PhotoScrape[Foursquare] failed: ${e.message}`);
+    TechLog.warn('PHOTO', 'foursquare_error', { error: e.message });
+    return [];
+  }
+}
+
 // ── Waterfall orchestrator ────────────────────────────────────────────────────
 // Sources are tried in priority order. Rather than returning as soon as one
 // source meets the minimum threshold, the waterfall now *accumulates* quality-
@@ -600,7 +716,7 @@ async function scrapeYelpPhotos(businessName, city) {
 // The `source` field in the return value reflects the first (primary) source
 // that contributed photos. When multiple sources are needed, `photoLog` records
 // the origin of every individual photo for full TechLog traceability.
-async function fetchPhotosWaterfall(businessName, address, entityType, minPics, apiKey, placePhotoObjects) {
+async function fetchPhotosWaterfall(businessName, address, entityType, minPics, apiKey, placePhotoObjects, foursquareApiKey = null) {
   const cityM = address.match(CITY_FROM_ADDRESS_RE_BG);
   const city  = (cityM?.[1] || address.split(',')[0] || '').trim();
   const target = Math.min(Math.max(minPics, SCRAPE_MIN), 5);
@@ -685,6 +801,20 @@ async function fetchPhotosWaterfall(businessName, address, entityType, minPics, 
     bgLog('info', `PhotoWaterfall: need ${target - collected.length} more — trying Yelp`);
     const yelpUrls = await raceTimeout(scrapeYelpPhotos(businessName, city), 18000);
     if (yelpUrls.length > 0) await collectFromUrls(yelpUrls, 'yelp');
+  }
+
+  // ── 3.5 TripAdvisor — only if still short of target ──────────────────────
+  if (collected.length < target) {
+    bgLog('info', `PhotoWaterfall: need ${target - collected.length} more — trying TripAdvisor`);
+    const taUrls = await raceTimeout(scrapeTripAdvisorPhotos(businessName, city), 20000);
+    if (taUrls.length > 0) await collectFromUrls(taUrls, 'tripadvisor');
+  }
+
+  // ── 3.8 Foursquare API — quota-tracked, only if key configured ───────────
+  if (collected.length < target && foursquareApiKey) {
+    bgLog('info', `PhotoWaterfall: need ${target - collected.length} more — trying Foursquare`);
+    const fsqUrls = await raceTimeout(fetchFoursquarePhotos(businessName, city, foursquareApiKey), 15000);
+    if (fsqUrls.length > 0) await collectFromUrls(fsqUrls, 'foursquare');
   }
 
   // ── 4. Google Places API — last resort, quota-consuming ───────────────────
@@ -775,21 +905,277 @@ async function getAutoSongBG(genre, country) {
   return song;
 }
 
-function getAutoCaptionBG(name, address, type, language, captionOpts, songInfo) {
-  const LANG = {
-    en: { opener:(name,t,city,seed) => [`Have you visited ${name} yet? 💬`,`Best ${t} in ${city}? ${name} is worth a visit! 🔥`,`What do you think of ${name}? 👇`,`Discover ${city}'s hidden gem: ${name} ✨`,`Don't miss ${name} in ${city}! 📍`,`Have you tried ${name}? 😍`][seed%6] },
-    nl: { opener:(name,t,city,seed) => [`Ben je al bij ${name}? Laat het weten! 💬`,`Beste ${t} in ${city}? ${name} is een bezoek waard! 🔥`,`Wat vind je van ${name}? 👇`,`Ontdek de parel van ${city}: ${name} ✨`,`Mis ${name} niet als je in ${city} bent! 📍`,`Heb je ${name} al geprobeerd? 😍`][seed%6] },
-    fr: { opener:(name,t,city,seed) => [`Avez-vous visité ${name}? 💬`,`Meilleur ${t} à ${city}? ${name} vaut le détour! 🔥`,`Que pensez-vous de ${name}? 👇`,`Découvrez ${city}: ${name} ✨`,`Ne manquez pas ${name} à ${city}! 📍`,`Avez-vous essayé ${name}? 😍`][seed%6] },
-    de: { opener:(name,t,city,seed) => [`Habt ihr ${name} besucht? 💬`,`Bestes ${t} in ${city}? ${name} ist jeden Besuch wert! 🔥`,`Was denkt ihr über ${name}? 👇`,`Entdeckt das Juwel von ${city}: ${name} ✨`,`Verpasst ${name} in ${city} nicht! 📍`,`Habt ihr ${name} probiert? 😍`][seed%6] },
-  };
+function getAutoCaptionBG(name, address, type, language, captionOpts, songInfo, entityMeta = {}) {
+  // entityMeta: { createdYear, lastVisitYear, province }
   const cityM  = address.match(CITY_FROM_ADDRESS_RE_BG);
   const city   = (cityM?.[1] || address.split(",")[0] || "").trim();
   const seed   = name.split("").reduce((a,c) => a+c.charCodeAt(0), 0);
   const tLabel = { restaurant:"restaurant", hotel:"hotel", bar:"bar" }[type] || type;
+  const province = entityMeta.province || "";
+  const area = province || city;
+
+  const currentYear = new Date().getFullYear();
+  const entityAge   = entityMeta.createdYear ? currentYear - entityMeta.createdYear : null;
+  const lastVisit   = entityMeta.lastVisitYear || null;
+  const recencyYrs  = lastVisit ? currentYear - lastVisit : null;
+
+  // Build large template pool indexed per language
+  const TEMPLATES = {
+    en: [
+      // Generic discovery & engagement
+      `Have you visited ${name} yet? 💬`,
+      `Best ${tLabel} in ${city}? ${name} is worth a visit! 🔥`,
+      `What do you think of ${name}? 👇`,
+      `Discover ${city}'s hidden gem: ${name} ✨`,
+      `Don't miss ${name} in ${city}! 📍`,
+      `Have you tried ${name}? 😍`,
+      `${name} — one of ${city}'s finest! 🌟`,
+      `Looking for a great ${tLabel} in ${city}? Say hello to ${name}! 👋`,
+      `${city} has so much to offer — and ${name} is at the top of the list! 🗺️`,
+      `Drop everything and go visit ${name} in ${city}! 📸`,
+      `Ever wondered where the locals go in ${city}? ${name} is the answer! 🤫`,
+      `${name} is giving us all the right vibes in ${city}! ✨`,
+      `Tag someone who would love ${name}! 🏷️`,
+      `This one deserves a spot on your bucket list: ${name} in ${city} 🙌`,
+      `Sharing one of ${city}'s best-kept secrets — ${name} 🤩`,
+      // Type-specific: restaurant
+      ...(type === 'restaurant' ? [
+        `The kitchen at ${name} is doing something special 🍽️`,
+        `Incredible cuisine at ${name} in ${city} — a must-try! 🥂`,
+        `${name}'s menu is a love letter to flavour 🌶️`,
+        `From the first dish to the last bite — ${name} delivers! 🍴`,
+        `${city}'s dining scene wouldn't be the same without ${name} 🍷`,
+        `If you love great cuisine, ${name} in ${city} is calling your name 📞`,
+        `The chef at ${name} is truly bringing something unique to ${city} 👨‍🍳`,
+        `Comfort food elevated — that's ${name} for you! 🫶`,
+        `Fine dining or casual feast? ${name} in ${city} nails both! 🎯`,
+        `${name} proves that the best meals are the ones shared with good company 🥗`,
+      ] : []),
+      // Type-specific: hotel
+      ...(type === 'hotel' ? [
+        `Luxury hospitality at its finest — welcome to ${name} 🏨`,
+        `${name} in ${city}: where every stay feels like home 🛎️`,
+        `A brand that knows how to take care of its guests: ${name} ⭐`,
+        `Looking for your next city stay? ${name} in ${city} is the one 🌆`,
+        `The ${name} chain continues to impress in ${city} 🏅`,
+        `Great service, stunning rooms — ${name} in ${city} exceeds expectations 🌟`,
+        `Your perfect base for exploring ${city}: ${name} 🗺️`,
+        `${name} — where comfort meets class in ${city} 🎩`,
+        `Whether business or leisure, ${name} in ${city} gets it right every time ✔️`,
+        `The ${name} property in ${city} is a genuine hidden gem 💎`,
+      ] : []),
+      // Type-specific: bar
+      ...(type === 'bar' ? [
+        `The tap selection at ${name} is something else entirely 🍺`,
+        `Craft brews, great vibes — ${name} in ${city} is the spot 🎶`,
+        `${name}'s drinks menu is a work of art 🍹`,
+        `Looking for the best bar atmosphere in ${city}? ${name} has it 🎉`,
+        `From IPAs to stouts — ${name} in ${city} covers all your bases 🍻`,
+        `The cocktail game at ${name} is seriously underrated 🍸`,
+        `${name} is the bar that ${city} deserves 🏆`,
+        `Beer lovers — you need to visit ${name} in ${city} immediately! 🚨`,
+        `Great beers, great company, great times — that's ${name} for you! 🥂`,
+        `The vibe at ${name} in ${city} is absolutely unmatched 🌃`,
+      ] : []),
+      // Location-aware
+      ...(area ? [
+        `Best ${tLabel} of ${area}? We'd put our money on ${name}! 🏅`,
+        `Repping ${area} with pride: ${name} 💪`,
+        `${area}'s food scene just hit different with ${name} around 🔥`,
+        `If you're ever in ${area}, ${name} needs to be on your itinerary! 📋`,
+      ] : []),
+      // Age-aware
+      ...(entityAge !== null && entityAge >= 2 ? [
+        `Celebrating ${entityAge} years of excellence — that's ${name} for you! 🎂`,
+        `${entityAge} years in ${city} and ${name} is still going strong! 💪`,
+        `Since ${entityMeta.createdYear}, ${name} has been a cornerstone of ${city} 🏛️`,
+      ] : []),
+      // Recency-aware
+      ...(recencyYrs !== null && recencyYrs === 0 ? [
+        `Just visited ${name} in ${city} — absolutely worth it! ⭐`,
+        `Fresh from ${name} in ${city} — what a great spot! 📸`,
+      ] : recencyYrs !== null && recencyYrs === 1 ? [
+        `Back at ${name} in ${city} — still as great as ever! 🔄`,
+        `Revisiting ${name} in ${city} — some places just never disappoint 💯`,
+      ] : []),
+    ],
+    nl: [
+      `Ben je al bij ${name}? Laat het weten! 💬`,
+      `Beste ${tLabel} in ${city}? ${name} is een bezoek waard! 🔥`,
+      `Wat vind je van ${name}? 👇`,
+      `Ontdek de parel van ${city}: ${name} ✨`,
+      `Mis ${name} niet als je in ${city} bent! 📍`,
+      `Heb je ${name} al geprobeerd? 😍`,
+      `${name} — een van de beste in ${city}! 🌟`,
+      `Op zoek naar een goede ${tLabel} in ${city}? Dan moet je bij ${name} zijn! 👋`,
+      `${city} heeft zoveel te bieden — en ${name} staat bovenaan de lijst! 🗺️`,
+      `Tag iemand die ${name} zou waarderen! 🏷️`,
+      `Dit verdient een plekje op je bucketlist: ${name} in ${city} 🙌`,
+      `Een van de best bewaarde geheimen van ${city} — ${name} 🤩`,
+      // Type-specific: restaurant
+      ...(type === 'restaurant' ? [
+        `De keuken van ${name} doet iets speciaals 🍽️`,
+        `Ongelooflijke keuken bij ${name} in ${city} — een aanrader! 🥂`,
+        `Het menu van ${name} is een ode aan smaak 🌶️`,
+        `Van het eerste gerecht tot de laatste hap — ${name} maakt het waar! 🍴`,
+        `${city}'s restaurantscene zou niet hetzelfde zijn zonder ${name} 🍷`,
+        `De chef van ${name} brengt iets unieks naar ${city} 👨‍🍳`,
+        `Lekker eten én een fijn sfeertje — ${name} in ${city} heeft het allebei! 🎯`,
+      ] : []),
+      // Type-specific: hotel
+      ...(type === 'hotel' ? [
+        `Luxe gastvrijheid op zijn best — welkom bij ${name} 🏨`,
+        `${name} in ${city}: waar elk verblijf als thuis voelt 🛎️`,
+        `Op zoek naar je volgende stadsverblijf? ${name} in ${city} is de keuze 🌆`,
+        `Top service, prachtige kamers — ${name} in ${city} overtreft alle verwachtingen 🌟`,
+        `Jouw perfecte uitvalsbasis om ${city} te verkennen: ${name} 🗺️`,
+      ] : []),
+      // Type-specific: bar
+      ...(type === 'bar' ? [
+        `De bierselectie bij ${name} is iets heel bijzonders 🍺`,
+        `Craft bieren, geweldige sfeer — ${name} in ${city} is dé plek 🎶`,
+        `Het drankenmenu van ${name} is een kunstwerk 🍹`,
+        `Op zoek naar de beste baratmosfeer in ${city}? ${name} heeft het! 🎉`,
+        `Bierliefhebbers — ga direct naar ${name} in ${city}! 🚨`,
+        `De cocktails bij ${name} zijn serieus ondergewaardeerd 🍸`,
+        `${name} is de bar die ${city} verdient 🏆`,
+      ] : []),
+      // Location-aware
+      ...(area ? [
+        `Beste ${tLabel} van ${area}? Onze stem gaat naar ${name}! 🏅`,
+        `Trots op ${area}: ${name} 💪`,
+        `Als je ooit in ${area} bent, moet ${name} op je lijstje staan! 📋`,
+      ] : []),
+      // Age-aware
+      ...(entityAge !== null && entityAge >= 2 ? [
+        `Al ${entityAge} jaar lang uitstekend — dat is ${name} voor je! 🎂`,
+        `${entityAge} jaar in ${city} en ${name} gaat nog steeds sterk! 💪`,
+        `Sinds ${entityMeta.createdYear} is ${name} een begrip in ${city} 🏛️`,
+      ] : []),
+      // Recency-aware
+      ...(recencyYrs !== null && recencyYrs === 0 ? [
+        `Net bij ${name} in ${city} geweest — zeker de moeite waard! ⭐`,
+        `Verse beelden van ${name} in ${city} — wat een geweldige plek! 📸`,
+      ] : recencyYrs !== null && recencyYrs === 1 ? [
+        `Terug bij ${name} in ${city} — nog steeds even goed! 🔄`,
+        `${name} in ${city} teleurstelt nooit 💯`,
+      ] : []),
+    ],
+    fr: [
+      `Avez-vous visité ${name}? 💬`,
+      `Meilleur ${tLabel} à ${city}? ${name} vaut le détour! 🔥`,
+      `Que pensez-vous de ${name}? 👇`,
+      `Découvrez ${city}: ${name} ✨`,
+      `Ne manquez pas ${name} à ${city}! 📍`,
+      `Avez-vous essayé ${name}? 😍`,
+      `${name} — l'une des meilleures adresses de ${city}! 🌟`,
+      `À la recherche d'un bon ${tLabel} à ${city}? Direction ${name}! 👋`,
+      `Taguez quelqu'un qui adorerait ${name}! 🏷️`,
+      `Un incontournable à ${city}: ${name} 🙌`,
+      `L'un des secrets les mieux gardés de ${city} — ${name} 🤩`,
+      // Type-specific: restaurant
+      ...(type === 'restaurant' ? [
+        `La cuisine de ${name} est tout simplement remarquable 🍽️`,
+        `Une carte qui est une véritable ode aux saveurs chez ${name} 🌶️`,
+        `${city} ne serait pas pareille sans ${name} dans son paysage gastronomique 🍷`,
+        `Le chef de ${name} apporte quelque chose d'unique à ${city} 👨‍🍳`,
+        `De l'entrée au dessert — ${name} ne déçoit jamais! 🍴`,
+      ] : []),
+      // Type-specific: hotel
+      ...(type === 'hotel' ? [
+        `Hospitalité de luxe par excellence — bienvenue chez ${name} 🏨`,
+        `${name} à ${city}: chaque séjour ressemble à la maison 🛎️`,
+        `Votre base idéale pour explorer ${city}: ${name} 🗺️`,
+        `Service impeccable, chambres superbes — ${name} à ${city} dépasse les attentes 🌟`,
+      ] : []),
+      // Type-specific: bar
+      ...(type === 'bar' ? [
+        `La sélection de bières chez ${name} est vraiment exceptionnelle 🍺`,
+        `Bières artisanales, ambiance au top — ${name} à ${city} c'est LA place 🎶`,
+        `La carte des boissons de ${name} est une œuvre d'art 🍹`,
+        `Les amateurs de bière doivent absolument visiter ${name} à ${city}! 🚨`,
+        `Les cocktails chez ${name} sont sérieusement sous-estimés 🍸`,
+      ] : []),
+      // Location-aware
+      ...(area ? [
+        `Meilleur ${tLabel} de ${area}? Notre vote va à ${name}! 🏅`,
+        `La fierté de ${area}: ${name} 💪`,
+        `Si vous êtes un jour à ${area}, ${name} doit figurer sur votre liste! 📋`,
+      ] : []),
+      // Age-aware
+      ...(entityAge !== null && entityAge >= 2 ? [
+        `${entityAge} ans d'excellence — c'est ${name} pour vous! 🎂`,
+        `Depuis ${entityMeta.createdYear}, ${name} est un pilier de ${city} 🏛️`,
+      ] : []),
+      // Recency-aware
+      ...(recencyYrs !== null && recencyYrs === 0 ? [
+        `Je viens de visiter ${name} à ${city} — vraiment au top! ⭐`,
+      ] : recencyYrs !== null && recencyYrs === 1 ? [
+        `De retour chez ${name} à ${city} — toujours aussi bien! 🔄`,
+      ] : []),
+    ],
+    de: [
+      `Habt ihr ${name} besucht? 💬`,
+      `Bestes ${tLabel} in ${city}? ${name} ist jeden Besuch wert! 🔥`,
+      `Was denkt ihr über ${name}? 👇`,
+      `Entdeckt das Juwel von ${city}: ${name} ✨`,
+      `Verpasst ${name} in ${city} nicht! 📍`,
+      `Habt ihr ${name} probiert? 😍`,
+      `${name} — eine der besten Adressen in ${city}! 🌟`,
+      `Auf der Suche nach einem guten ${tLabel} in ${city}? ${name} ist die Antwort! 👋`,
+      `Markiert jemanden, der ${name} lieben würde! 🏷️`,
+      `Ein Muss für euren ${city}-Besuch: ${name} 🙌`,
+      `Eines von ${city}'s bestgehüteten Geheimnissen — ${name} 🤩`,
+      // Type-specific: restaurant
+      ...(type === 'restaurant' ? [
+        `Die Küche von ${name} ist wirklich außergewöhnlich 🍽️`,
+        `Unglaubliche Küche bei ${name} in ${city} — unbedingt probieren! 🥂`,
+        `Die Speisekarte von ${name} ist eine Hymne an den Geschmack 🌶️`,
+        `${city}'s Gastronomie wäre ohne ${name} nicht dieselbe 🍷`,
+        `Der Koch bei ${name} bringt etwas Einzigartiges nach ${city} 👨‍🍳`,
+        `Von Vorspeise bis Dessert — ${name} enttäuscht nie! 🍴`,
+      ] : []),
+      // Type-specific: hotel
+      ...(type === 'hotel' ? [
+        `Luxuriöse Gastfreundschaft at its finest — willkommen bei ${name} 🏨`,
+        `${name} in ${city}: wo jeder Aufenthalt wie zuhause fühlt 🛎️`,
+        `Eure perfekte Basis zum Entdecken von ${city}: ${name} 🗺️`,
+        `Top Service, traumhafte Zimmer — ${name} in ${city} übertrifft alle Erwartungen 🌟`,
+      ] : []),
+      // Type-specific: bar
+      ...(type === 'bar' ? [
+        `Die Bierauswahl bei ${name} ist einfach unglaublich 🍺`,
+        `Craft Biere, tolle Atmosphäre — ${name} in ${city} ist der Ort schlechthin 🎶`,
+        `Die Getränkekarte von ${name} ist ein Kunstwerk 🍹`,
+        `Bierliebhaber müssen ${name} in ${city} unbedingt besuchen! 🚨`,
+        `Die Cocktails bei ${name} sind ernsthaft unterschätzt 🍸`,
+      ] : []),
+      // Location-aware
+      ...(area ? [
+        `Bestes ${tLabel} von ${area}? Unsere Stimme geht an ${name}! 🏅`,
+        `Stolz auf ${area}: ${name} 💪`,
+        `Wenn ihr jemals in ${area} seid, muss ${name} auf eurer Liste stehen! 📋`,
+      ] : []),
+      // Age-aware
+      ...(entityAge !== null && entityAge >= 2 ? [
+        `${entityAge} Jahre Exzellenz — das ist ${name} für euch! 🎂`,
+        `Seit ${entityMeta.createdYear} ist ${name} ein Wahrzeichen in ${city} 🏛️`,
+      ] : []),
+      // Recency-aware
+      ...(recencyYrs !== null && recencyYrs === 0 ? [
+        `Gerade bei ${name} in ${city} gewesen — absolut empfehlenswert! ⭐`,
+      ] : recencyYrs !== null && recencyYrs === 1 ? [
+        `Zurück bei ${name} in ${city} — immer noch genauso gut! 🔄`,
+      ] : []),
+    ],
+  };
+
+  const pool = TEMPLATES[language] || TEMPLATES.en;
+  const opener = pool[seed % pool.length];
+
   const cityTag = city.replace(/\s+/g,"");
-  const lang   = LANG[language] || LANG.en;
   const parts  = [];
-  if (captionOpts.catchy)  { parts.push(lang.opener(name,tLabel,city,seed)); parts.push(""); }
+  if (captionOpts.catchy)  { parts.push(opener); parts.push(""); }
   if (captionOpts.name && name)       parts.push(`📍 ${name}`);
   if (captionOpts.address && address) parts.push(`📌 ${address}`);
   if ((captionOpts.name||captionOpts.address) && (captionOpts.song||captionOpts.hashtags)) parts.push("");
@@ -852,6 +1238,7 @@ async function autoPostNow(postIndex) {
   // API key is optional — used only as a last-resort photo source in the
   // waterfall. Discovery and the first three photo sources work without one.
   const apiKey = await getApiKey();
+  const { foursquareApiKey = null } = await chrome.storage.local.get({ foursquareApiKey: null });
 
   await updateRunLogStatus(postIndex, "triggered");
 
@@ -879,7 +1266,7 @@ async function autoPostNow(postIndex) {
     const allPhotos = (place.photos||[]).sort((a,b)=>(b.width||0)-(a.width||0));
     const minPics   = Math.max(parseInt(config.minPics||"3",10), 3);
 
-    const photoResult = await fetchPhotosWaterfall(name, address, config.type||"restaurant", minPics, apiKey, allPhotos);
+    const photoResult = await fetchPhotosWaterfall(name, address, config.type||"restaurant", minPics, apiKey, allPhotos, foursquareApiKey);
     const photoDataUrls = photoResult.dataUrls;
 
     if (photoDataUrls.length === 0) {
@@ -1839,8 +2226,9 @@ const INJECTORS = {
   tiktok:    injectTikTok,
 };
 
-async function handleSocialPost({ platform, photoDataUrls, caption, songName, location, restaurantName, tiktokAudioDataUrl, autoPost = false }) {
-  bgLog('info', `Opening ${platform} (silent/minimised)`, { photos: photoDataUrls.length, song: songName, location, autoPost });
+async function handleSocialPost(opts, _attempt = 1) {
+  const { platform, photoDataUrls, caption, songName, location, restaurantName, tiktokAudioDataUrl, autoPost = false } = opts;
+  bgLog('info', `Opening ${platform} (silent/minimised) [attempt ${_attempt}/2]`, { photos: photoDataUrls.length, song: songName, location, autoPost });
 
   // ── Silent window: create unfocused, immediately minimise ────────────────────
   const win = await chrome.windows.create({
@@ -1969,13 +2357,34 @@ async function handleSocialPost({ platform, photoDataUrls, caption, songName, lo
       });
       // Close the whole window (not just the tab) so no minimised window lingers
       setTimeout(() => chrome.windows.remove(winId).catch(() => {}), 3000);
+
+      // Auto-retry once on failure (autoPost only)
+      if (result.failed && _attempt < 2) {
+        bgLog('warn', `${platform} post failed — retrying after 12s (attempt ${_attempt}/2)`, result.error);
+        TechLog.warn('POST', 'injection_retry', { platform, attempt: _attempt, error: result.error });
+        TechLog._flush();
+        await new Promise(r => setTimeout(r, 12000));
+        return handleSocialPost(opts, _attempt + 1);
+      }
+
       return result;
     }
 
   } catch (err) {
     bgLog('error', `Inject failed on ${platform}`, String(err));
     if (autoPost) chrome.windows.remove(winId).catch(() => {});
-    return { failed: true, error: String(err) };
+    const errResult = { failed: true, error: String(err) };
+
+    // Auto-retry once on inject-level error (autoPost only)
+    if (autoPost && _attempt < 2) {
+      bgLog('warn', `${platform} inject error — retrying after 12s (attempt ${_attempt}/2)`, String(err));
+      TechLog.warn('POST', 'injection_retry', { platform, attempt: _attempt, error: String(err) });
+      TechLog._flush();
+      await new Promise(r => setTimeout(r, 12000));
+      return handleSocialPost(opts, _attempt + 1);
+    }
+
+    return errResult;
   }
   return { failed: false };
 }
