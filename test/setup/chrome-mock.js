@@ -17,6 +17,17 @@ function listenerSet() {
   return { addListener: jest.fn(), removeListener: jest.fn(), hasListener: jest.fn() };
 }
 
+// jsdom doesn't implement scrollIntoView / scrollTo / scrollBy — background.js
+// calls captionEl.scrollIntoView(...) before filling the caption field.
+// Stub them as no-ops so the injectors can proceed without throwing.
+if (typeof Element !== 'undefined' && !Element.prototype.scrollIntoView) {
+  Element.prototype.scrollIntoView = function () {};
+}
+if (typeof window !== 'undefined') {
+  if (!window.scrollTo) window.scrollTo = () => {};
+  if (!window.scrollBy) window.scrollBy = () => {};
+}
+
 // jsdom doesn't implement `document.execCommand` at all, but the Facebook
 // injector calls it (legacy contenteditable insertion fallback) and the
 // tests need to `jest.spyOn(document, 'execCommand')` — spyOn requires the
