@@ -33,14 +33,25 @@ async function flushAsync(times = 1) {
 // AND awaits the microtasks/promise chains they trigger (including
 // `setInterval`-based `waitFor` polling loops) before moving on.
 //
-// After advancing, we do extra microtask-draining rounds so that async chains
-// that don't use setTimeout (e.g. image-load via queueMicrotask, awaited
-// VideoEncoder.isConfigSupported, etc.) also complete before the test
-// asserts. Without this, jest.advanceTimersByTimeAsync sometimes returns while
-// injector logic is still pending in the microtask queue.
+// Problem: jest.advanceTimersByTimeAsync(ms) processes timers in ascending
+// time order, but timers that are *scheduled during* the async-chain processing
+// of an earlier timer (e.g. sleep(200) inside the crop-click loop that fires
+// during sleep(500)'s chain) can be missed — they are added to the queue after
+// advanceTimersByTimeAsync has already stepped past their due time.
+//
+// Fix: after the main advance, repeatedly run small advances + microtask rounds
+// to drain any late-scheduled fake timers left in the queue.  We use 200ms
+// steps (matching the smallest sleep interval in the injectors) and repeat
+// enough times to cover the deepest nesting (crop + filter click loops =
+// ~6 × 200ms rounds).  Extra microtask rounds after each advance ensure
+// Promise-based chains (VideoEncoder, applyCoverOverlay) also complete.
 async function runTimersInSteps(ms) {
   await jest.advanceTimersByTimeAsync(ms);
-  for (let i = 0; i < 30; i++) await Promise.resolve();
+  for (let outer = 0; outer < 20; outer++) {
+    for (let i = 0; i < 10; i++) await Promise.resolve();
+    await jest.advanceTimersByTimeAsync(200);
+    for (let i = 0; i < 10; i++) await Promise.resolve();
+  }
 }
 
 module.exports = { PHOTO_DATA_URL, photoDataUrls, flushAsync, runTimersInSteps };

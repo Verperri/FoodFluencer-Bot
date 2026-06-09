@@ -62,8 +62,10 @@ beforeEach(() => {
   HTMLCanvasElement.prototype.getContext = jest.fn(() => fakeCtx2d);
   HTMLCanvasElement.prototype.toDataURL = jest.fn(() => 'data:image/jpeg;base64,ZmFrZQ==');
 
-  // jsdom doesn't decode images — resolve `new Image()` loads synchronously-ish
-  // via microtask so `await new Promise(res => img.onload = res)` patterns work.
+  // jsdom doesn't decode images — fire onload via a 0ms fake setTimeout so that
+  // jest.advanceTimersByTimeAsync() drains it predictably for any number of images.
+  // Using queueMicrotask() caused the multi-image chain to outlast advanceTimersByTimeAsync's
+  // single-level microtask drain, leaving build_video_done unfired in step-1 tests.
   class FakeImage {
     constructor() {
       this.naturalWidth = 800;
@@ -72,7 +74,7 @@ beforeEach(() => {
     }
     set src(v) {
       this._src = v;
-      queueMicrotask(() => this.onload && this.onload());
+      setTimeout(() => this.onload && this.onload(), 0);
     }
     get src() { return this._src; }
   }
