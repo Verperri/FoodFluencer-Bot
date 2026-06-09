@@ -43,7 +43,10 @@ function buildFixture({ omit = new Set(), restaurantName = '', withLocation = tr
   if (!omit.has('create')) {
     const createBtn = document.createElement('a');
     createBtn.setAttribute('aria-label', 'New post');
-    clickable(createBtn, () => showCreateMenu());
+    // Delay the menu by 400ms so that the injector's "Post" snapshot
+    // (taken immediately after clicking the Create button) captures an
+    // empty set, allowing findAndClickPostOption to detect the NEW menu.
+    clickable(createBtn, () => setTimeout(showCreateMenu, 400));
     root.appendChild(createBtn);
   }
 

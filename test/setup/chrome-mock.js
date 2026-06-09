@@ -17,6 +17,56 @@ if (typeof document !== 'undefined' && typeof document.execCommand !== 'function
   document.execCommand = () => true;
 }
 
+// DataTransfer — jsdom's implementation is incomplete: items.add() with a
+// File object silently fails and dt.files stays empty, which means all the
+// injectors' file-injection paths produce empty FileLists in tests.
+// Override with a minimal but functional implementation that:
+//   • accepts File / Blob / string via items.add()
+//   • returns an array-like `files` property that the injector code can read
+//   • supports the Object.getOwnPropertyDescriptor(HTMLInputElement.prototype,
+//     'files')?.set path that the injectors prefer for setting input.files
+{
+  class MockDataTransfer {
+    constructor() {
+      this._files = [];
+      this.items = {
+        add: (item) => this._files.push(item),
+        remove: (i) => this._files.splice(i, 1),
+        clear: () => { this._files = []; },
+        get length() { return this._files.length; },
+      };
+    }
+    get files() {
+      const arr = [...this._files];
+      // Return an array-like that also exposes .item() and .length so it
+      // behaves enough like a FileList for the tests' assertions to pass.
+      const fl = arr.slice(); // real Array, so .toHaveLength / spread work
+      fl.item = (i) => fl[i] ?? null;
+      return fl;
+    }
+    clearData() { this._files = []; }
+  }
+  global.DataTransfer = MockDataTransfer;
+}
+
+// Patch HTMLInputElement.prototype.files to be writable in jsdom.
+// jsdom marks `files` as a read-only DOMFileList property, so the injectors'
+//   setter.call(input, dt.files)  or  input.files = dt.files
+// both silently do nothing. Redefine the property to use a per-instance
+// backing store that can be set, mirroring what a real browser's setter does.
+if (typeof HTMLInputElement !== 'undefined') {
+  const desc = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'files');
+  // Only patch if already defined (jsdom sets it up as a getter-only accessor)
+  if (desc && typeof desc.set !== 'function') {
+    Object.defineProperty(HTMLInputElement.prototype, 'files', {
+      configurable: true,
+      enumerable: true,
+      get() { return this._mockFileList ?? (this._mockFileList = []); },
+      set(fl) { this._mockFileList = fl; },
+    });
+  }
+}
+
 global.chrome = {
   runtime: {
     onInstalled: listenerSet(),
