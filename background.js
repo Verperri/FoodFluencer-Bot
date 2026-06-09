@@ -183,6 +183,112 @@ async function fetchAsDataUrl(url) {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
+// Image Quality Scorer — canvas-based, zero-cost, runs in the service worker
+//
+// Draws each downloaded image onto a small OffscreenCanvas (150×150) and derives
+// four pixel-level metrics:
+//
+//   blur        Laplacian variance — measures edge sharpness.
+//               Sharp images have high local gradient variance; blurry or
+//               heavily-compressed images look "smooth" and score low.
+//               Threshold: < 80  → rejected as blurry.
+//
+//   brightness  Mean luminance (0–255, rec.601 weighting).
+//               Threshold: < 40  → too dark; > 220 → overexposed.
+//
+//   contrast    Standard deviation of per-pixel luminance.
+//               Flat, washed-out images score low.
+//               Threshold: < 20  → rejected as low contrast.
+//
+//   saturation  Mean HSL saturation (0–100 %).
+//               Catches accidental greyscale, heavily-tinted, or near-B&W images.
+//               Threshold: < 8 % → rejected as near-greyscale.
+//
+// Returns { blur, brightness, contrast, saturation, passed, reasons[] }.
+// A photo passes only when all four metrics are within acceptable bounds.
+// ═══════════════════════════════════════════════════════════════════════════════
+
+async function scoreImageQuality(dataUrl) {
+  try {
+    const SIZE = 150;
+    const canvas = new OffscreenCanvas(SIZE, SIZE);
+    const ctx = canvas.getContext('2d');
+
+    // Decode the data-URL into a bitmap and draw it at analysis resolution
+    const blob   = await fetch(dataUrl).then(r => r.blob());
+    const bitmap = await createImageBitmap(blob);
+    ctx.drawImage(bitmap, 0, 0, SIZE, SIZE);
+    bitmap.close();
+
+    const { data } = ctx.getImageData(0, 0, SIZE, SIZE);
+    const total    = SIZE * SIZE;
+
+    // ── Greyscale luminance array ─────────────────────────────────────────────
+    const gray  = new Float32Array(total);
+    let   sumL  = 0;
+    for (let i = 0; i < total; i++) {
+      const lum  = 0.299 * data[i * 4] + 0.587 * data[i * 4 + 1] + 0.114 * data[i * 4 + 2];
+      gray[i]    = lum;
+      sumL      += lum;
+    }
+    const brightness = sumL / total;
+
+    // ── Contrast = std-dev of luminance ───────────────────────────────────────
+    let sumSq = 0;
+    for (let i = 0; i < total; i++) {
+      const d = gray[i] - brightness;
+      sumSq  += d * d;
+    }
+    const contrast = Math.sqrt(sumSq / total);
+
+    // ── Blur = variance of the Laplacian (3×3 kernel) ─────────────────────────
+    // Kernel: [0, 1, 0,  1, -4, 1,  0, 1, 0]
+    // High variance → lots of sharp edges → sharp image.
+    // Low variance  → smooth gradients everywhere → blurry image.
+    let lapSum = 0, lapSumSq = 0, lapCount = 0;
+    for (let y = 1; y < SIZE - 1; y++) {
+      for (let x = 1; x < SIZE - 1; x++) {
+        const idx = y * SIZE + x;
+        const lap = gray[idx - SIZE] + gray[idx + SIZE]
+                  + gray[idx - 1]   + gray[idx + 1]
+                  - 4 * gray[idx];
+        lapSum   += lap;
+        lapSumSq += lap * lap;
+        lapCount++;
+      }
+    }
+    const lapMean  = lapSum / lapCount;
+    const blurScore = lapSumSq / lapCount - lapMean * lapMean; // variance
+
+    // ── Saturation = mean HSL saturation (0–100 %) ────────────────────────────
+    let satSum = 0;
+    for (let i = 0; i < total; i++) {
+      const r = data[i * 4] / 255, g = data[i * 4 + 1] / 255, b = data[i * 4 + 2] / 255;
+      const max = Math.max(r, g, b), min = Math.min(r, g, b);
+      const l   = (max + min) / 2;
+      const s   = max === min ? 0 : (max - min) / (l > 0.5 ? 2 - max - min : max + min);
+      satSum   += s;
+    }
+    const saturation = (satSum / total) * 100;
+
+    // ── Gate each metric ──────────────────────────────────────────────────────
+    const reasons = [];
+    if (blurScore   <  80)  reasons.push(`blurry (Laplacian variance ${blurScore.toFixed(0)})`);
+    if (brightness  <  40)  reasons.push(`too dark (brightness ${brightness.toFixed(0)}/255)`);
+    if (brightness  > 220)  reasons.push(`overexposed (brightness ${brightness.toFixed(0)}/255)`);
+    if (contrast    <  20)  reasons.push(`low contrast (σ ${contrast.toFixed(0)})`);
+    if (saturation  <   8)  reasons.push(`near-greyscale (saturation ${saturation.toFixed(1)} %)`);
+
+    return { blur: blurScore, brightness, contrast, saturation, passed: reasons.length === 0, reasons };
+  } catch (e) {
+    // If scoring itself fails for any reason, let the photo through rather than
+    // silently dropping a potentially good image.
+    bgLog('warn', `PhotoQuality: scoring error — letting photo through (${e.message})`);
+    return { blur: 999, brightness: 128, contrast: 50, saturation: 50, passed: true, reasons: [] };
+  }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
 // Photo Waterfall — 4 sources tried in order, each with quality threshold
 //
 //  1. Google Maps embedded JSON   (venue-specific, highest quality)
@@ -348,9 +454,20 @@ async function scrapeYelpPhotos(businessName, city) {
 }
 
 // ── Waterfall orchestrator ────────────────────────────────────────────────────
-// Tries each source in order. Accepts a source only when it yields ≥ SCRAPE_MIN
-// successfully fetched data-URLs. Falls back to Google Places API last.
-// Every photo is tagged with its source for full TechLog traceability.
+// Sources are tried in priority order. Rather than returning as soon as one
+// source meets the minimum threshold, the waterfall now *accumulates* quality-
+// passing photos across sources until the target count is reached.
+//
+// Concretely: if Google Maps yields 2 good photos and the target is 4, the
+// waterfall continues to DuckDuckGo and collects the remaining 2 from there
+// (or Yelp, or Google Places API as a last resort). Quality-rejected photos
+// from a source are automatically replaced by additional candidates from that
+// same source first; only once a source's URL pool is exhausted does the
+// waterfall advance to the next one.
+//
+// The `source` field in the return value reflects the first (primary) source
+// that contributed photos. When multiple sources are needed, `photoLog` records
+// the origin of every individual photo for full TechLog traceability.
 async function fetchPhotosWaterfall(businessName, address, entityType, minPics, apiKey, placePhotoObjects) {
   const cityM = address.match(/\d{4}\s+([A-Za-zÀ-ÿ\s-]+),/);
   const city  = (cityM?.[1] || address.split(',')[0] || '').trim();
@@ -359,79 +476,121 @@ async function fetchPhotosWaterfall(businessName, address, entityType, minPics, 
   bgLog('info', `PhotoWaterfall start — "${businessName}" ${city}, target=${target}`);
   TechLog.info('PHOTO', 'waterfall_start', { businessName, city, entityType, target });
 
-  // Convert scraped URLs → data URLs, tag each with source, stop at target count
-  async function toDataUrls(urls, sourceName) {
-    const out = [];
+  // Shared accumulator — filled incrementally across sources.
+  const collected = [];
+
+  // Convert scraped URLs → quality-passing data URLs, contributing up to
+  // `needed` photos into `collected`. Exhausts the full URL list before
+  // giving up so that every candidate from a source is evaluated before
+  // moving on. Quality failures are logged and skipped; the loop simply
+  // continues to the next URL in the same source's pool.
+  async function collectFromUrls(urls, sourceName) {
+    const needed = target - collected.length;
+    if (needed <= 0) return;
+
+    let accepted = 0, rejected = 0;
     for (const url of urls) {
-      if (out.length >= target) break;
+      if (collected.length >= target) break;
       try {
         const dataUrl = await Promise.race([
           fetchAsDataUrl(url),
           new Promise((_, rej) => setTimeout(() => rej(new Error('timeout')), 9000)),
         ]);
-        out.push({ dataUrl, sourceUrl: url, source: sourceName });
+
+        // ── Canvas-based quality gate ──────────────────────────────────────
+        const quality = await scoreImageQuality(dataUrl);
+        if (!quality.passed) {
+          rejected++;
+          bgLog('info', `PhotoQuality[${sourceName}]: ✗ ${url.slice(0, 80)} — ${quality.reasons.join(', ')}`);
+          TechLog.info('PHOTO', 'quality_rejected', {
+            source: sourceName,
+            url: url.slice(0, 120),
+            reasons: quality.reasons,
+            metrics: {
+              blur:       Math.round(quality.blur),
+              brightness: Math.round(quality.brightness),
+              contrast:   Math.round(quality.contrast),
+              saturation: +quality.saturation.toFixed(1),
+            },
+          });
+          continue;
+        }
+        accepted++;
+        bgLog('info', `PhotoQuality[${sourceName}]: ✓ blur=${quality.blur.toFixed(0)} bright=${quality.brightness.toFixed(0)} contrast=${quality.contrast.toFixed(0)} sat=${quality.saturation.toFixed(1)}% (${collected.length + 1}/${target})`);
+        // ──────────────────────────────────────────────────────────────────
+
+        collected.push({ dataUrl, sourceUrl: url, source: sourceName });
       } catch(_) {}
     }
-    return out;
+
+    if (accepted > 0) {
+      bgLog('info', `PhotoWaterfall[${sourceName}]: contributed ${accepted} photos (${rejected} rejected) — total ${collected.length}/${target}`);
+      TechLog.info('PHOTO', 'source_contribution', {
+        source: sourceName, accepted, rejected, total: collected.length, target,
+      });
+    } else {
+      bgLog('info', `PhotoWaterfall[${sourceName}]: 0 quality photos from ${urls.length} URLs (${rejected} rejected)`);
+    }
   }
 
   // ── 1. Google Maps ─────────────────────────────────────────────────────────
   const gmUrls = await raceTimeout(scrapeGoogleMapsPhotos(businessName, city), 10000);
-  if (gmUrls.length >= SCRAPE_MIN) {
-    const photos = await toDataUrls(gmUrls, 'google_maps');
-    if (photos.length >= SCRAPE_MIN) {
-      bgLog('info', `PhotoWaterfall → google_maps (${photos.length} photos)`);
-      TechLog.info('PHOTO', 'waterfall_result', { source: 'google_maps', count: photos.length,
-        urls: photos.map(p => p.sourceUrl) });
-      return { dataUrls: photos.map(p => p.dataUrl), source: 'google_maps', photoLog: photos };
+  if (gmUrls.length > 0) await collectFromUrls(gmUrls, 'google_maps');
+
+  // ── 2. DuckDuckGo — only if still short of target ─────────────────────────
+  if (collected.length < target) {
+    bgLog('info', `PhotoWaterfall: need ${target - collected.length} more — trying DuckDuckGo`);
+    const ddgUrls = await raceTimeout(scrapeDDGPhotos(businessName, city, entityType), 14000);
+    if (ddgUrls.length > 0) await collectFromUrls(ddgUrls, 'duckduckgo');
+  }
+
+  // ── 3. Yelp — only if still short of target ───────────────────────────────
+  if (collected.length < target) {
+    bgLog('info', `PhotoWaterfall: need ${target - collected.length} more — trying Yelp`);
+    const yelpUrls = await raceTimeout(scrapeYelpPhotos(businessName, city), 18000);
+    if (yelpUrls.length > 0) await collectFromUrls(yelpUrls, 'yelp');
+  }
+
+  // ── 4. Google Places API — last resort, quota-consuming ───────────────────
+  if (collected.length < target) {
+    if (!apiKey) {
+      bgLog('warn', 'PhotoWaterfall: no API key — skipping Google Places fallback.');
+      TechLog.warn('PHOTO', 'waterfall_no_api_key', { collected: collected.length });
+    } else {
+      bgLog('info', `PhotoWaterfall: need ${target - collected.length} more — trying Google Places API`);
+      const needed   = target - collected.length;
+      const uris     = await Promise.all(
+        placePhotoObjects.slice(0, needed + 2).map(p => resolvePhotoUriBG(p.name, 900, apiKey))
+      );
+      await collectFromUrls(uris, 'google_places');
     }
   }
-  bgLog('info', `PhotoWaterfall: google_maps yielded ${gmUrls.length} URLs — trying DDG`);
 
-  // ── 2. DuckDuckGo ──────────────────────────────────────────────────────────
-  const ddgUrls = await raceTimeout(scrapeDDGPhotos(businessName, city, entityType), 14000);
-  if (ddgUrls.length >= SCRAPE_MIN) {
-    const photos = await toDataUrls(ddgUrls, 'duckduckgo');
-    if (photos.length >= SCRAPE_MIN) {
-      bgLog('info', `PhotoWaterfall → duckduckgo (${photos.length} photos)`);
-      TechLog.info('PHOTO', 'waterfall_result', { source: 'duckduckgo', count: photos.length,
-        urls: photos.map(p => p.sourceUrl) });
-      return { dataUrls: photos.map(p => p.dataUrl), source: 'duckduckgo', photoLog: photos };
-    }
-  }
-  bgLog('info', `PhotoWaterfall: duckduckgo yielded ${ddgUrls.length} URLs — trying Yelp`);
-
-  // ── 3. Yelp ────────────────────────────────────────────────────────────────
-  const yelpUrls = await raceTimeout(scrapeYelpPhotos(businessName, city), 18000);
-  if (yelpUrls.length >= SCRAPE_MIN) {
-    const photos = await toDataUrls(yelpUrls, 'yelp');
-    if (photos.length >= SCRAPE_MIN) {
-      bgLog('info', `PhotoWaterfall → yelp (${photos.length} photos)`);
-      TechLog.info('PHOTO', 'waterfall_result', { source: 'yelp', count: photos.length,
-        urls: photos.map(p => p.sourceUrl) });
-      return { dataUrls: photos.map(p => p.dataUrl), source: 'yelp', photoLog: photos };
-    }
-  }
-  bgLog('info', `PhotoWaterfall: yelp yielded ${yelpUrls.length} URLs — falling back to Google Places API`);
-
-  // ── 4. Google Places API (quota-consuming fallback) ────────────────────────
-  // Skipped entirely if no API key is configured — user has not set one up.
-  if (!apiKey) {
-    bgLog('warn', 'PhotoWaterfall: no API key — skipping Google Places fallback. Only 3 scrape sources available.');
-    TechLog.warn('PHOTO', 'waterfall_result', { source: 'none', note: 'no API key — Google Places step skipped' });
+  // ── Final result ───────────────────────────────────────────────────────────
+  if (collected.length === 0) {
+    bgLog('warn', 'PhotoWaterfall: all sources exhausted — no quality photos found');
+    TechLog.warn('PHOTO', 'waterfall_result', { source: 'none', count: 0 });
     return { dataUrls: [], source: 'none', photoLog: [] };
   }
 
-  TechLog.info('PHOTO', 'waterfall_result', { source: 'google_places',
-    count: placePhotoObjects.length, note: 'all scrape sources exhausted' });
-  bgLog('info', `PhotoWaterfall → google_places (${placePhotoObjects.length} available)`);
+  // Summarise which sources contributed to this post
+  const sourceBreakdown = collected.reduce((acc, p) => {
+    acc[p.source] = (acc[p.source] || 0) + 1;
+    return acc;
+  }, {});
+  const primarySource = collected[0].source;
+  const sourceLabel   = Object.keys(sourceBreakdown).length > 1 ? 'mixed' : primarySource;
 
-  const photoUris  = await Promise.all(placePhotoObjects.slice(0, target).map(p => resolvePhotoUriBG(p.name, 900, apiKey)));
-  const dataUrls   = await Promise.all(photoUris.map(fetchAsDataUrl));
+  bgLog('info', `PhotoWaterfall complete — ${collected.length} photos from: ${JSON.stringify(sourceBreakdown)}`);
+  TechLog.info('PHOTO', 'waterfall_result', {
+    source: sourceLabel, primarySource, count: collected.length,
+    sourceBreakdown, urls: collected.map(p => p.sourceUrl),
+  });
+
   return {
-    dataUrls,
-    source: 'google_places',
-    photoLog: dataUrls.map((d, i) => ({ dataUrl: d, sourceUrl: photoUris[i], source: 'google_places' })),
+    dataUrls: collected.map(p => p.dataUrl),
+    source:   sourceLabel,
+    photoLog: collected,
   };
 }
 
