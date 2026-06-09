@@ -19,21 +19,30 @@ fetch('version.json').then(r => r.json()).then(v => {
 // SETTINGS PANEL
 // ════════════════════════════════════════════════════════════════════════════
 
-function buildFeatureStatus(hasKey) {
+function buildFeatureStatus(hasKey, hasFsqKey = false) {
   return [
-    { label: 'Google Maps photo scraping',  on: true  },
-    { label: 'DuckDuckGo image search',     on: true  },
-    { label: 'Yelp photo scraping',         on: true  },
-    { label: 'Google Places API (source 4)',on: hasKey, note: hasKey ? '' : ' — add API key to enable' },
-    { label: 'Automatic business discovery',on: true },
-    { label: 'Scheduled auto-posting',      on: true },
+    // Photo sources
+    { label: 'Photo source 1 — Google Maps scraping',     on: true },
+    { label: 'Photo source 2 — DuckDuckGo image search',  on: true },
+    { label: 'Photo source 3 — Yelp scraping',            on: true },
+    { label: 'Photo source 4 — TripAdvisor scraping',     on: true },
+    { label: 'Photo source 5 — Foursquare API',           on: hasFsqKey, note: hasFsqKey ? '' : ' — add Foursquare key to enable' },
+    { label: 'Photo source 6 — Google Places API',        on: hasKey,    note: hasKey    ? '' : ' — add Google key to enable' },
+    // Posting
+    { label: 'Automatic business discovery',  on: hasKey, note: hasKey ? '' : ' — requires Google key' },
+    { label: 'Scheduled auto-posting',        on: true },
+    { label: 'Auto-retry on post failure',    on: true },
+    // Captions
+    { label: 'Multilingual caption templates (50–100 per language)', on: true },
+    { label: 'Type-aware captions (restaurant / hotel / bar)',        on: true },
+    { label: 'Location-aware captions (city / province)',             on: true },
   ];
 }
 
-function renderFeatureStatus(containerId, hasKey) {
+function renderFeatureStatus(containerId, hasKey, hasFsqKey = false) {
   const el = document.getElementById(containerId);
   if (!el) return;
-  el.innerHTML = buildFeatureStatus(hasKey).map(f => `
+  el.innerHTML = buildFeatureStatus(hasKey, hasFsqKey).map(f => `
     <div class="settings-feature ${f.on ? '' : 'disabled'}">
       <span class="feat-icon">${f.on ? '✅' : '⚠️'}</span>
       <span>${f.label}${f.note ? `<em style="font-size:.68rem;color:var(--muted)">${f.note}</em>` : ''}</span>
@@ -45,29 +54,118 @@ function openSettings() {
   const backdrop = document.getElementById('settingsBackdrop');
   if (!panel) return;
 
-  // Populate current API key (masked)
-  chrome.storage.local.get({ googleApiKey: '' }, ({ googleApiKey }) => {
+  // Populate current API keys (masked) and update sub-drawer badges
+  chrome.storage.local.get({ googleApiKey: '', foursquareApiKey: '' }, ({ googleApiKey, foursquareApiKey }) => {
     const input = document.getElementById('settingsApiKey');
     if (input) input.value = googleApiKey ? '••••••••••••••••' : '';
     const status = document.getElementById('settingsKeyStatus');
     if (status) {
       status.className = 'settings-key-status ' + (googleApiKey ? 'ok' : 'warn');
-      status.textContent = googleApiKey ? '✓ API key saved' : 'ℹ No API key — 3 of 4 image sources active (optional)';
+      status.textContent = googleApiKey ? '✓ Google key saved' : 'ℹ No key — business discovery & Google photos disabled';
     }
-    renderFeatureStatus('settingsFeatures', !!googleApiKey);
+    const fsqInput = document.getElementById('settingsFsqKey');
+    if (fsqInput) fsqInput.value = foursquareApiKey ? '••••••••••••••••' : '';
+    const fsqStatus = document.getElementById('settingsFsqKeyStatus');
+    if (fsqStatus) {
+      fsqStatus.className = 'settings-key-status ' + (foursquareApiKey ? 'ok' : '');
+      fsqStatus.textContent = foursquareApiKey ? '✓ Foursquare key saved' : '';
+    }
+    setSubBadge('stGoogleBadge', googleApiKey);
+    setSubBadge('stFsqBadge', foursquareApiKey);
+    renderFeatureStatus('settingsFeatures', !!googleApiKey, !!foursquareApiKey);
   });
 
   const sv = document.getElementById('settingsVersion');
   if (sv && CURRENT_VERSION) sv.textContent = CURRENT_VERSION;
 
+  loadDiagResults();
+  refreshLogsBadges();
+
   panel.classList.remove('hidden');
   backdrop.classList.remove('hidden');
+}
+
+// Eagerly updates all Logs & Statistics sub-drawer badges from storage.
+// Called every time settings opens so values survive popup close/reopen.
+function refreshLogsBadges() {
+  chrome.storage.local.get(
+    { techLog: [], activityLog: [], apiLog: [], totalCost: 0, foursquareQuota: { count: 0, date: '' } },
+    ({ techLog, activityLog, apiLog, totalCost, foursquareQuota }) => {
+
+      // ── Technical Log: errors in last run ──────────────────────────────
+      const lastRunId = [...techLog].reverse().find(e => e.run_id)?.run_id;
+      const lastRunErrors = lastRunId
+        ? techLog.filter(e => e.run_id === lastRunId && e.level === 'error').length
+        : techLog.filter(e => e.level === 'error').length;
+      const techBadge = document.getElementById('stTechLogBadge');
+      if (techBadge) {
+        if (techLog.length === 0) {
+          techBadge.textContent = 'No entries';
+          techBadge.className   = 'st-sub-badge st-sub-badge--none';
+        } else if (lastRunErrors === 0) {
+          techBadge.textContent = '✓ Last run clean';
+          techBadge.className   = 'st-sub-badge st-sub-badge--ok';
+        } else {
+          techBadge.textContent = `${lastRunErrors} error${lastRunErrors > 1 ? 's' : ''} in last run`;
+          techBadge.className   = 'st-sub-badge st-sub-badge--warn';
+        }
+      }
+
+      // ── Activity: total posts ──────────────────────────────────────────
+      const totalPosts = activityLog.length;
+      const actBadge = document.getElementById('stActivityBadge');
+      if (actBadge) {
+        actBadge.textContent = `${totalPosts} post${totalPosts !== 1 ? 's' : ''}`;
+        actBadge.className   = 'st-sub-badge ' + (totalPosts ? 'st-sub-badge--ok' : 'st-sub-badge--none');
+      }
+
+      // ── API Usage: est. calls / cost summary ──────────────────────────
+      const today    = new Date().toISOString().slice(0, 10);
+      const fsqToday = foursquareQuota.date === today ? foursquareQuota.count : 0;
+      const usageBadge = document.getElementById('stApiUsageBadge');
+      if (usageBadge) {
+        const parts = [];
+        if (apiLog.length)  parts.push(`Google: ${apiLog.length} calls · $${totalCost.toFixed(2)}`);
+        if (fsqToday > 0)   parts.push(`FSQ: ${fsqToday}/950`);
+        usageBadge.textContent = parts.length ? parts.join(' · ') : 'No usage yet';
+        usageBadge.className   = 'st-sub-badge ' + (parts.length ? 'st-sub-badge--ok' : 'st-sub-badge--none');
+      }
+    }
+  );
 }
 
 function closeSettings() {
   document.getElementById('settingsPanel')?.classList.add('hidden');
   document.getElementById('settingsBackdrop')?.classList.add('hidden');
 }
+
+// ── Settings drawer helpers ───────────────────────────────────────────────────
+
+function toggleDrawer(hdrId, bodyId) {
+  const hdr  = document.getElementById(hdrId);
+  const body = document.getElementById(bodyId);
+  if (!hdr || !body) return;
+  const open = hdr.classList.contains('collapsed');
+  hdr.classList.toggle('collapsed', !open);
+  body.classList.toggle('collapsed', !open);
+}
+
+function setSubBadge(badgeId, hasKey) {
+  const badge = document.getElementById(badgeId);
+  if (!badge) return;
+  badge.textContent  = hasKey ? 'Configured' : 'Not set';
+  badge.className    = 'st-sub-badge ' + (hasKey ? 'st-sub-badge--ok' : 'st-sub-badge--none');
+}
+
+// Top-level drawers
+document.getElementById('stApiKeysHdr')  ?.addEventListener('click', () => toggleDrawer('stApiKeysHdr',  'stApiKeysBody'));
+document.getElementById('stFeaturesHdr') ?.addEventListener('click', () => toggleDrawer('stFeaturesHdr', 'stFeaturesBody'));
+document.getElementById('stLogsHdr')     ?.addEventListener('click', () => { toggleDrawer('stLogsHdr', 'stLogsBody'); });
+document.getElementById('stDiagHdr')     ?.addEventListener('click', () => toggleDrawer('stDiagHdr',     'stDiagBody'));
+
+// API key sub-drawers
+document.getElementById('stGoogleHdr')?.addEventListener('click', e => { e.stopPropagation(); toggleDrawer('stGoogleHdr', 'stGoogleBody'); });
+document.getElementById('stFsqHdr')   ?.addEventListener('click', e => { e.stopPropagation(); toggleDrawer('stFsqHdr',    'stFsqBody'); });
 
 // Settings open buttons (selector + both modes)
 ['settingsBtnSelector','settingsBtnManual','settingsBtnAuto'].forEach(id => {
@@ -76,7 +174,7 @@ function closeSettings() {
 document.getElementById('settingsCloseBtn')?.addEventListener('click', closeSettings);
 document.getElementById('settingsBackdrop')?.addEventListener('click', closeSettings);
 
-// Save API key from settings panel
+// Save Google API key from settings panel
 document.getElementById('settingsSaveKey')?.addEventListener('click', () => {
   const input  = document.getElementById('settingsApiKey');
   const status = document.getElementById('settingsKeyStatus');
@@ -85,66 +183,189 @@ document.getElementById('settingsSaveKey')?.addEventListener('click', () => {
   chrome.storage.local.set({ googleApiKey: val }, () => {
     API_KEY = val;
     if (input)  input.value = '••••••••••••••••';
-    if (status) { status.className='settings-key-status ok'; status.textContent='✓ API key saved'; }
-    renderFeatureStatus('settingsFeatures', true);
+    if (status) { status.className='settings-key-status ok'; status.textContent='✓ Google key saved'; }
+    setSubBadge('stGoogleBadge', true);
+    chrome.storage.local.get({ foursquareApiKey: '' }, ({ foursquareApiKey }) =>
+      renderFeatureStatus('settingsFeatures', true, !!foursquareApiKey));
     checkUsageWarning();
     initAfterKey();
   });
 });
 
-// Settings action buttons
-document.getElementById('settingsExportLogs')?.addEventListener('click', () => { TechLog.exportCSV(); closeSettings(); });
-document.getElementById('settingsResetActivity')?.addEventListener('click', () => {
-  if (confirm('Reset the activity log? This cannot be undone.')) {
-    chrome.storage.local.set({ activityLog: [] }, () => { refreshActivityLog(); closeSettings(); });
-  }
-});
-document.getElementById('settingsUsageStats')?.addEventListener('click', () => {
-  chrome.storage.local.get({ apiLog: [], totalCost: 0 }, ({ apiLog, totalCost }) => {
-    // Build per-day breakdown for the last 7 days
-    const dayMap = {};
-    apiLog.forEach(entry => {
-      const day = (entry.ts || entry.timestamp || '').slice(0, 10);
-      if (day) { dayMap[day] = (dayMap[day] || 0) + 1; }
-    });
-    const days = Object.keys(dayMap).sort().slice(-7);
-    const dayRows = days.length
-      ? days.map(d => `  ${d}: ${dayMap[d]} call${dayMap[d]>1?'s':''}`).join('\n')
-      : '  No data yet';
-
-    // Call type breakdown
-    const typeMap = {};
-    apiLog.forEach(e => { const t = e.type || e.callType || 'search'; typeMap[t] = (typeMap[t]||0)+1; });
-    const typeRows = Object.entries(typeMap).map(([t,n]) => `  ${t}: ${n}`).join('\n') || '  —';
-
-    const msg = [
-      `📊 Google Places API Usage`,
-      ``,
-      `Total calls : ${apiLog.length}`,
-      `Est. cost   : $${totalCost.toFixed(4)}`,
-      ``,
-      `Last 7 days:`,
-      dayRows,
-      ``,
-      `By type:`,
-      typeRows,
-      ``,
-      `⚠ These are estimates. For exact usage, visit Google Cloud Console (see the "View in Console" button).`,
-    ].join('\n');
-    alert(msg);
+// Save Foursquare API key from settings panel
+document.getElementById('settingsSaveFsqKey')?.addEventListener('click', () => {
+  const input  = document.getElementById('settingsFsqKey');
+  const status = document.getElementById('settingsFsqKeyStatus');
+  const val = (input?.value || '').trim();
+  if (!val || val.startsWith('•')) { if (status) { status.className='settings-key-status warn'; status.textContent='Enter a new key to update.'; } return; }
+  chrome.storage.local.set({ foursquareApiKey: val }, () => {
+    if (input)  input.value = '••••••••••••••••';
+    if (status) { status.className='settings-key-status ok'; status.textContent='✓ Foursquare key saved'; }
+    setSubBadge('stFsqBadge', true);
+    chrome.storage.local.get({ googleApiKey: '' }, ({ googleApiKey }) =>
+      renderFeatureStatus('settingsFeatures', !!googleApiKey, true));
   });
 });
 
-// Cloud Console link — opens the actual API metrics dashboard
-const consoleBtn = document.createElement('button');
-consoleBtn.className = 'btn btn--ghost btn--sm';
-consoleBtn.style.cssText = 'margin-top:6px;width:100%;';
-consoleBtn.textContent = '🔗 View in Google Cloud Console';
-consoleBtn.addEventListener('click', () => {
-  chrome.tabs.create({ url: 'https://console.cloud.google.com/apis/api/places.googleapis.com/metrics' });
-  closeSettings();
+// ── Logs & Statistics — sub-drawer wiring ────────────────────────────────────
+document.getElementById('stTechLogHdr')  ?.addEventListener('click', e => { e.stopPropagation(); toggleDrawer('stTechLogHdr',  'stTechLogBody');  if (!document.getElementById('stTechLogBody').classList.contains('collapsed')) renderTechLog(); });
+document.getElementById('stActivityHdr') ?.addEventListener('click', e => { e.stopPropagation(); toggleDrawer('stActivityHdr',  'stActivityBody'); if (!document.getElementById('stActivityBody').classList.contains('collapsed')) renderActivitySummary(); });
+document.getElementById('stApiUsageHdr') ?.addEventListener('click', e => { e.stopPropagation(); toggleDrawer('stApiUsageHdr',  'stApiUsageBody'); if (!document.getElementById('stApiUsageBody').classList.contains('collapsed')) renderApiUsage(); });
+
+// Technical log — level + category filters
+let _tlLevel = 'all', _tlCat = 'all';
+document.getElementById('stTechLogLevels')?.addEventListener('click', e => {
+  const btn = e.target.closest('.stl-filter-btn');
+  if (!btn) return;
+  _tlLevel = btn.dataset.level;
+  document.querySelectorAll('#stTechLogLevels .stl-filter-btn').forEach(b => b.classList.toggle('active', b === btn));
+  renderTechLog();
 });
-document.getElementById('settingsUsageStats')?.parentElement?.appendChild(consoleBtn);
+document.getElementById('stTechLogCat')?.addEventListener('change', e => {
+  _tlCat = e.target.value;
+  renderTechLog();
+});
+
+function renderTechLog() {
+  chrome.storage.local.get({ techLog: [] }, ({ techLog }) => {
+    // Badge: errors in last run (same logic as refreshLogsBadges)
+    const lastRunId     = [...techLog].reverse().find(e => e.run_id)?.run_id;
+    const lastRunErrors = lastRunId
+      ? techLog.filter(e => e.run_id === lastRunId && e.level === 'error').length
+      : techLog.filter(e => e.level === 'error').length;
+    const badge = document.getElementById('stTechLogBadge');
+    if (badge) {
+      if (techLog.length === 0) {
+        badge.textContent = 'No entries'; badge.className = 'st-sub-badge st-sub-badge--none';
+      } else if (lastRunErrors === 0) {
+        badge.textContent = '✓ Last run clean'; badge.className = 'st-sub-badge st-sub-badge--ok';
+      } else {
+        badge.textContent = `${lastRunErrors} error${lastRunErrors > 1 ? 's' : ''} in last run`;
+        badge.className = 'st-sub-badge st-sub-badge--warn';
+      }
+    }
+    const container = document.getElementById('stTechLogEntries');
+    if (!container) return;
+    const filtered = techLog
+      .filter(e => (_tlLevel === 'all' || e.level === _tlLevel) && (_tlCat === 'all' || e.category === _tlCat))
+      .slice(-100).reverse();
+    container.innerHTML = filtered.map(e => {
+      const time = (e.ts || '').slice(11, 19);
+      const lvlCls = e.level === 'warn' ? 'stl-lvl-warn' : e.level === 'error' ? 'stl-lvl-error' : 'stl-lvl-info';
+      const msg = e.action + (e.name ? ` · ${e.name}` : '') + (e.error ? ` · ${e.error}` : '');
+      return `<div class="stl-row">
+        <span class="stl-ts">${time}</span>
+        <span class="stl-lvl ${lvlCls}">${e.level || 'info'}</span>
+        <span class="stl-cat">${e.category || ''}</span>
+        <span class="stl-msg" title="${msg.replace(/"/g,'&quot;')}">${msg}</span>
+      </div>`;
+    }).join('') || '';
+  });
+}
+
+function renderActivitySummary() {
+  chrome.storage.local.get({ activityLog: [] }, ({ activityLog }) => {
+    // Per-platform counts (all time)
+    const platforms = { instagram: 0, facebook: 0, tiktok: 0 };
+    activityLog.forEach(e => { if (e.platform in platforms) platforms[e.platform]++; });
+    const total = Object.values(platforms).reduce((a, b) => a + b, 0);
+
+    const badge = document.getElementById('stActivityBadge');
+    if (badge) {
+      badge.textContent = `${total} post${total !== 1 ? 's' : ''}`;
+      badge.className = 'st-sub-badge ' + (total ? 'st-sub-badge--ok' : 'st-sub-badge--none');
+    }
+
+    const pillsEl = document.getElementById('stActivityPlatforms');
+    if (pillsEl) {
+      const labels = { instagram: '📷 Instagram', facebook: '👤 Facebook', tiktok: '🎵 TikTok' };
+      pillsEl.innerHTML = Object.entries(platforms).map(([p, n]) => `
+        <div class="stl-platform-pill">
+          <span class="pill-count">${n}</span>
+          <span class="pill-label">${labels[p]}</span>
+        </div>`).join('');
+    }
+
+    // Last 7 days sparkline
+    const sparkEl  = document.getElementById('stActivitySparkline');
+    const labelsEl = document.getElementById('stActivitySparklineLabels');
+    if (sparkEl && labelsEl) {
+      const days = [];
+      for (let i = 6; i >= 0; i--) {
+        const d = new Date(); d.setDate(d.getDate() - i);
+        days.push(d.toISOString().slice(0, 10));
+      }
+      const dayCounts = days.map(d => activityLog.filter(e => (e.ts || '').startsWith(d)).length);
+      const maxCount  = Math.max(...dayCounts, 1);
+      const dayNames  = ['Sun','Mon','Tue','Wed','Thu','Fri','Sat'];
+      sparkEl.innerHTML  = dayCounts.map(c => `<div class="stl-spark-bar ${c === 0 ? 'empty' : ''}" style="height:${Math.round((c / maxCount) * 36) + 4}px" title="${c} post${c !== 1 ? 's' : ''}"></div>`).join('');
+      labelsEl.innerHTML = days.map(d => `<div class="stl-spark-lbl">${dayNames[new Date(d + 'T12:00:00').getDay()]}</div>`).join('');
+    }
+  });
+}
+
+function renderApiUsage() {
+  chrome.storage.local.get({ apiLog: [], totalCost: 0, foursquareQuota: { count: 0, date: '' } }, data => {
+    const { apiLog, totalCost, foursquareQuota } = data;
+    const today = new Date().toISOString().slice(0, 10);
+    const todayCalls = apiLog.filter(e => (e.ts || '').startsWith(today)).length;
+    const weekCalls  = apiLog.filter(e => {
+      const d = new Date(); d.setDate(d.getDate() - 7);
+      return new Date(e.ts) >= d;
+    }).length;
+
+    const fsqToday  = foursquareQuota.date === today ? foursquareQuota.count : 0;
+    const fsqLimit  = 950;
+    const fsqPct    = Math.min((fsqToday / fsqLimit) * 100, 100);
+    const fsqBarCls = fsqPct >= 80 ? 'stl-quota-bar--high' : fsqPct >= 50 ? 'stl-quota-bar--mid' : 'stl-quota-bar--low';
+
+    const costPct    = Math.min((totalCost / 10) * 100, 100);
+    const costBarCls = costPct >= 80 ? 'stl-quota-bar--high' : costPct >= 40 ? 'stl-quota-bar--mid' : 'stl-quota-bar--low';
+
+    const badge = document.getElementById('stApiUsageBadge');
+    if (badge) {
+      badge.textContent = `$${totalCost.toFixed(3)}`;
+      badge.className = 'st-sub-badge ' + (totalCost >= 8 ? 'st-sub-badge--warn' : 'st-sub-badge--ok');
+    }
+
+    const container = document.getElementById('stApiUsageCards');
+    if (!container) return;
+    container.innerHTML = `
+      <div class="stl-api-card">
+        <div class="stl-api-card-title">🔵 Google Places API</div>
+        <div class="stl-api-stat-row"><span>Total calls</span><strong>${apiLog.length}</strong></div>
+        <div class="stl-api-stat-row"><span>Today</span><strong>${todayCalls}</strong></div>
+        <div class="stl-api-stat-row"><span>Last 7 days</span><strong>${weekCalls}</strong></div>
+        <div class="stl-api-stat-row"><span>Est. cost (all time)</span><strong>$${totalCost.toFixed(4)}</strong></div>
+        <div class="stl-quota-bar-wrap"><div class="stl-quota-bar ${costBarCls}" style="width:${costPct}%"></div></div>
+        <div class="stl-api-stat-row" style="margin-top:3px"><span style="font-size:.64rem;color:var(--muted)">Estimated against $10 threshold</span></div>
+      </div>
+      <div class="stl-api-card">
+        <div class="stl-api-card-title">🟡 Foursquare API</div>
+        <div class="stl-api-stat-row"><span>Calls today</span><strong>${fsqToday}</strong></div>
+        <div class="stl-api-stat-row"><span>Remaining today</span><strong>${fsqLimit - fsqToday} / ${fsqLimit}</strong></div>
+        <div class="stl-quota-bar-wrap"><div class="stl-quota-bar ${fsqBarCls}" style="width:${fsqPct}%"></div></div>
+        <div class="stl-api-stat-row" style="margin-top:3px"><span style="font-size:.64rem;color:var(--muted)">Quota resets at midnight</span></div>
+      </div>`;
+  });
+}
+
+// Export + reset
+document.getElementById('settingsExportLogs')?.addEventListener('click', () => { TechLog.exportCSV(); });
+document.getElementById('settingsResetActivity')?.addEventListener('click', () => {
+  if (confirm('Reset the activity log? This cannot be undone.')) {
+    chrome.storage.local.set({ activityLog: [] }, () => { refreshActivityLog(); renderActivitySummary(); });
+  }
+});
+
+// Console deep-links
+document.getElementById('stGoogleConsoleBtn')?.addEventListener('click', () => {
+  chrome.tabs.create({ url: 'https://console.cloud.google.com/apis/api/places.googleapis.com/metrics' });
+});
+document.getElementById('stFsqConsoleBtn')?.addEventListener('click', () => {
+  chrome.tabs.create({ url: 'https://foursquare.com/developers/home' });
+});
+
 document.getElementById('settingsShowOnboarding')?.addEventListener('click', () => {
   closeSettings();
   showOnboarding();
@@ -152,37 +373,136 @@ document.getElementById('settingsShowOnboarding')?.addEventListener('click', () 
 
 // ── Diagnostics ───────────────────────────────────────────────────────────────
 // Runs the silent feasibility probes (RUN_DIAGNOSTICS → testSilentInstagram /
-// testSilentTikTok, see background.js) that open each platform in a minimised
-// window and check whether the posting flow's key elements are reachable.
-// Read-only — nothing is posted and nothing is written to the activity log
-// (beyond DIAGNOSTIC entries in the technical log, for later export/monitoring).
-//
-// IMPORTANT: `chrome.windows.create()` steals OS focus, which makes Chrome
-// auto-close the extension *popup* — so running the test here would blank the
-// UI mid-run with no way to watch progress. Instead the button simply opens
-// `diagnostics.html` as a normal browser tab: a regular tab does NOT auto-close
-// on blur, so the user can leave it open across the whole run and watch the
-// "Test Case #N" checklist update live (it renders from
-// `chrome.storage.local.silentTestResults`, same storage-driven approach).
-// If a tab for this page is already open, we focus that one instead of
-// spawning duplicates.
-(() => {
-  const btn = document.getElementById('runDiagnosticBtn');
-  if (!btn) return;
+// ── Inline diagnostic test results ───────────────────────────────────────────
+// NOTE: chrome.windows.create() steals OS focus and will close the extension
+// popup mid-run. The Run button still triggers the background test; results
+// persist in chrome.storage.local.silentTestResults and are rendered here both
+// on settings open and via storage.onChanged so they appear when the user
+// reopens the popup after the test completes.
 
-  const DIAG_URL = chrome.runtime.getURL('diagnostics.html');
+function _diagPlatformTests(result) {
+  return (result?.steps || [])
+    .filter(s => typeof s.ok === 'boolean')
+    .map((s, i) => ({ name: `Test Case #${i + 1} — ${s.label}`, ok: s.ok, detail: s.detail }));
+}
 
-  btn.addEventListener('click', () => {
-    chrome.tabs.query({ url: DIAG_URL }, (tabs) => {
-      if (tabs && tabs.length) {
-        chrome.tabs.update(tabs[0].id, { active: true });
-        chrome.windows.update(tabs[0].windowId, { focused: true });
-      } else {
-        chrome.tabs.create({ url: DIAG_URL });
+function _renderDiagResults(results) {
+  const container = document.getElementById('stDiagResults');
+  const btn       = document.getElementById('runDiagnosticBtn');
+  const summary   = document.getElementById('stDiagSummary');
+  if (!container) return;
+
+  const ig = results?.instagram;
+  const tt = results?.tiktok;
+
+  if (!ig && !tt) {
+    container.innerHTML = '';
+    if (summary) { summary.textContent = ''; summary.className = 'st-drawer-summary'; }
+    return;
+  }
+
+  container.innerHTML = '';
+
+  let totalPassed = 0, totalTests = 0, anyRunning = false;
+
+  [[ig, '📷 Instagram'], [tt, '🎵 TikTok']].forEach(([result, title]) => {
+    if (!result) return;
+    const tests  = _diagPlatformTests(result);
+    const passed = tests.filter(t => t.ok).length;
+    totalPassed += passed;
+    totalTests  += tests.length;
+    if (result.running) anyRunning = true;
+
+    const section = document.createElement('div');
+    section.className = 'st-test-platform';
+
+    const hdr = document.createElement('div');
+    hdr.className = 'st-test-platform-hdr';
+    hdr.textContent = result.running
+      ? `${title} — running… (${passed}/${tests.length} so far)`
+      : `${title} — ${passed}/${tests.length} passed`;
+    section.appendChild(hdr);
+
+    tests.forEach(t => {
+      const row     = document.createElement('details');
+      row.className = 'st-test-case';
+      const sum     = document.createElement('summary');
+      sum.textContent = `${t.ok ? '✅' : '❌'} ${t.name}`;
+      row.appendChild(sum);
+      if (t.detail) {
+        const body = document.createElement('div');
+        body.className = 'st-test-detail';
+        body.textContent = t.detail;
+        row.appendChild(body);
       }
+      section.appendChild(row);
+    });
+
+    if (result.running) {
+      const hint = document.createElement('div');
+      hint.className = 'st-test-running';
+      hint.textContent = '⏳ Running — popup may close when a window opens; reopen to see results.';
+      section.appendChild(hint);
+    }
+    if (result.error) {
+      const err = document.createElement('div');
+      err.className = 'st-test-error';
+      err.textContent = `✖ ${result.error}`;
+      section.appendChild(err);
+    } else if (result.verdict) {
+      const v = document.createElement('div');
+      v.className = 'st-test-verdict';
+      v.textContent = `⇒ ${result.verdict}`;
+      section.appendChild(v);
+    }
+
+    container.appendChild(section);
+  });
+
+  // Update drawer header badge
+  if (summary && totalTests > 0) {
+    const allPass = totalPassed === totalTests && !anyRunning;
+    const hasFail = totalPassed < totalTests && !anyRunning;
+    summary.textContent = anyRunning
+      ? `Running…`
+      : `Last run: ${totalPassed}/${totalTests} passed`;
+    summary.className = 'st-drawer-summary st-diag-summary-badge ' + (
+      anyRunning ? 'st-diag-summary-badge--running'
+      : allPass  ? 'st-diag-summary-badge--pass'
+      :            'st-diag-summary-badge--fail'
+    );
+  }
+
+  if (btn) {
+    btn.disabled = anyRunning;
+    btn.textContent = anyRunning ? '🧪 Running…' : '🧪 Run Tests';
+  }
+}
+
+function loadDiagResults() {
+  chrome.storage.local.get({ silentTestResults: {} }, ({ silentTestResults }) =>
+    _renderDiagResults(silentTestResults));
+}
+
+// Live updates if the popup stays open during a run
+chrome.storage.onChanged.addListener((changes, area) => {
+  if (area === 'local' && changes.silentTestResults)
+    _renderDiagResults(changes.silentTestResults.newValue);
+});
+
+document.getElementById('runDiagnosticBtn')?.addEventListener('click', () => {
+  const btn = document.getElementById('runDiagnosticBtn');
+  const container = document.getElementById('stDiagResults');
+  if (btn) { btn.disabled = true; btn.textContent = '🧪 Running…'; }
+  if (container) container.innerHTML = '<div class="st-test-running">⏳ Starting — opening platforms in minimised windows…</div>';
+  // Persist flag so settings auto-reopens to the Tests drawer if the popup closes
+  chrome.storage.local.set({ settingsReopenToDiag: true }, () => {
+    chrome.runtime.sendMessage({ type: 'RUN_DIAGNOSTICS' }, () => {
+      chrome.storage.local.remove('settingsReopenToDiag');
+      loadDiagResults();
     });
   });
-})();
+});
 
 // ════════════════════════════════════════════════════════════════════════════
 // ONBOARDING
@@ -213,13 +533,16 @@ document.querySelectorAll('.ob-btn-next').forEach(btn => {
   btn.addEventListener('click', () => goObStep(parseInt(btn.dataset.to)));
 });
 
-// Skip API key
+// Skip / Continue from API keys step — advance to completion screen
 document.getElementById('obSkipKey')?.addEventListener('click', () => {
-  showObComplete(false);
+  showObComplete(!!API_KEY);
   goObStep(4);
 });
+document.getElementById('obKeyContinue')?.addEventListener('click', () => {
+  showObComplete(!!API_KEY);
+});
 
-// Save API key in onboarding
+// Save Google API key in onboarding
 document.getElementById('obSaveKey')?.addEventListener('click', () => {
   const input  = document.getElementById('obApiKeyInput');
   const status = document.getElementById('obKeyStatus');
@@ -228,19 +551,32 @@ document.getElementById('obSaveKey')?.addEventListener('click', () => {
   if (status) { status.className='ob-key-status'; status.textContent='Saving…'; }
   chrome.storage.local.set({ googleApiKey: val }, () => {
     API_KEY = val;
-    if (status) { status.className='ob-key-status ok'; status.textContent='✓ Key saved!'; }
-    setTimeout(() => { showObComplete(true); goObStep(4); }, 700);
+    if (status) { status.className='ob-key-status ok'; status.textContent='✓ Google key saved!'; }
+  });
+});
+
+// Save Foursquare API key in onboarding
+document.getElementById('obSaveFsqKey')?.addEventListener('click', () => {
+  const input  = document.getElementById('obFsqKeyInput');
+  const status = document.getElementById('obFsqKeyStatus');
+  const val = (input?.value || '').trim();
+  if (!val) { if (status) { status.className='ob-key-status err'; status.textContent='Please enter an API key.'; } return; }
+  if (status) { status.className='ob-key-status'; status.textContent='Saving…'; }
+  chrome.storage.local.set({ foursquareApiKey: val }, () => {
+    if (status) { status.className='ob-key-status ok'; status.textContent='✓ Foursquare key saved!'; }
   });
 });
 
 function showObComplete(hasKey) {
   const el = document.getElementById('obFeatureStatus');
   if (!el) return;
-  const features = buildFeatureStatus(hasKey);
-  el.innerHTML = features.map(f => `
-    <div class="ob-feat ${f.on ? 'enabled' : 'disabled'}">
-      ${f.on ? '✅' : '⚠️'} ${f.label}${f.note ? ` <em style="font-size:.67rem">${f.note}</em>` : ''}
-    </div>`).join('');
+  chrome.storage.local.get({ foursquareApiKey: '' }, ({ foursquareApiKey }) => {
+    const features = buildFeatureStatus(hasKey, !!foursquareApiKey);
+    el.innerHTML = features.map(f => `
+      <div class="ob-feat ${f.on ? 'enabled' : 'disabled'}">
+        ${f.on ? '✅' : '⚠️'} ${f.label}${f.note ? ` <em style="font-size:.67rem">${f.note}</em>` : ''}
+      </div>`).join('');
+  });
 }
 
 // Finish onboarding
@@ -252,14 +588,27 @@ document.getElementById('obFinishBtn')?.addEventListener('click', () => {
   });
 });
 
-// ── Check on popup open whether to show onboarding ───────────────────────────
-chrome.storage.local.get({ hasSeenOnboarding: false, googleApiKey: '' }, ({ hasSeenOnboarding, googleApiKey }) => {
+// ── Check on popup open whether to show onboarding or reopen settings ────────
+chrome.storage.local.get({ hasSeenOnboarding: false, googleApiKey: '', settingsReopenToDiag: false }, ({ hasSeenOnboarding, googleApiKey, settingsReopenToDiag }) => {
   if (!hasSeenOnboarding) {
     showOnboarding();
-    // Pre-fill step 3 if key already exists (unlikely on first run but safe)
     if (googleApiKey) {
       const input = document.getElementById('obApiKeyInput');
       if (input) input.value = googleApiKey;
+    }
+    return;
+  }
+  // If the user ran a diagnostic test and the popup closed mid-run, reopen settings
+  // to the Tests drawer so they can see the results without any extra clicks.
+  if (settingsReopenToDiag) {
+    chrome.storage.local.remove('settingsReopenToDiag');
+    openSettings();
+    // Open the Tests drawer
+    const diagHdr  = document.getElementById('stDiagHdr');
+    const diagBody = document.getElementById('stDiagBody');
+    if (diagHdr && diagBody) {
+      diagHdr.classList.remove('collapsed');
+      diagBody.classList.remove('collapsed');
     }
   }
 });
@@ -646,6 +995,12 @@ $("saveKeyBtn").addEventListener("click", () => {
     API_KEY = key;
     showKeySetup(false);
   });
+});
+
+document.getElementById('saveFsqKeyBtn')?.addEventListener('click', () => {
+  const key = document.getElementById('fsqKeyInput')?.value.trim();
+  if (!key) return;
+  chrome.storage.local.set({ foursquareApiKey: key });
 });
 
 $("changeKeyBtn").addEventListener("click", () => {
