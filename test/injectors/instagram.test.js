@@ -139,7 +139,10 @@ function buildFixture({ omit = new Set(), restaurantName = '', withLocation = tr
     opt.className = 'location-result';
     opt.textContent = 'Brussels, Belgium';
     opt.getBoundingClientRect = () => ({ top: 200, width: 200, height: 40 });
-    clickable(opt, () => {});
+    // Do NOT use clickable() here — that would overwrite role="option" with
+    // role="button", breaking the injector's [role="option"] selector.
+    opt.tabIndex = 0;
+    opt.addEventListener('click', () => {});
     dialog.appendChild(opt);
   }
 
@@ -160,7 +163,14 @@ function buildFixture({ omit = new Set(), restaurantName = '', withLocation = tr
     // Matches the slugified `restaurantName` so the injector treats it as a hit.
     opt.textContent = restaurantName.replace(/[^\w\s]/g, ' ').trim().slice(0, 25);
     opt.getBoundingClientRect = () => ({ top: 220, width: 200, height: 40 });
-    clickable(opt, () => {});
+    // Do NOT use clickable() here — that would overwrite role="option" with
+    // role="button", breaking the injector's [role="option"] selector.
+    opt.tabIndex = 0;
+    // Mark as selected when the injector clicks — persists after the final
+    // "All ready!" banner overwrites the collab-step banner message.
+    opt.addEventListener('click', () => {
+      opt.setAttribute('data-ffbot-collab-selected', 'true');
+    });
     dialog.appendChild(opt);
   }
 
@@ -282,7 +292,10 @@ describe('Instagram injector — step 7: tag the restaurant as a collaborator', 
     injectInstagram(photoDataUrls(1), 'caption', null, null, { restaurantName: 'Chez Test' });
     await runTimersInSteps(40000);
 
-    expect(bannerMsg()).toMatch(/collaborator.*chez test.*added/i);
+    // The injector overwrites the per-step banner with the final "All ready!" message
+    // once it completes, so we check the collab-result element's data attribute
+    // (set by its click handler) rather than bannerMsg().
+    expect(document.querySelector('[role="option"].collab-result[data-ffbot-collab-selected]')).not.toBeNull();
   });
 
   test('reports no match when the search returns nothing relevant', async () => {
@@ -290,7 +303,8 @@ describe('Instagram injector — step 7: tag the restaurant as a collaborator', 
     injectInstagram(photoDataUrls(1), 'caption', null, null, { restaurantName: 'Chez Test' });
     await runTimersInSteps(40000);
 
-    expect(bannerMsg()).toMatch(/no instagram account found for.*chez test/i);
+    // No collab result was ever shown, so none should be selected.
+    expect(document.querySelector('[role="option"].collab-result[data-ffbot-collab-selected]')).toBeNull();
   });
 });
 

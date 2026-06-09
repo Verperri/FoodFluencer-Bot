@@ -17,6 +17,20 @@ function listenerSet() {
   return { addListener: jest.fn(), removeListener: jest.fn(), hasListener: jest.fn() };
 }
 
+// jsdom doesn't implement Element.prototype.innerText (it always returns undefined).
+// Injector code uses `el.innerText || el.textContent` so undefined falls through,
+// but TikTok's location trigger-verification path reads innerText to detect that
+// the trigger's label changed after a location result was clicked.  Polyfill as a
+// textContent alias — safe for tests because all fixture elements use plain text.
+if (typeof Element !== 'undefined' && !('innerText' in Element.prototype)) {
+  Object.defineProperty(Element.prototype, 'innerText', {
+    get() { return this.textContent; },
+    set(v) { this.textContent = v; },
+    configurable: true,
+    enumerable: false,
+  });
+}
+
 // jsdom doesn't implement scrollIntoView / scrollTo / scrollBy — background.js
 // calls captionEl.scrollIntoView(...) before filling the caption field.
 // Stub them as no-ops so the injectors can proceed without throwing.
