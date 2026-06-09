@@ -18,8 +18,8 @@ function buildFeatureStatus(hasKey) {
     { label: 'DuckDuckGo image search',     on: true  },
     { label: 'Yelp photo scraping',         on: true  },
     { label: 'Google Places API (source 4)',on: hasKey, note: hasKey ? '' : ' — add API key to enable' },
-    { label: 'Automatic business discovery',on: hasKey, note: hasKey ? '' : ' — add API key to enable' },
-    { label: 'Scheduled auto-posting',      on: hasKey, note: hasKey ? '' : ' — add API key to enable' },
+    { label: 'Automatic business discovery',on: true },
+    { label: 'Scheduled auto-posting',      on: true },
   ];
 }
 
@@ -45,7 +45,7 @@ function openSettings() {
     const status = document.getElementById('settingsKeyStatus');
     if (status) {
       status.className = 'settings-key-status ' + (googleApiKey ? 'ok' : 'warn');
-      status.textContent = googleApiKey ? '✓ API key saved' : '⚠ No API key — 3 of 4 image sources active';
+      status.textContent = googleApiKey ? '✓ API key saved' : 'ℹ No API key — 3 of 4 image sources active (optional)';
     }
     renderFeatureStatus('settingsFeatures', !!googleApiKey);
   });

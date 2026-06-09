@@ -1,61 +1,150 @@
 # FoodFluencer Bot — Setup Guide
 
-Retrieves the top 3–5 photos for any restaurant in Belgium and exports them to a local folder with a metadata note.
+FoodFluencer Bot is a Chrome extension that finds top restaurant photos and
+auto-posts them to Instagram, Facebook, and TikTok.
 
-## 1. Get a Google Places API key (free)
+---
+
+## Prerequisites
+
+Install these before anything else.
+
+| Tool | Version | Download |
+|---|---|---|
+| **Google Chrome** | Any current release | [chrome.com](https://www.google.com/chrome/) |
+| **Node.js (LTS)** | 20 or higher | [nodejs.org](https://nodejs.org) |
+| **Git** | Any current release | [git-scm.com](https://git-scm.com) |
+
+> Node.js bundles **npm**. After installing, verify both are available:
+> ```bash
+> node --version
+> npm --version
+> ```
+
+---
+
+## 1. Clone the repository
+
+```bash
+git clone https://github.com/Verperri/FoodFluencer-Bot.git
+cd FoodFluencer-Bot
+```
+
+---
+
+## 2. Install dependencies
+
+```bash
+npm install
+```
+
+This installs Jest and all test dependencies. Run this once after cloning and
+again after any `package.json` change.
+
+---
+
+## 3. Configure your Google Places API key (optional)
+
+A Google Places API key is **not required** to use the bot. All core features —
+automatic business discovery, photo retrieval, and scheduled auto-posting —
+work without one using free scraping sources (Google Maps, DuckDuckGo, Yelp).
+
+The API key unlocks a fourth photo source (Google Places API) as an additional
+fallback when all three scraping sources return fewer photos than needed.
+
+To add one later:
 
 1. Go to [console.cloud.google.com](https://console.cloud.google.com) and sign in.
 2. Create a new project (or select an existing one).
-3. In the left menu go to **APIs & Services → Library**.
-4. Search for and enable **Places API**.
-5. Go to **APIs & Services → Credentials** → **+ Create Credentials → API key**.
-6. Copy the generated key.
+3. Go to **APIs & Services → Library**, search for and enable **Places API (New)**.
+4. Go to **APIs & Services → Credentials → + Create Credentials → API key**.
+5. Paste the key into the extension's settings panel (gear icon in the popup).
 
-> Free tier gives $200/month credit — roughly 5,000–10,000 restaurant searches for free.
+> The free tier includes $200/month credit — more than enough for occasional
+> use as a supplemental photo source.
 
-## 2. Configure the key
+---
 
-```bash
-cp .env.example .env
-```
+## 4. Load the extension in Chrome
 
-Open `.env` and replace the placeholder:
+1. Open Chrome and navigate to `chrome://extensions`.
+2. Enable **Developer mode** (toggle in the top-right corner).
+3. Click **Load unpacked** and select the root folder of this repository.
+4. The FoodFluencer Bot icon will appear in your Chrome toolbar.
 
-```
-GOOGLE_API_KEY=AIza...your_key_here
-```
+The extension reloads automatically when you edit source files — just click
+the refresh icon on `chrome://extensions` if changes don't appear.
 
-## 3. Install dependencies
+---
 
-```bash
-pip install -r requirements.txt
-```
-
-## 4. Run
+## 5. Run the test suite
 
 ```bash
-python app.py
+npm test
 ```
 
-Open your browser at **http://localhost:5000**
+This runs all Jest test suites under `test/`. All tests must pass before
+merging or opening a pull request (enforced automatically — see below).
 
-## How it works
+---
 
-1. Type a restaurant name (e.g. `Comme Chez Soi, Brussels` or `De Vitrine, Ghent`).
-2. Click **Search** — the top result in Belgium is shown with a preview of up to 5 photos.
-3. Click **Export Photos** — images are saved to `exports/<restaurant>_<timestamp>/` along with an `info.txt` note containing the name and address.
-4. All exports are logged to `logs/export_log.csv`.
+## Development workflow
 
-## Output structure
+### Branching
+
+Branches follow the version naming convention: `V2.3`, `V2.4`, etc.
+
+```bash
+git checkout main
+git checkout -b V2.x        # start a new feature branch
+```
+
+### Pre-merge / pre-PR test gate
+
+A Claude Code hook in `.claude/settings.local.json` automatically runs
+`npm test` before every `git merge` or `gh pr create` command. If any test
+fails the operation is blocked with a clear error message. **There are no
+exceptions** — fix failing tests before merging.
+
+### Pull requests
+
+Always create a PR against `main` rather than merging locally:
+
+```bash
+gh pr create --base main --title "V2.x — short description" --body "..."
+```
+
+The test gate runs automatically before the PR is created.
+
+---
+
+## Project structure
 
 ```
-exports/
-  comme_chez_soi_20260602_143021/
-    photo_01.jpg
-    photo_02.jpg
-    photo_03.jpg
-    info.txt          ← name, address, timestamp
-logs/
-  export_log.csv      ← running history of all exports
-  app.log             ← server log
+FoodFluencer-Bot/
+├── background.js        # Service worker — photo waterfall, auto-post logic
+├── popup.js             # Extension popup — manual post flow, UI
+├── popup.html / .css    # Popup UI
+├── manifest.json        # Chrome extension manifest (MV3)
+├── config.js            # Shared constants
+├── diagnostics.html/js  # Built-in diagnostic tool
+├── test/
+│   ├── injectors/       # Jest tests for Facebook, Instagram, TikTok injectors
+│   └── setup/           # Jest environment mocks (Chrome API, WebCodecs)
+├── jest.config.js       # Jest configuration
+├── package.json         # npm scripts and dev dependencies
+├── .env.example         # API key template
+└── SETUP.md             # This file
 ```
+
+---
+
+## Troubleshooting
+
+| Problem | Fix |
+|---|---|
+| `npm: command not found` | Install Node.js from [nodejs.org](https://nodejs.org), then reopen your terminal |
+| `npm install` fails | Delete `node_modules/` and `package-lock.json`, then re-run `npm install` |
+| Extension not updating | Click the refresh icon on `chrome://extensions` |
+| API key errors | Confirm `Places API (New)` is enabled in Google Cloud Console and the key is in `.env` |
+| Tests blocked by hook | Run `npm test` locally, fix all failures, then retry the merge/PR |

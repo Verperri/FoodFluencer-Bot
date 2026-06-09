@@ -100,40 +100,171 @@ async function getApiKey() {
   return new Promise(res => chrome.storage.local.get({ googleApiKey:"" }, d => res(d.googleApiKey)));
 }
 
+// ── Business discovery waterfall ──────────────────────────────────────────────
+// Tries sources in priority order, stopping as soon as one yields a result.
+//
+//  1. Google Maps search page   — no key needed; extracts displayName /
+//     formattedAddress / rating from the JSON Google embeds in the HTML,
+//     using the same field names as the Places API response.
+//  2. Yelp search page          — no key needed; extracts business slugs as a
+//     lighter fallback when Maps is unavailable or returns no parseable data.
+//  3. Google Places API         — only attempted when an API key is configured;
+//     delivers the richest structured data including photo references.
+//  4. City fallback             — always available; returns a synthetic place so
+//     the photo waterfall can still run and find real images.
 async function searchAutoPlaceBG(config, apiKey) {
-  const typeQ   = AB_TYPE_QUERY_BG[config.type] || "restaurant";
-  const country = AB_COUNTRY_NAMES_BG[config.country] || "Belgium";
-  const bounds  = AB_BOUNDS_BG[config.country] || AB_BOUNDS_BG.BE;
-  const region  = config.region || "";
-  // When no specific region is selected, anchor to a random city so each call
-  // returns a completely different result set (country-wide queries always
-  // return the same top-20 popular places).
-  const locPart = region ? `${region}, ${country}` : `${pickRandomCity(config.country)}, ${country}`;
+  const typeQ      = AB_TYPE_QUERY_BG[config.type] || "restaurant";
+  const country    = AB_COUNTRY_NAMES_BG[config.country] || "Belgium";
+  const city       = config.region || pickRandomCity(config.country);
+  const minStars   = parseFloat(config.minStars   || "4");
+  const minRatings = parseInt (config.minRatings  || "100", 10);
 
-  const res = await fetch(AB_PLACES_SEARCH, {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-      "X-Goog-Api-Key": apiKey,
-      "X-Goog-FieldMask": "places.id,places.displayName,places.formattedAddress,places.rating,places.userRatingCount,places.googleMapsUri,places.photos",
-    },
-    body: JSON.stringify({
-      textQuery: `${typeQ} in ${locPart}`,
-      maxResultCount: 20,
-      minRating: parseFloat(config.minStars || "4"),
-      locationRestriction: { rectangle: bounds },
-    }),
-  });
-  const data = await res.json();
-  if (!data.places?.length) throw new Error(`No ${typeQ}s found in ${locPart}`);
+  bgLog('info', `AutoSearch: looking for ${typeQ} in ${city}, ${country}`);
+  TechLog.info('SEARCH', 'auto_search_start', { type: typeQ, city, country, source: 'scrape' });
 
-  const minRatings = parseInt(config.minRatings || "100", 10);
-  const minPics    = parseInt(config.minPics    || "3",   10);
-  const filtered   = data.places.filter(p =>
-    (p.userRatingCount || 0) >= minRatings && (p.photos || []).length >= minPics
-  );
-  const pool = filtered.length ? filtered : data.places;
-  return pool[Math.floor(Math.random() * pool.length)];
+  // ── 1. Google Maps search HTML ─────────────────────────────────────────────
+  try {
+    const query = `${typeQ} in ${city} ${country}`;
+    const html  = await Promise.race([
+      fetch(`https://www.google.com/maps/search/${encodeURIComponent(query)}`,
+        { headers: { 'User-Agent': SCRAPE_UA, 'Accept-Language': 'en-US,en;q=0.9' } })
+        .then(r => { if (!r.ok) throw new Error(`HTTP ${r.status}`); return r.text(); }),
+      new Promise((_, rej) => setTimeout(() => rej(new Error('timeout')), 10000)),
+    ]);
+
+    // Google Maps embeds business data using the same field names as the Places
+    // API — extract them directly with regex.
+    const names     = [...html.matchAll(/"displayName":\{"text":"([^"]{3,80})"/g)].map(m => m[1]);
+    const addrs     = [...html.matchAll(/"formattedAddress":"([^"]{10,150})"/g)].map(m => m[1]);
+    const ratings   = [...html.matchAll(/"rating":([\d.]+)/g)].map(m => parseFloat(m[1]));
+    const revCounts = [...html.matchAll(/"userRatingCount":(\d+)/g)].map(m => parseInt(m[1], 10));
+
+    if (names.length) {
+      const candidates = names.map((name, i) => ({
+        displayName:      { text: name },
+        formattedAddress: addrs[i]     || `${city}, ${country}`,
+        rating:           ratings[i]   || 0,
+        userRatingCount:  revCounts[i] || 0,
+        photos: [],
+      }));
+      const filtered = candidates.filter(p => p.rating >= minStars && p.userRatingCount >= minRatings);
+      const pool     = filtered.length ? filtered : candidates;
+      const pick     = pool[Math.floor(Math.random() * pool.length)];
+      bgLog('info', `AutoSearch[Maps]: ${candidates.length} found, ${filtered.length} quality — picked "${pick.displayName.text}"`);
+      TechLog.info('SEARCH', 'auto_search_done', {
+        source: 'maps_scrape', total: candidates.length, quality: filtered.length,
+        picked: pick.displayName.text,
+      });
+      return pick;
+    }
+    bgLog('warn', 'AutoSearch[Maps]: no parseable businesses in HTML — trying Yelp');
+  } catch(e) {
+    bgLog('warn', `AutoSearch[Maps] failed: ${e.message} — trying Yelp`);
+    TechLog.warn('SEARCH', 'auto_search_error', { source: 'maps_scrape', error: e.message });
+  }
+
+  // ── 2. Yelp search page ────────────────────────────────────────────────────
+  try {
+    const html = await Promise.race([
+      fetch(
+        `https://www.yelp.com/search?find_desc=${encodeURIComponent(typeQ)}&find_loc=${encodeURIComponent(`${city}, ${country}`)}`,
+        { headers: { 'User-Agent': SCRAPE_UA, 'Accept-Language': 'en-US,en;q=0.9' } })
+        .then(r => { if (!r.ok) throw new Error(`HTTP ${r.status}`); return r.text(); }),
+      new Promise((_, rej) => setTimeout(() => rej(new Error('timeout')), 10000)),
+    ]);
+
+    if (/datadome|are you a robot/i.test(html)) throw new Error('DataDome block');
+
+    // Extract business slugs and convert to human-readable names.
+    // Slug format: "le-pain-quotidien-brussels-3" → "Le Pain Quotidien"
+    const slugs = [...new Set(
+      [...html.matchAll(/href="\/biz\/([a-z0-9][a-z0-9-]{3,60})(?:[?"#][^"]*)?"/g)].map(m => m[1])
+    )];
+
+    if (slugs.length) {
+      const toName = slug => slug
+        .replace(/-\d+$/, '')   // drop trailing numeric suffix
+        .split('-')
+        .map(w => w.charAt(0).toUpperCase() + w.slice(1))
+        .join(' ');
+
+      const candidates = slugs.slice(0, 12).map(slug => ({
+        displayName:      { text: toName(slug) },
+        formattedAddress: `${city}, ${country}`,
+        rating:           0,
+        userRatingCount:  0,
+        photos:           [],
+      }));
+      const pick = candidates[Math.floor(Math.random() * candidates.length)];
+      bgLog('info', `AutoSearch[Yelp]: ${candidates.length} slugs — picked "${pick.displayName.text}"`);
+      TechLog.info('SEARCH', 'auto_search_done', {
+        source: 'yelp_scrape', total: candidates.length, picked: pick.displayName.text,
+      });
+      return pick;
+    }
+    bgLog('warn', 'AutoSearch[Yelp]: no slugs found');
+  } catch(e) {
+    bgLog('warn', `AutoSearch[Yelp] failed: ${e.message}`);
+    TechLog.warn('SEARCH', 'auto_search_error', { source: 'yelp_scrape', error: e.message });
+  }
+
+  // ── 3. Google Places API ──────────────────────────────────────────────────
+  // Only attempted when an API key is configured. Skipped entirely otherwise
+  // so no quota is consumed for users without a key.
+  if (apiKey) {
+    try {
+      bgLog('info', `AutoSearch[Places API] fallback for ${typeQ} in ${city}`);
+      const bounds  = AB_BOUNDS_BG[config.country] || AB_BOUNDS_BG.BE;
+      const locPart = `${city}, ${country}`;
+      const res = await Promise.race([
+        fetch(AB_PLACES_SEARCH, {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            'X-Goog-Api-Key': apiKey,
+            'X-Goog-FieldMask': 'places.displayName,places.formattedAddress,places.rating,places.userRatingCount,places.photos',
+          },
+          body: JSON.stringify({
+            textQuery: `${typeQ} in ${locPart}`,
+            maxResultCount: 20,
+            minRating: minStars,
+            locationRestriction: { rectangle: bounds },
+          }),
+        }).then(r => { if (!r.ok) throw new Error(`HTTP ${r.status}`); return r.json(); }),
+        new Promise((_, rej) => setTimeout(() => rej(new Error('timeout')), 10000)),
+      ]);
+
+      if (res.places?.length) {
+        const filtered = res.places.filter(p =>
+          (p.userRatingCount || 0) >= minRatings
+        );
+        const pool = filtered.length ? filtered : res.places;
+        const pick = pool[Math.floor(Math.random() * pool.length)];
+        bgLog('info', `AutoSearch[Places API]: ${res.places.length} found, ${filtered.length} quality — picked "${pick.displayName?.text}"`);
+        TechLog.info('SEARCH', 'auto_search_done', {
+          source: 'places_api', total: res.places.length, quality: filtered.length,
+          picked: pick.displayName?.text,
+        });
+        return pick;
+      }
+    } catch(e) {
+      bgLog('warn', `AutoSearch[Places API] failed: ${e.message}`);
+      TechLog.warn('SEARCH', 'auto_search_error', { source: 'places_api', error: e.message });
+    }
+  }
+
+  // ── 4. City fallback ───────────────────────────────────────────────────────
+  // All discovery sources failed. Return a city-level placeholder so the photo
+  // waterfall can still run and produce real images for the post.
+  bgLog('warn', `AutoSearch: all sources failed — using city fallback (${city})`);
+  TechLog.warn('SEARCH', 'auto_search_fallback', { city, type: typeQ });
+  return {
+    displayName:      { text: `${typeQ} ${city}` },
+    formattedAddress: `${city}, ${country}`,
+    rating:           0,
+    userRatingCount:  0,
+    photos:           [],
+  };
 }
 
 async function resolvePhotoUriBG(photoName, maxWidth, apiKey) {
@@ -701,8 +832,9 @@ async function autoPostNow(postIndex) {
   const config = data.autoBotConfig;
   if (!post || !config) return;
 
+  // API key is optional — used only as a last-resort photo source in the
+  // waterfall. Discovery and the first three photo sources work without one.
   const apiKey = await getApiKey();
-  if (!apiKey) { bgLog("error","Auto Bot: no API key configured"); return; }
 
   await updateRunLogStatus(postIndex, "triggered");
 
