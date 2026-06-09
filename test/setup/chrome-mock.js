@@ -3,6 +3,16 @@
 // onMessage) — those just need to be callable; the injector functions we test
 // don't exercise them.
 
+// jest-environment-jsdom v29 / jsdom v20 does NOT expose TextEncoder or
+// TextDecoder as globals (they were removed from the automatic Node→jsdom
+// bridge). background.js's muxMP4() uses `new TextEncoder()` directly, so
+// polyfill from Node's built-in `util` module before any test code runs.
+if (typeof TextEncoder === 'undefined') {
+  const { TextEncoder, TextDecoder } = require('util');
+  global.TextEncoder = TextEncoder;
+  global.TextDecoder = TextDecoder;
+}
+
 function listenerSet() {
   return { addListener: jest.fn(), removeListener: jest.fn(), hasListener: jest.fn() };
 }
@@ -56,8 +66,13 @@ if (typeof document !== 'undefined' && typeof document.execCommand !== 'function
 // backing store that can be set, mirroring what a real browser's setter does.
 if (typeof HTMLInputElement !== 'undefined') {
   const desc = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'files');
-  // Only patch if already defined (jsdom sets it up as a getter-only accessor)
-  if (desc && typeof desc.set !== 'function') {
+  // Override jsdom's built-in setter: jsdom v20 HAS a setter but it validates
+  // its argument as a FileList and rejects our plain-array mock, throwing
+  //   "The provided value is not of type 'FileList'"
+  // We need to replace it with one that accepts any array-like. Only do so
+  // when the existing descriptor is configurable (so Object.defineProperty
+  // won't throw).
+  if (desc && desc.configurable) {
     Object.defineProperty(HTMLInputElement.prototype, 'files', {
       configurable: true,
       enumerable: true,

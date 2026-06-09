@@ -1994,50 +1994,66 @@ function injectInstagram(photoDataUrls, caption, songName, location, opts) {
     if (!createBtn) {
       step(1, total, 'Could not find the <strong>+</strong> Create button. Please click it manually.', 'warn');
       dbg('FAILED: create button not found after 8s');
+      // Don't overwrite the guidance banner — fall through to waitFor('[role="dialog"]')
+      // so the bot resumes automatically once the user navigates to the upload dialog.
     } else {
       dbg(`Clicking create button: ${createBtn.tagName} aria="${createBtn.getAttribute('aria-label')}"`);
       createBtn.click();
-    }
 
-    // ══ STEP 1b: Snapshot pre-existing "Post" elements, then find the NEW one ═══
-    // Snapshot BEFORE the panel animates in
-    const prePostEls = new Set(
-      [...document.querySelectorAll('*')]
-        .filter(el => (el.innerText || el.textContent || '').trim() === 'Post')
-    );
-    dbg(`Snapshot: ${prePostEls.size} existing elements with text "Post"`);
+      // ══ STEP 1b: Snapshot pre-existing "Post" elements, then find the NEW one ═══
+      // Snapshot taken IMMEDIATELY after clicking — before the menu animates in.
+      // We record every element whose visible text is exactly "Post" so we can
+      // distinguish the new menu item (added by Instagram) from anything pre-existing.
+      const prePostEls = new Set(
+        [...document.querySelectorAll('*')]
+          .filter(el => (el.innerText || el.textContent || '').trim() === 'Post')
+      );
+      dbg(`Snapshot: ${prePostEls.size} existing elements with text "Post"`);
 
-    step(1, total, 'Waiting for Post/Story/Reel menu to appear…');
-    await sleep(700);
+      step(1, total, 'Waiting for Post/Story/Reel menu to appear…');
+      await sleep(700);
 
-    async function findAndClickPostOption() {
-      // Find elements with text "Post" that did NOT exist before we clicked Create
-      const newPostEls = [...document.querySelectorAll('*')]
-        .filter(el => (el.innerText || el.textContent || '').trim() === 'Post' && !prePostEls.has(el));
+      async function findAndClickPostOption() {
+        // Find NEW elements with text exactly "Post" — exclude pre-existing ones AND
+        // exclude container ancestors whose textContent equals "Post" only because a
+        // CHILD element does (innerText is not implemented in jsdom, so we can't use
+        // it; instead we filter to the innermost match: an element is "innermost" if
+        // none of its direct children also has textContent === "Post").
+        const newPostEls = [...document.querySelectorAll('*')]
+          .filter(el => {
+            const txt = (el.innerText || el.textContent || '').trim();
+            if (txt !== 'Post') return false;
+            if (prePostEls.has(el)) return false;
+            // Exclude containers — only keep leaf / innermost matches
+            return ![...el.children].some(
+              child => (child.innerText || child.textContent || '').trim() === 'Post'
+            );
+          });
 
-      dbg(`Found ${newPostEls.length} new "Post" element(s) after clicking Create`);
+        dbg(`Found ${newPostEls.length} new "Post" element(s) after clicking Create`);
 
-      if (newPostEls.length > 0) {
-        // Pick the first one and find its clickable ancestor
-        const target = newPostEls[0].closest('a,[role="button"],button,[tabindex]') || newPostEls[0];
-        dbg(`Clicking: ${target.tagName} class="${target.className.toString().slice(0,40)}"`);
-        target.click();
-        return true;
+        if (newPostEls.length > 0) {
+          // Pick the first one and find its nearest clickable ancestor (or itself)
+          const target = newPostEls[0].closest('a,[role="button"],button,[tabindex]') || newPostEls[0];
+          dbg(`Clicking: ${target.tagName} class="${target.className.toString().slice(0,40)}"`);
+          target.click();
+          return true;
+        }
+        return false;
       }
-      return false;
-    }
 
-    let postClicked = false;
-    for (let i = 0; i < 10 && !postClicked; i++) {
-      postClicked = await findAndClickPostOption();
-      if (!postClicked) { dbg(`Retry ${i + 1}/10 — post option not visible yet`); await sleep(350); }
-    }
+      let postClicked = false;
+      for (let i = 0; i < 10 && !postClicked; i++) {
+        postClicked = await findAndClickPostOption();
+        if (!postClicked) { dbg(`Retry ${i + 1}/10 — post option not visible yet`); await sleep(350); }
+      }
 
-    if (!postClicked) {
-      step(1, total, 'Please click <strong>Post</strong> from the menu — bot will continue when the upload dialog appears.', 'warn');
-      dbg('FAILED: Post option not found — waiting for dialog manually');
-    } else {
-      step(1, total, '"Post" clicked — waiting for upload dialog…');
+      if (!postClicked) {
+        step(1, total, 'Please click <strong>Post</strong> from the menu — bot will continue when the upload dialog appears.', 'warn');
+        dbg('FAILED: Post option not found — waiting for dialog manually');
+      } else {
+        step(1, total, '"Post" clicked — waiting for upload dialog…');
+      }
     }
 
     // Wait for the upload dialog to appear (has a file input or drag-drop area)
