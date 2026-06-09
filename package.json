@@ -1,0 +1,14 @@
+{
+  "name": "foodfluencer-bot",
+  "private": true,
+  "version": "1.0.0",
+  "description": "Tests for the FoodFluencer Chrome extension post-creation pipeline",
+  "scripts": {
+    "test": "jest",
+    "test:watch": "jest --watch"
+  },
+  "devDependencies": {
+    "jest": "^29.7.0",
+    "jest-environment-jsdom": "^29.7.0"
+  }
+}

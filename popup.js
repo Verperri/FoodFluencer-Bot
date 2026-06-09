@@ -143,10 +143,39 @@ document.getElementById('settingsShowOnboarding')?.addEventListener('click', () 
   showOnboarding();
 });
 
-// ── Diagnostics (placeholder — full E2E test suite coming later) ─────────────
-// The "Run Diagnostic Test" button is currently disabled in the UI.
-// When implemented it will run a full end-to-end pipeline check without
-// writing to the activity log, verifying each platform silently.
+// ── Diagnostics ───────────────────────────────────────────────────────────────
+// Runs the silent feasibility probes (RUN_DIAGNOSTICS → testSilentInstagram /
+// testSilentTikTok, see background.js) that open each platform in a minimised
+// window and check whether the posting flow's key elements are reachable.
+// Read-only — nothing is posted and nothing is written to the activity log
+// (beyond DIAGNOSTIC entries in the technical log, for later export/monitoring).
+//
+// IMPORTANT: `chrome.windows.create()` steals OS focus, which makes Chrome
+// auto-close the extension *popup* — so running the test here would blank the
+// UI mid-run with no way to watch progress. Instead the button simply opens
+// `diagnostics.html` as a normal browser tab: a regular tab does NOT auto-close
+// on blur, so the user can leave it open across the whole run and watch the
+// "Test Case #N" checklist update live (it renders from
+// `chrome.storage.local.silentTestResults`, same storage-driven approach).
+// If a tab for this page is already open, we focus that one instead of
+// spawning duplicates.
+(() => {
+  const btn = document.getElementById('runDiagnosticBtn');
+  if (!btn) return;
+
+  const DIAG_URL = chrome.runtime.getURL('diagnostics.html');
+
+  btn.addEventListener('click', () => {
+    chrome.tabs.query({ url: DIAG_URL }, (tabs) => {
+      if (tabs && tabs.length) {
+        chrome.tabs.update(tabs[0].id, { active: true });
+        chrome.windows.update(tabs[0].windowId, { focused: true });
+      } else {
+        chrome.tabs.create({ url: DIAG_URL });
+      }
+    });
+  });
+})();
 
 // ════════════════════════════════════════════════════════════════════════════
 // ONBOARDING
