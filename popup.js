@@ -1,4 +1,11 @@
-﻿// ── Version footer ────────────────────────────────────────────────────────────
+﻿// ── HTML escaping helper (prevents XSS when inserting external data into innerHTML) ──
+function escapeHtml(s) {
+  return String(s ?? '').replace(/[&<>"']/g, c => (
+    { '&':'&amp;', '<':'&lt;', '>':'&gt;', '"':'&quot;', "'":'&#39;' }[c]
+  ));
+}
+
+// ── Version footer ────────────────────────────────────────────────────────────
 let CURRENT_VERSION = '';
 fetch('version.json').then(r => r.json()).then(v => {
   CURRENT_VERSION = `${v.branch} · ${v.commit}`;
@@ -374,6 +381,10 @@ const AppLog = {
   error: (msg, d) => AppLog._write("error", msg, d),
 };
 
+// Reused regex for extracting city from a formatted address
+// Matches "1234 CityName, Country" patterns across all supported countries.
+const CITY_FROM_ADDRESS_RE = /\d{4}\s+([A-Za-zÀ-ÿ\s-]+),\s*(?:Belgium|France|Germany|Luxembourg|(?:The )?Netherlands)/i;
+
 // ── State ─────────────────────────────────────────────────────────────────────
 
 let API_KEY           = "";
@@ -418,7 +429,7 @@ async function createCoverOverlay(imgUri, restaurantName, address) {
   return new Promise(resolve => {
     const img = new Image();
     img.crossOrigin = 'anonymous';
-    img.onload = () => {
+    img.onload = () => { try {
       const W = img.naturalWidth  || 900;
       const H = img.naturalHeight || 900;
       const canvas = document.createElement('canvas');
@@ -472,7 +483,7 @@ async function createCoverOverlay(imgUri, restaurantName, address) {
       const gap        = Math.round(nameSize * 0.42);
 
       // Extract city (for tagline + corner label only)
-      const cityM = address.match(/\d{4}\s+([A-Za-zÀ-ÿ\s-]+),\s*Belgium/i);
+      const cityM = address.match(CITY_FROM_ADDRESS_RE);
       const city  = (cityM?.[1] || address.split(',')[0] || '').trim();
       const tagline = getCoverTagline(restaurantName, city);
 
@@ -513,7 +524,7 @@ async function createCoverOverlay(imgUri, restaurantName, address) {
       const result = canvas.toDataURL('image/jpeg', 0.93);
       coverOverlayCache.set(key, result);
       resolve(result);
-    };
+    } catch(e) { resolve(null); } }; // try/catch ensures promise always resolves
     img.onerror = () => resolve(null);
     img.src = imgUri;
   });
@@ -545,6 +556,10 @@ function saveState() {
 // Debounced save for caption edits
 let _saveTimer = null;
 function saveStateSoon() { clearTimeout(_saveTimer); _saveTimer = setTimeout(saveState, 600); }
+
+// Tracks the most recent renderPhotoGrid call so stale in-flight photo resolves
+// from a previous restaurant don't write into the new grid.
+let _photoGridVersion = 0;
 
 function restoreState(saved) {
   if (!saved?.restaurant) return;
@@ -743,7 +758,10 @@ async function searchRestaurant(query) {
 
   if (!res.ok) {
     const err = await res.json().catch(() => ({}));
-    throw new Error(err?.error?.message || `API error ${res.status}`);
+    const msg = err?.error?.message || `API error ${res.status}`;
+    if (/quota|billing|exceeded|disabled|SERVICE_DISABLED/i.test(msg))
+      throw new Error(`⛔ Google API quota exceeded or billing issue — check your Google Cloud Console. (${msg})`);
+    throw new Error(msg);
   }
   const data = await res.json();
   if (!data.places?.length)
@@ -802,9 +820,13 @@ function renderResults(place) {
 }
 
 function renderPhotoGrid() {
-  const grid   = $("photoGrid");
-  const photos = currentRestaurant.photos;
+  const grid    = $("photoGrid");
+  const photos  = currentRestaurant.photos;
   grid.innerHTML = "";
+
+  // Stamp this render so any in-flight resolves from a previous restaurant
+  // that complete late can detect they're stale and bail out.
+  const myVersion = ++_photoGridVersion;
 
   photos.forEach((photo, i) => {
     const div = document.createElement("div");
@@ -818,8 +840,14 @@ function renderPhotoGrid() {
     } else {
       div.innerHTML = `<div class="loading-thumb">Loading…</div>`;
       resolvePhotoUri(photo.name, 400)
-        .then(uri => fillPhotoSlot(div, uri, i))
-        .catch(() => { div.innerHTML = `<div class="loading-thumb">Unavailable</div>`; });
+        .then(uri => {
+          if (_photoGridVersion !== myVersion) return; // stale — new restaurant loaded
+          fillPhotoSlot(div, uri, i);
+        })
+        .catch(() => {
+          if (_photoGridVersion !== myVersion) return;
+          div.innerHTML = `<div class="loading-thumb">Unavailable</div>`;
+        });
     }
   });
 }
@@ -842,7 +870,7 @@ function fillPhotoSlot(div, uri, index) {
       .then(overlayUri => {
         if (overlayUri) {
           const imgEl = div.querySelector('img');
-          if (imgEl && div.dataset.slot == index) imgEl.src = overlayUri;
+          if (imgEl && div.dataset.slot === String(index)) imgEl.src = overlayUri;
         }
       });
   }
@@ -897,7 +925,7 @@ async function dismissPhoto(index) {
 function getEngagementOpener() {
   if (!currentRestaurant) return "";
   const { name, address } = currentRestaurant;
-  const cityMatch   = address.match(/\d{4}\s+([A-Za-zÀ-ÿ\s-]+),\s*Belgium/i);
+  const cityMatch   = address.match(CITY_FROM_ADDRESS_RE);
   const cityDisplay = (cityMatch?.[1] || "Belgium").trim();
   const seed        = name.split("").reduce((a, c) => a + c.charCodeAt(0), 0);
   const openers = [
@@ -915,7 +943,7 @@ function buildDefaultCaption() {
   if (!currentRestaurant) return "";
   const { name, address, rating } = currentRestaurant;
 
-  const cityMatch   = address.match(/\d{4}\s+([A-Za-zÀ-ÿ\s-]+),\s*Belgium/i);
+  const cityMatch   = address.match(CITY_FROM_ADDRESS_RE);
   const cityDisplay = (cityMatch?.[1] || "Belgium").trim();
   const cityTag     = cityDisplay.replace(/\s+/g, "");
 
@@ -1651,7 +1679,10 @@ async function searchAutoPlace(type, country, region, minRatings = 0, minStars =
 
   if (!res.ok) {
     const err = await res.json().catch(() => ({}));
-    throw new Error(err?.error?.message || `API error ${res.status}`);
+    const msg = err?.error?.message || `API error ${res.status}`;
+    if (/quota|billing|exceeded|disabled|SERVICE_DISABLED/i.test(msg))
+      throw new Error(`⛔ Google API quota exceeded or billing issue — check your Google Cloud Console. (${msg})`);
+    throw new Error(msg);
   }
   const data = await res.json();
   if (!data.places?.length)
@@ -1681,7 +1712,7 @@ async function searchAutoPlace(type, country, region, minRatings = 0, minStars =
 // Builds a multilingual caption. Catchy opener + Name + Address use the selected
 // language. Hashtags and Song name are always in English.
 function getAutoCaption(name, address, type, language, captionOpts, songInfo = null) {
-  const cityM   = address.match(/\d{4}\s+([A-Za-zÀ-ÿ\s-]+),\s*(?:Belgium|France|Germany|Luxembourg|Netherlands)/i);
+  const cityM   = address.match(CITY_FROM_ADDRESS_RE);
   const city    = (cityM?.[1] || address.split(",")[0] || "").trim();
   const seed    = name.split("").reduce((a, c) => a + c.charCodeAt(0), 0);
   const tLabel  = type === "restaurant" ? "restaurant" : type === "hotel" ? "hotel" : "bar";
@@ -1788,22 +1819,22 @@ async function previewExamplePost() {
         <span class="auto-preview-lang">🌐 ${langLabels[settings.language] || settings.language}</span>
       </div>
       <div class="auto-preview-card">
-        <span class="auto-preview-name">${name}</span>
-        <span class="auto-preview-addr">${address}</span>
-        ${rating ? `<span class="auto-preview-rating">⭐ ${rating} · ${ratingCount.toLocaleString()} ratings</span>` : ""}
+        <span class="auto-preview-name">${escapeHtml(name)}</span>
+        <span class="auto-preview-addr">${escapeHtml(address)}</span>
+        ${rating ? `<span class="auto-preview-rating">⭐ ${escapeHtml(rating)} · ${ratingCount.toLocaleString()} ratings</span>` : ""}
       </div>
       <div class="auto-preview-photos" id="autoPreviewPhotos"></div>
       ${songInfo ? `
         <div class="auto-preview-song">
-          <img src="${songInfo.artwork}" alt="" />
+          <img src="${escapeHtml(songInfo.artwork)}" alt="" />
           <div class="auto-preview-song-info">
-            <span class="auto-preview-song-name">${songInfo.name}</span>
-            <span class="auto-preview-song-artist">${songInfo.artist}</span>
+            <span class="auto-preview-song-name">${escapeHtml(songInfo.name)}</span>
+            <span class="auto-preview-song-artist">${escapeHtml(songInfo.artist)}</span>
           </div>
-          <span class="auto-preview-genre-badge">${songInfo.genre}</span>
+          <span class="auto-preview-genre-badge">${escapeHtml(songInfo.genre)}</span>
         </div>` : ""}
-      ${caption ? `<div class="auto-preview-caption">${caption.replace(/\n/g, "<br>")}</div>` : ""}
-      <p class="auto-preview-note">${photos.length} photo${photos.length !== 1 ? "s" : ""} · ≥${settings.minRatings} ratings · ≥${settings.minStars}⭐</p>
+      ${caption ? `<div class="auto-preview-caption">${escapeHtml(caption).replace(/\n/g, "<br>")}</div>` : ""}
+      <p class="auto-preview-note">${photos.length} photo${photos.length !== 1 ? "s" : ""} · ≥${escapeHtml(settings.minRatings)} ratings · ≥${escapeHtml(settings.minStars)}⭐</p>
     `;
 
     // Load photos async
@@ -1888,14 +1919,26 @@ function saveAutoBotConfig() {
   chrome.storage.local.set({ autoBotConfig: config });
 }
 
+const AB_CONFIG_DEFAULTS = {
+  type: "restaurant", country: "BE", allRegions: true, regions: [],
+  minRatings: "100", minStars: "4", minPics: "5",
+  songGenre: "top100", language: "nl",
+  capCatchy: true, capName: true, capAddr: true, capHash: true, capSong: true,
+  freqNum: "1", freqPeriod: "day", freqRandom: false,
+  fromH: "05", fromM: "00", fromAP: "PM", toH: "10", toM: "00", toAP: "PM",
+  windowRandom: false, socialIG: true, socialFB: true, socialTT: false,
+};
+
 function loadAutoBotConfig() {
-  chrome.storage.local.get({ autoBotConfig: null }, ({ autoBotConfig: cfg }) => {
-    if (!cfg) return;
+  chrome.storage.local.get({ autoBotConfig: null }, ({ autoBotConfig: raw }) => {
+    if (!raw) return;
+    // Merge stored config over defaults so missing/corrupted keys fall back safely
+    const cfg = { ...AB_CONFIG_DEFAULTS, ...raw };
 
     const pill = (groupId, val) =>
       document.querySelectorAll(`#${groupId} .ab-pill`)
         .forEach(p => p.classList.toggle("active", p.dataset.val === val));
-    const sel = (id, val) => { const e = document.getElementById(id); if (e && val) e.value = val; };
+    const sel = (id, val) => { const e = document.getElementById(id); if (e && val != null) e.value = val; };
 
     pill("abType",  cfg.type);
     sel("abCountry", cfg.country);
@@ -2018,14 +2061,17 @@ function abGetWindowMinutes(windowCfg) {
 // Distribute `total` posts across `numDays` days respecting maxPerDay
 // Returns array of per-day counts
 function abDistributePostsAcrossDays(total, numDays, maxPerDay = 2) {
-  const perDay = new Array(numDays).fill(0);
-  let remaining = Math.min(total, maxPerDay * numDays);
-  let attempts = 0;
-  while (remaining > 0 && attempts < 10000) {
-    const d = Math.floor(Math.random() * numDays);
-    if (perDay[d] < maxPerDay) { perDay[d]++; remaining--; }
-    attempts++;
-  }
+  const capped  = Math.min(total, maxPerDay * numDays);
+  const base    = Math.floor(capped / numDays);   // every day gets at least this many
+  const extra   = capped % numDays;               // first `extra` days get one more
+
+  // Shuffle day indices so the extra posts land on random days rather than always
+  // the first N days — preserves the feel of random distribution without O(10000) retries.
+  const order = Array.from({ length: numDays }, (_, i) => i)
+    .sort(() => Math.random() - 0.5);
+
+  const perDay = new Array(numDays).fill(base);
+  for (let i = 0; i < extra; i++) perDay[order[i]]++;
   return perDay;
 }
 
@@ -2046,6 +2092,11 @@ function generateAutoBotSchedule(settings) {
   if (document.getElementById("abSocialIG")?.classList.contains("active")) platforms.push("instagram");
   if (document.getElementById("abSocialFB")?.classList.contains("active")) platforms.push("facebook");
   if (document.getElementById("abSocialTT")?.classList.contains("active")) platforms.push("tiktok");
+
+  if (platforms.length === 0) {
+    AppLog.warn("Auto Bot schedule: no platforms selected — schedule not generated");
+    return { generatedAt: new Date().toISOString(), period: freq.period, totalPosts: 0, platforms: [], posts: [] };
+  }
 
   const winBounds = abGetWindowMinutes(win);
 
@@ -2104,6 +2155,18 @@ function generateAutoBotSchedule(settings) {
   const now = new Date();
   posts.sort((a, b) => `${a.date}${a.time}`.localeCompare(`${b.date}${b.time}`));
   const futurePosts = posts.filter(p => new Date(`${p.date}T${p.time}:00`) > now);
+
+  if (futurePosts.length === 0 && posts.length > 0) {
+    // All generated times ended up in the past (e.g. user activated late at night
+    // with a narrow posting window that already closed today).
+    const schedBtn = document.getElementById("abScheduleBtn");
+    if (schedBtn) {
+      const origText = schedBtn.textContent;
+      schedBtn.textContent = "⚠️ All times already past — schedule a future window";
+      setTimeout(() => { schedBtn.textContent = origText; }, 6000);
+    }
+    AppLog.warn("Auto Bot schedule: all generated posts were in the past — no alarms will fire");
+  }
 
   const result = {
     generatedAt: new Date().toISOString(),
@@ -2213,8 +2276,13 @@ function activateBot() {
 
 function deactivateBot() {
   autoBotActive = false;
-  // Clear SCHEDULE data only — activityLog (persistent history) is preserved
-  chrome.storage.local.set({ autoBotActive: false, autoBotSchedule: null, autoBotRunLog: [] });
+  // Archive last schedule before clearing so the user can re-enable from where they left off.
+  // activityLog (persistent history) is always preserved.
+  chrome.storage.local.get({ autoBotSchedule: null }, ({ autoBotSchedule: prev }) => {
+    const updates = { autoBotActive: false, autoBotSchedule: null, autoBotRunLog: [] };
+    if (prev) updates.autoBotLastSchedule = prev;
+    chrome.storage.local.set(updates);
+  });
   chrome.alarms.clearAll();
   updateBotUI(false);
   // Reset schedule-specific UI
@@ -2320,8 +2388,8 @@ function renderScheduledPosts(schedule) {
       item.className = "ab-sched-item";
       item.id = `abSchedItem-${post.idx}`;
       item.innerHTML = `
-        <span class="ab-sched-time">${post.time}</span>
-        <span class="ab-sched-platforms">${plat}</span>
+        <span class="ab-sched-time">${escapeHtml(post.time)}</span>
+        <span class="ab-sched-platforms">${escapeHtml(plat)}</span>
         <span class="ab-sched-status ${isPast ? 'done' : 'pending'}" id="abSchedStatus-${post.idx}">
           ${isPast ? "✓ Done" : "⏳ Pending"}
         </span>`;
@@ -2363,6 +2431,9 @@ function updateNextPostLabel(schedule) {
   }
 }
 
+const ACTIVITY_LOG_MAX_ENTRIES = 2000; // prune floor for chrome.storage writes
+const ACTIVITY_LOG_DISPLAY_CAP = 500;  // max entries rendered at once to avoid DOM freeze
+
 // ── Activity log — reads from persistent activityLog, filtered by time ────────
 function refreshActivityLog(filter) {
   if (filter) activityLogFilter = filter;
@@ -2371,9 +2442,16 @@ function refreshActivityLog(filter) {
   const cutoff = new Date(now - (ms[activityLogFilter] || ms.month));
 
   chrome.storage.local.get({ activityLog:[] }, ({ activityLog }) => {
+    // Auto-prune oversized logs before reading so storage stays lean
+    if (activityLog.length > ACTIVITY_LOG_MAX_ENTRIES) {
+      const pruned = activityLog.slice(-ACTIVITY_LOG_MAX_ENTRIES);
+      chrome.storage.local.set({ activityLog: pruned });
+      activityLog = pruned;
+    }
     const counts = { instagram:0, facebook:0, tiktok:0 };
     activityLog
       .filter(e => e.status === "done" && new Date(e.ts) >= cutoff)
+      .slice(-ACTIVITY_LOG_DISPLAY_CAP)
       .forEach(e => { if (e.platform in counts) counts[e.platform]++; });
 
     const total = Object.values(counts).reduce((a,b) => a+b, 0);
