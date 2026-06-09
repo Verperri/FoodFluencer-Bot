@@ -296,21 +296,21 @@ async function generateSyntheticTestPhotoDataUrl() {
   const blob = await canvas.convertToBlob({ type: 'image/jpeg', quality: 0.85 });
   const ab = await blob.arrayBuffer();
   const bytes = new Uint8Array(ab);
-  let binary = '';
+  const parts = [];
   for (let i = 0; i < bytes.length; i += 8192)
-    binary += String.fromCharCode(...bytes.slice(i, i + 8192));
-  return `data:image/jpeg;base64,${btoa(binary)}`;
+    parts.push(String.fromCharCode(...bytes.slice(i, i + 8192)));
+  return `data:image/jpeg;base64,${btoa(parts.join(''))}`;
 }
 
-async function fetchAsDataUrl(url) {
-  const res  = await fetch(url);
+async function fetchAsDataUrl(url, signal) {
+  const res  = await fetch(url, signal ? { signal } : undefined);
   const blob = await res.blob();
   const ab   = await blob.arrayBuffer();
   const bytes = new Uint8Array(ab);
-  let binary = "";
+  const parts = [];
   for (let i = 0; i < bytes.length; i += 8192)
-    binary += String.fromCharCode(...bytes.slice(i, i + 8192));
-  return `data:${blob.type || "image/jpeg"};base64,${btoa(binary)}`;
+    parts.push(String.fromCharCode(...bytes.slice(i, i + 8192)));
+  return `data:${blob.type || "image/jpeg"};base64,${btoa(parts.join(''))}`;
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -431,6 +431,7 @@ async function scoreImageQuality(dataUrl) {
 // ═══════════════════════════════════════════════════════════════════════════════
 
 const SCRAPE_UA  = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36';
+const CITY_FROM_ADDRESS_RE_BG = /\d{4}\s+([A-Za-zÀ-ÿ\s-]+),/;
 const SCRAPE_MIN = 3;   // minimum usable photos before accepting a source
 
 function raceTimeout(promise, ms) {
@@ -600,7 +601,7 @@ async function scrapeYelpPhotos(businessName, city) {
 // that contributed photos. When multiple sources are needed, `photoLog` records
 // the origin of every individual photo for full TechLog traceability.
 async function fetchPhotosWaterfall(businessName, address, entityType, minPics, apiKey, placePhotoObjects) {
-  const cityM = address.match(/\d{4}\s+([A-Za-zÀ-ÿ\s-]+),/);
+  const cityM = address.match(CITY_FROM_ADDRESS_RE_BG);
   const city  = (cityM?.[1] || address.split(',')[0] || '').trim();
   const target = Math.min(Math.max(minPics, SCRAPE_MIN), 5);
 
@@ -623,10 +624,14 @@ async function fetchPhotosWaterfall(businessName, address, entityType, minPics, 
     for (const url of urls) {
       if (collected.length >= target) break;
       try {
-        const dataUrl = await Promise.race([
-          fetchAsDataUrl(url),
-          new Promise((_, rej) => setTimeout(() => rej(new Error('timeout')), 9000)),
-        ]);
+        const controller = new AbortController();
+        const timeoutId  = setTimeout(() => controller.abort(), 9000);
+        let dataUrl;
+        try {
+          dataUrl = await fetchAsDataUrl(url, controller.signal);
+        } finally {
+          clearTimeout(timeoutId);
+        }
 
         // ── Canvas-based quality gate ──────────────────────────────────────
         const quality = await scoreImageQuality(dataUrl);
@@ -725,8 +730,14 @@ async function fetchPhotosWaterfall(businessName, address, entityType, minPics, 
   };
 }
 
+const _songCacheBG = new Map(); // "genre|cc" → { song, expiresAt }
+const SONG_CACHE_TTL_MS = 30 * 60 * 1000; // 30 minutes
+
 async function getAutoSongBG(genre, country) {
-  const cc = AB_ITUNES_CC_BG[country] || "be";
+  const cc       = AB_ITUNES_CC_BG[country] || "be";
+  const cacheKey = `${genre}|${cc}`;
+  const cached   = _songCacheBG.get(cacheKey);
+  if (cached && Date.now() < cached.expiresAt) return cached.song;
   if (genre === "top100") {
     try {
       const feedRes = await fetch(`https://itunes.apple.com/${cc}/rss/topsongs/limit=100/json`);
@@ -741,7 +752,11 @@ async function getAutoSongBG(genre, country) {
             if (lr.ok) {
               const ld    = await lr.json();
               const track = ld.results?.[0];
-              if (track) return { name:track.trackName, artist:track.artistName, artwork:track.artworkUrl100, previewUrl:track.previewUrl||null, genre:"Top 100" };
+              if (track) {
+                const song = { name:track.trackName, artist:track.artistName, artwork:track.artworkUrl100, previewUrl:track.previewUrl||null, genre:"Top 100" };
+                _songCacheBG.set(cacheKey, { song, expiresAt: Date.now() + SONG_CACHE_TTL_MS });
+                return song;
+              }
             }
           }
         }
@@ -755,7 +770,9 @@ async function getAutoSongBG(genre, country) {
   const songs = d.results || [];
   if (!songs.length) return null;
   const s = songs[Math.floor(Math.random() * songs.length)];
-  return { name:s.trackName, artist:s.artistName, artwork:s.artworkUrl100, previewUrl:s.previewUrl||null, genre:labels[genre]||genre };
+  const song = { name:s.trackName, artist:s.artistName, artwork:s.artworkUrl100, previewUrl:s.previewUrl||null, genre:labels[genre]||genre };
+  _songCacheBG.set(cacheKey, { song, expiresAt: Date.now() + SONG_CACHE_TTL_MS });
+  return song;
 }
 
 function getAutoCaptionBG(name, address, type, language, captionOpts, songInfo) {
@@ -765,7 +782,7 @@ function getAutoCaptionBG(name, address, type, language, captionOpts, songInfo) 
     fr: { opener:(name,t,city,seed) => [`Avez-vous visité ${name}? 💬`,`Meilleur ${t} à ${city}? ${name} vaut le détour! 🔥`,`Que pensez-vous de ${name}? 👇`,`Découvrez ${city}: ${name} ✨`,`Ne manquez pas ${name} à ${city}! 📍`,`Avez-vous essayé ${name}? 😍`][seed%6] },
     de: { opener:(name,t,city,seed) => [`Habt ihr ${name} besucht? 💬`,`Bestes ${t} in ${city}? ${name} ist jeden Besuch wert! 🔥`,`Was denkt ihr über ${name}? 👇`,`Entdeckt das Juwel von ${city}: ${name} ✨`,`Verpasst ${name} in ${city} nicht! 📍`,`Habt ihr ${name} probiert? 😍`][seed%6] },
   };
-  const cityM  = address.match(/\d{4}\s+([A-Za-zÀ-ÿ\s-]+),/i);
+  const cityM  = address.match(CITY_FROM_ADDRESS_RE_BG);
   const city   = (cityM?.[1] || address.split(",")[0] || "").trim();
   const seed   = name.split("").reduce((a,c) => a+c.charCodeAt(0), 0);
   const tLabel = { restaurant:"restaurant", hotel:"hotel", bar:"bar" }[type] || type;
@@ -864,6 +881,15 @@ async function autoPostNow(postIndex) {
 
     const photoResult = await fetchPhotosWaterfall(name, address, config.type||"restaurant", minPics, apiKey, allPhotos);
     const photoDataUrls = photoResult.dataUrls;
+
+    if (photoDataUrls.length === 0) {
+      bgLog("warn", `Auto Bot post ${postIndex}: no photos found for "${name}" — skipping post`);
+      TechLog.warn("POST", "post_skipped_no_photos", { run_id: runId, postIndex, name, total_duration_ms: Date.now()-runStart });
+      TechLog._flush();
+      await updateRunLogStatus(postIndex, "failed", post.platforms);
+      return;
+    }
+
     // Tally how many photos came from each source
     const sourceBreakdown = (photoResult.photoLog||[]).reduce((acc,p) => {
       acc[p.source] = (acc[p.source]||0)+1; return acc;
