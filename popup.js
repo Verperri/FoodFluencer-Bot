@@ -624,21 +624,6 @@ const COST_PHOTO       = 0.007;
 const WARN_SOFT        = 5;
 const WARN_HARD        = 20;
 
-const BELGIAN_RESTAURANTS = [
-  "Comme Chez Soi Brussels",       "In De Wulf Dranouter",
-  "The Jane Antwerp",               "Hof van Cleve Kruishoutem",
-  "Bon Bon Brussels",               "Zilte Antwerp",
-  "De Karmeliet Bruges",            "La Paix Brussels",
-  "Bozar Restaurant Brussels",      "Humphrey Brussels",
-  "Vrijmoed Ghent",                 "OAK Ghent",
-  "Balls & Glory Ghent",            "Fiskebar Antwerp",
-  "Dôme Antwerp",                   "Den Dyver Bruges",
-  "Le Chalet de la Foret Brussels", "La Villa Lorraine Brussels",
-  "La Menuiserie Ghent",            "Gruut Stadsbrouwerij Ghent",
-  "Le Tournant Liège",              "Numerus Clausus Namur",
-  "Braserie Appelmans Antwerp",     "De Troubadour Bruges",
-];
-
 // ══════════════════════════════════════════════════════════════════════════════
 // TECHNICAL LOGGER — structured action log for debugging and audit
 // ══════════════════════════════════════════════════════════════════════════════
@@ -779,6 +764,11 @@ const MIN_PHOTO_DIM   = 720;  // minimum short-side pixels for a post-worthy pho
 const IG_MIN_RATIO    = 0.8;  // Instagram minimum aspect ratio (4:5 portrait)
 const IG_MAX_RATIO    = 1.91; // Instagram maximum aspect ratio (~landscape)
 
+// Resolution used to fetch photos for the quality/resolution gate — matches
+// the Auto Bot's resolvePhotoUriBG(name, 2048, ...) so "Low res" reflects the
+// true source photo, not the small grid thumbnail.
+const QUALITY_SCAN_DIM = 2048;
+
 // Returns { score, blurScore, meetsResolution, width, height }
 // score         — combined quality signal (higher = better)
 // blurScore     — Laplacian variance; higher means sharper
@@ -793,7 +783,7 @@ async function scorePhotoQuality(uri) {
         const SH = Math.min(img.naturalHeight, 200);
         const c = document.createElement('canvas');
         c.width = SW; c.height = SH;
-        const ctx = c.getContext('2d');
+        const ctx = c.getContext('2d', { willReadFrequently: true });
         ctx.drawImage(img, 0, 0, SW, SH);
         const d = ctx.getImageData(0, 0, SW, SH).data;
 
@@ -895,7 +885,7 @@ async function createCoverOverlay(imgUri, restaurantName, address) {
       const H = Math.round(cropH * downScale);
       const canvas = document.createElement('canvas');
       canvas.width = W; canvas.height = H;
-      const ctx = canvas.getContext('2d');
+      const ctx = canvas.getContext('2d', { willReadFrequently: true });
 
       // Draw base image — crop and (down)scale in one pass
       ctx.drawImage(img, cropOffX, cropOffY, cropW, cropH, 0, 0, W, H);
@@ -993,10 +983,32 @@ async function createCoverOverlay(imgUri, restaurantName, address) {
 
 function setCoverPhoto(newIndex) {
   if (!currentRestaurant) return;
-  coverPhotoIndex = newIndex;
+  // Clicking the current cover photo's badge again clears it (no cover photo)
+  coverPhotoIndex = (newIndex === coverPhotoIndex) ? -1 : newIndex;
   coverOverlayCache.clear(); // invalidate cache (photo changed)
   renderPhotoGrid();
   saveState();
+}
+
+// Reorders currentRestaurant.photos via drag & drop, keeping the cover
+// photo selection pinned to the same photo even after it moves.
+function reorderPhotos(fromIndex, toIndex) {
+  if (!currentRestaurant) return;
+  const { photos } = currentRestaurant;
+  if (fromIndex === toIndex || fromIndex < 0 || fromIndex >= photos.length ||
+      toIndex < 0 || toIndex >= photos.length) return;
+
+  const coverPhoto = coverPhotoIndex >= 0 ? photos[coverPhotoIndex] : null;
+
+  const [moved] = photos.splice(fromIndex, 1);
+  photos.splice(toIndex, 0, moved);
+
+  if (coverPhoto) coverPhotoIndex = photos.indexOf(coverPhoto);
+
+  coverOverlayCache.clear();
+  renderPhotoGrid();
+  saveState();
+  AppLog.info("Photo order changed", { fromIndex, toIndex });
 }
 
 // ── State persistence ─────────────────────────────────────────────────────────
@@ -1010,6 +1022,7 @@ function saveState() {
       selectedSong,
       caption:         $("caption")?.value || "",
       activePlatforms: [...activePlatforms],
+      coverPhotoIndex,
     },
   });
 }
@@ -1030,6 +1043,7 @@ function restoreState(saved) {
 
   // Restore restaurant
   currentRestaurant = saved.restaurant;
+  coverPhotoIndex   = saved.coverPhotoIndex ?? 0;
 
   $("restaurantName").textContent    = currentRestaurant.name;
   $("restaurantAddress").textContent = currentRestaurant.address;
@@ -1086,6 +1100,8 @@ chrome.storage.local.get(
     } else {
       showKeySetup(!API_KEY);
       checkUsageWarning();
+      loadAutoBotConfig();   // populate Auto Bot filter settings
+      loadManualConfig();    // populate independent Manual Post filter settings
       if (API_KEY && lastState) restoreState(lastState);
     }
   }
@@ -1200,8 +1216,13 @@ $("downloadLogBtn").addEventListener("click", () => {
 
 // ── Places API (New) ──────────────────────────────────────────────────────────
 
-async function searchRestaurant(query) {
-  const q = /belgium/i.test(query) ? query : `${query} Belgium`;
+// Searches for places matching a free-text query, biased to the configured
+// country, and returns up to several candidates so the user can disambiguate
+// (e.g. "Hilton" -> several Hilton hotels in the area).
+async function searchRestaurantMulti(query, country = "BE") {
+  const countryName = AB_COUNTRY_NAMES[country] || "Belgium";
+  const bounds      = AB_COUNTRY_BOUNDS[country] || AB_COUNTRY_BOUNDS.BE;
+  const q = new RegExp(countryName, "i").test(query) ? query : `${query} ${countryName}`;
   trackApiCall("search", q);
 
   const res = await fetch(PLACES_SEARCH, {
@@ -1213,13 +1234,8 @@ async function searchRestaurant(query) {
     },
     body: JSON.stringify({
       textQuery: q,
-      maxResultCount: 1,
-      locationRestriction: {
-        rectangle: {
-          low:  { latitude: 49.5, longitude: 2.5 },
-          high: { latitude: 51.5, longitude: 6.4 },
-        },
-      },
+      maxResultCount: 8,
+      locationRestriction: { rectangle: bounds },
     }),
   });
 
@@ -1232,8 +1248,8 @@ async function searchRestaurant(query) {
   }
   const data = await res.json();
   if (!data.places?.length)
-    throw new Error(`No restaurant found for "${query}" in Belgium.`);
-  return data.places[0];
+    throw new Error(`No results found for "${query}" in ${countryName}.`);
+  return data.places;
 }
 
 async function resolvePhotoUri(photoName, maxWidth = 400) {
@@ -1299,6 +1315,30 @@ function renderPhotoGrid() {
     const div = document.createElement("div");
     div.className = "photo-item";
     div.dataset.slot = i;
+    div.draggable = true;
+
+    div.addEventListener("dragstart", e => {
+      e.dataTransfer.effectAllowed = "move";
+      e.dataTransfer.setData("text/plain", String(i));
+      div.classList.add("dragging");
+    });
+    div.addEventListener("dragend", () => {
+      div.classList.remove("dragging");
+      grid.querySelectorAll(".photo-item.drag-over").forEach(el => el.classList.remove("drag-over"));
+    });
+    div.addEventListener("dragover", e => {
+      e.preventDefault();
+      e.dataTransfer.dropEffect = "move";
+      div.classList.add("drag-over");
+    });
+    div.addEventListener("dragleave", () => div.classList.remove("drag-over"));
+    div.addEventListener("drop", e => {
+      e.preventDefault();
+      div.classList.remove("drag-over");
+      const fromIndex = parseInt(e.dataTransfer.getData("text/plain"), 10);
+      reorderPhotos(fromIndex, i);
+    });
+
     grid.appendChild(div);
 
     const cached = uriCache.get(`${photo.name}|400`);
@@ -1326,20 +1366,28 @@ function fillPhotoSlot(div, uri, index) {
   div.innerHTML = `
     <img src="${uri}" alt="Photo ${index + 1}" />
     ${isCover
-      ? '<span class="cover-badge">Cover</span>'
+      ? '<button class="cover-badge" title="Click to remove as cover photo">Cover ✕</button>'
       : `<button class="make-cover-btn" title="Set as cover photo">⭐ Cover</button>`}
     <span class="photo-label">${isCover ? '★' : index + 1}</span>
     <span class="quality-badge"></span>
     <button class="dismiss-btn" title="Replace with another photo">✕</button>`;
 
-  // Score quality (contrast + blur + resolution) and update grid badges
-  scorePhotoQuality(uri).then(({ score, meetsResolution }) => {
-    if (currentRestaurant?.photos[index]) {
-      currentRestaurant.photos[index].qualityScore    = score;
-      currentRestaurant.photos[index].meetsResolution = meetsResolution;
-      updateQualityBadges();
-    }
-  });
+  // Score quality (contrast + blur + resolution) and update grid badges.
+  // The resolution check needs the TRUE source dimensions, so score against a
+  // high-res fetch (2048px) rather than the 400px grid thumbnail — a 400px
+  // image can never satisfy MIN_PHOTO_DIM (720), which would flag every photo
+  // as low-res regardless of its real size. This mirrors the Auto Bot's
+  // photo-quality gate, which scores resolvePhotoUriBG(name, 2048, ...).
+  const scoreName = currentRestaurant?.photos[index]?.name;
+  (scoreName ? resolvePhotoUri(scoreName, QUALITY_SCAN_DIM) : Promise.resolve(uri))
+    .then(scanUri => scorePhotoQuality(scanUri || uri))
+    .then(({ score, meetsResolution }) => {
+      if (currentRestaurant?.photos[index]) {
+        currentRestaurant.photos[index].qualityScore    = score;
+        currentRestaurant.photos[index].meetsResolution = meetsResolution;
+        updateQualityBadges();
+      }
+    });
 
   // Show cover overlay preview on the cover photo — use 1600px source for quality
   if (isCover && currentRestaurant) {
@@ -1362,12 +1410,11 @@ function fillPhotoSlot(div, uri, index) {
     dismissPhoto(index);
   });
 
-  if (!isCover) {
-    div.querySelector(".make-cover-btn")?.addEventListener("click", e => {
-      e.stopPropagation();
-      setCoverPhoto(index);
-    });
-  }
+  const coverBtn = div.querySelector(".make-cover-btn, .cover-badge");
+  coverBtn?.addEventListener("click", e => {
+    e.stopPropagation();
+    setCoverPhoto(index);
+  });
 }
 
 async function dismissPhoto(index) {
@@ -1483,18 +1530,56 @@ function setStatus(msg, type = "loading") {
   if (type !== "loading") setTimeout(() => el.classList.add("hidden"), 6000);
 }
 
+// Hides and clears the entity-search results dropdown
+function hideSearchResultsDropdown() {
+  const el = $("searchResultsDropdown");
+  if (!el) return;
+  el.innerHTML = "";
+  el.classList.add("hidden");
+}
+
+// Renders the candidate places returned by the search as a clickable dropdown
+// so the user can pick the exact entity they meant (e.g. the right Hilton).
+function renderSearchResultsDropdown(places) {
+  const el = $("searchResultsDropdown");
+  if (!el) return;
+  el.innerHTML = "";
+  places.forEach(place => {
+    const name = place.displayName?.text || "Unknown";
+    const meta = place.rating
+      ? `⭐ ${place.rating} · ${(place.userRatingCount || 0).toLocaleString()} ratings` : "";
+
+    const div = document.createElement("div");
+    div.className = "search-result-item";
+    div.innerHTML = `
+      <div class="search-result-name">${name}</div>
+      <div class="search-result-address">${place.formattedAddress || ""}</div>
+      ${meta ? `<div class="search-result-meta">${meta}</div>` : ""}`;
+    div.addEventListener("click", () => {
+      $("query").value = name;
+      hideSearchResultsDropdown();
+      renderResults(place);
+      AppLog.info("Restaurant selected from search results", { name });
+    });
+    el.appendChild(div);
+  });
+  el.classList.remove("hidden");
+}
+
 async function doSearch(query) {
   if (!query.trim()) return;
   if (!API_KEY) { setStatus("Please save your API key first.", "error"); return; }
   setStatus("Searching…");
   $("results").classList.add("hidden");
+  hideSearchResultsDropdown();
   // Clear song for a fresh search
   selectedSong = null;
   $("selectedSong")?.classList.add("hidden");
   try {
-    const place = await searchRestaurant(query);
-    renderResults(place);
-    AppLog.info("Restaurant found", { name: place.displayName?.text, query });
+    const { country } = getManualSettings();
+    const places = await searchRestaurantMulti(query, country);
+    renderSearchResultsDropdown(places);
+    AppLog.info("Restaurant search results", { count: places.length, query });
     $("status").classList.add("hidden");
   } catch (err) {
     AppLog.error("Restaurant search failed", { query, error: err.message });
@@ -1504,10 +1589,25 @@ async function doSearch(query) {
 
 $("searchBtn").addEventListener("click", () => doSearch($("query").value));
 $("query").addEventListener("keydown", e => { if (e.key === "Enter") doSearch($("query").value); });
-$("randomBtn").addEventListener("click", () => {
-  const pick = BELGIAN_RESTAURANTS[Math.floor(Math.random() * BELGIAN_RESTAURANTS.length)];
-  $("query").value = pick;
-  doSearch(pick);
+$("randomBtn").addEventListener("click", async () => {
+  if (!API_KEY) { setStatus("Please save your API key first.", "error"); return; }
+  setStatus("Picking a random place…");
+  $("results").classList.add("hidden");
+  hideSearchResultsDropdown();
+  selectedSong = null;
+  $("selectedSong")?.classList.add("hidden");
+  try {
+    const settings = getManualSettings();
+    const place = await searchAutoPlace(settings.type, settings.country, settings.region,
+      settings.minRatings, settings.minStars, settings.minPics);
+    $("query").value = place.displayName?.text || "";
+    renderResults(place);
+    AppLog.info("Random place found", { name: place.displayName?.text, settings });
+    $("status").classList.add("hidden");
+  } catch (err) {
+    AppLog.error("Random place search failed", { error: err.message, settings: getManualSettings() });
+    setStatus(err.message, "error");
+  }
 });
 
 // ── Social platform toggles ───────────────────────────────────────────────────
@@ -1581,7 +1681,8 @@ $("removeSongBtn").addEventListener("click", () => {
 
 // ── Export & Post ─────────────────────────────────────────────────────────────
 
-$("exportBtn").addEventListener("click", exportAndPost);
+$("postBtn").addEventListener("click", postToSocial);
+$("exportBtn").addEventListener("click", exportPhotos);
 
 async function photoToDataUrl(uri, maxWidth = 1440) {
   const res    = await fetch(uri);
@@ -1604,27 +1705,13 @@ async function photoToDataUrl(uri, maxWidth = 1440) {
   return canvas.toDataURL("image/jpeg", 0.95);
 }
 
-async function exportAndPost() {
-  if (!currentRestaurant) return;
+// Resolves full-res photo URIs from the Google Places CDN, gated to
+// MIN_PHOTO_DIM short-side resolution. Shared by Post and Export.
+async function resolveManualPhotoUris(runId, runType) {
+  const { photos } = currentRestaurant;
 
-  const { name, address, photos } = currentRestaurant;
-  const caption   = $("caption")?.value.trim() || buildDefaultCaption();
-  const songName  = selectedSong?.name || "";
-  const timestamp = new Date().toISOString().replace(/[:.]/g, "-").slice(0, 19);
-  const platforms = [...activePlatforms];
-
-  const runId    = `manual-${Date.now()}`;
-  const runStart = Date.now();
-  TechLog.info("POST", "run_start", { run_id: runId, run_type: "manual",
-    restaurant: name, address, platforms, song: songName });
-
-  $("exportBtn").disabled = true;
-  AppLog.info("Export & Post started", { restaurant: name, photos: photos.length, platforms, song: songName });
-  setStatus("Resolving photos…");
-
-  // ── 1. Resolve full-res photo URIs from Google Places CDN ─────────────────
   const t_photos = Date.now();
-  TechLog.info("MEDIA", "photos_start", { run_id: runId, run_type: "manual", name });
+  TechLog.info("MEDIA", "photos_start", { run_id: runId, run_type: runType, name: currentRestaurant.name });
 
   // Build a pool of candidate photo names: selected photos first, then unused extras
   const selectedNames = new Set(photos.map(p => p.name));
@@ -1658,25 +1745,56 @@ async function exportAndPost() {
       console.warn("Photo resolve failed:", e);
     }
   }
-  TechLog.info("MEDIA", "photos_done", { run_id: runId, run_type: "manual",
+  TechLog.info("MEDIA", "photos_done", { run_id: runId, run_type: runType,
     photo_source: "google_places_manual", photo_count: photoUris.length,
     source_breakdown: { google_places_manual: photoUris.length },
     duration_ms: Date.now()-t_photos });
   AppLog.info(`Resolved ${photoUris.length}/${photos.length} photo URIs`);
 
-  // ── 2. Log the export (no local file download) ────────────────────────────
+  return photoUris;
+}
+
+function logManualExport(timestamp, photoCount, platforms, caption) {
+  const { name, address } = currentRestaurant;
   chrome.storage.local.get({ exportLog: [] }, ({ exportLog }) => {
     exportLog.push({
-      timestamp, name, address, photos: photoUris.length,
+      timestamp, name, address, photos: photoCount,
       song:      selectedSong ? `${selectedSong.name} – ${selectedSong.artist}` : null,
       platforms,
       caption,
     });
     chrome.storage.local.set({ exportLog });
   });
+}
 
-  // ── 3. Prepare data URLs — cover photo (with overlay) first ─────────────────
-  if (platforms.length > 0 && photoUris.length > 0) {
+async function postToSocial() {
+  if (!currentRestaurant) return;
+
+  const { name, address, photos } = currentRestaurant;
+  const caption   = $("caption")?.value.trim() || buildDefaultCaption();
+  const songName  = selectedSong?.name || "";
+  const timestamp = new Date().toISOString().replace(/[:.]/g, "-").slice(0, 19);
+  const platforms = [...activePlatforms];
+
+  if (platforms.length === 0) {
+    setStatus("⚠️ Select at least one social media platform to post.", "error");
+    return;
+  }
+
+  const runId    = `manual-${Date.now()}`;
+  const runStart = Date.now();
+  TechLog.info("POST", "run_start", { run_id: runId, run_type: "manual",
+    restaurant: name, address, platforms, song: songName });
+
+  $("postBtn").disabled   = true;
+  $("exportBtn").disabled = true;
+  AppLog.info("Post started", { restaurant: name, photos: photos.length, platforms, song: songName });
+  setStatus("Resolving photos…");
+
+  const photoUris = await resolveManualPhotoUris(runId, "manual");
+  logManualExport(timestamp, photoUris.length, platforms, caption);
+
+  if (photoUris.length > 0) {
     setStatus(`Preparing photos… applying cover overlay…`);
 
     // Build photo data URLs with cover (+ text overlay) at position 0
@@ -1687,12 +1805,16 @@ async function exportAndPost() {
     // The text/vignette overlay is applied once, inside each platform injector,
     // at the photo's native resolution. Pre-baking here would force an
     // upscale + double JPEG re-encode + double overlay → blurry result.
-    try {
-      const coverUri = photoUris[covIdx];
-      photoDataUrls.push(await photoToDataUrl(coverUri));
-      AppLog.info("Cover photo prepared (overlay applied in injector)", { index: covIdx });
-    } catch(e) {
-      AppLog.warn("Cover photo prep failed", String(e));
+    // If the user removed the cover photo (covIdx === -1), photos are simply
+    // sent in their current order with no designated cover.
+    if (covIdx >= 0) {
+      try {
+        const coverUri = photoUris[covIdx];
+        photoDataUrls.push(await photoToDataUrl(coverUri));
+        AppLog.info("Cover photo prepared (overlay applied in injector)", { index: covIdx });
+      } catch(e) {
+        AppLog.warn("Cover photo prep failed", String(e));
+      }
     }
 
     // Remaining photos in original order (skip cover)
@@ -1734,7 +1856,9 @@ async function exportAndPost() {
         chrome.runtime.sendMessage({
           type: "OPEN_SOCIAL", platform, photoDataUrls, caption, songName,
           location:         currentRestaurant.address || "",
-          restaurantName:   currentRestaurant.name    || "",
+          // Empty restaurantName tells the injectors to skip the cover
+          // overlay when the user has explicitly removed the cover photo.
+          restaurantName:   coverPhotoIndex >= 0 ? (currentRestaurant.name || "") : "",
           tiktokAudioDataUrl: platform === "tiktok" ? (tiktokAudioDataUrl || null) : null,
         });
         await new Promise(r => setTimeout(r, 900));
@@ -1749,15 +1873,78 @@ async function exportAndPost() {
       AppLog.error("All photo resizes failed — cannot post to social media");
       setStatus("⚠️ Could not prepare photos for social media.", "error");
     }
-  } else if (platforms.length === 0) {
-    // No platforms selected — just log
-    AppLog.info("No platforms selected, logged only");
-    setStatus("✅ Logged — select a platform above to post to social media.", "success");
   } else {
     AppLog.error("No photo URIs resolved");
     setStatus("⚠️ Could not resolve any photos.", "error");
   }
 
+  $("postBtn").disabled   = false;
+  $("exportBtn").disabled = false;
+}
+
+async function exportPhotos() {
+  if (!currentRestaurant) return;
+
+  const { name, address, photos } = currentRestaurant;
+  const caption   = $("caption")?.value.trim() || buildDefaultCaption();
+  const timestamp = new Date().toISOString().replace(/[:.]/g, "-").slice(0, 19);
+
+  const runId = `manual-export-${Date.now()}`;
+  TechLog.info("EXPORT", "run_start", { run_id: runId, run_type: "manual-export", restaurant: name, address });
+
+  $("postBtn").disabled   = true;
+  $("exportBtn").disabled = true;
+  AppLog.info("Export started", { restaurant: name, photos: photos.length });
+  setStatus("Resolving photos…");
+
+  const photoUris = await resolveManualPhotoUris(runId, "manual-export");
+  logManualExport(timestamp, photoUris.length, [], caption);
+
+  if (photoUris.length === 0) {
+    AppLog.error("No photo URIs resolved");
+    setStatus("⚠️ Could not resolve any photos.", "error");
+    $("postBtn").disabled   = false;
+    $("exportBtn").disabled = false;
+    return;
+  }
+
+  setStatus("Preparing photos for export…");
+
+  const slug = (name || "restaurant").toLowerCase()
+    .replace(/[^a-z0-9]+/g, "-").replace(/^-+|-+$/g, "") || "restaurant";
+  const folder = `FoodFluencer/${slug}_${timestamp}`;
+
+  let saved = 0;
+  for (let i = 0; i < photoUris.length; i++) {
+    setStatus(`Exporting photo ${i + 1}/${photoUris.length}…`);
+    try {
+      const dataUrl = await photoToDataUrl(photoUris[i]);
+      await new Promise(resolve => {
+        chrome.runtime.sendMessage({
+          type:     "DOWNLOAD",
+          url:      dataUrl,
+          filename: `${folder}/photo_${i + 1}.jpg`,
+        }, resolve);
+      });
+      saved++;
+    } catch (e) {
+      AppLog.error("Photo export failed", { uri: photoUris[i], error: String(e) });
+    }
+  }
+
+  TechLog.info("EXPORT", "run_complete", { run_id: runId, run_type: "manual-export",
+    name, photo_count: saved });
+  TechLog._flush();
+
+  if (saved > 0) {
+    AppLog.info(`Exported ${saved}/${photoUris.length} photos`, { restaurant: name });
+    setStatus(`✅ Exported ${saved} photo${saved === 1 ? "" : "s"} to Downloads/${folder}/`, "success");
+  } else {
+    AppLog.error("All photo exports failed");
+    setStatus("⚠️ Could not export any photos.", "error");
+  }
+
+  $("postBtn").disabled   = false;
   $("exportBtn").disabled = false;
 }
 
@@ -2160,6 +2347,27 @@ function getAutoBotSettings() {
   };
 }
 
+// Read current Manual Post search-filter form values (independent of Auto Bot)
+function getManualSettings() {
+  const country = document.getElementById("mmCountry")?.value || "BE";
+  const type    = document.querySelector("#mmType .ab-pill.active")?.dataset?.val || "restaurant";
+
+  // Selected regions (empty string = All)
+  const allChip     = document.querySelector("#mmRegionWrap .all-chip");
+  const activeChips = [...document.querySelectorAll("#mmRegionWrap .ab-region-chip:not(.all-chip)")]
+                        .filter(c => c.classList.contains("active"));
+  let region = "";
+  if (!allChip?.classList.contains("active") && activeChips.length > 0) {
+    region = activeChips[Math.floor(Math.random() * activeChips.length)].textContent.trim();
+  }
+
+  const minRatings = parseInt(document.getElementById("mmMinRatings")?.value || "100", 10);
+  const minStars   = parseFloat(document.querySelector("#mmStars .ab-pill.active")?.dataset?.val || "4");
+  const minPics    = parseInt(document.querySelector("#mmPics .ab-pill.active")?.dataset?.val || "5", 10);
+
+  return { country, type, region, minRatings, minStars, minPics };
+}
+
 // Search Places API with ALL filter parameters baked in (one call)
 async function searchAutoPlace(type, country, region, minRatings = 0, minStars = 3, minPics = 3) {
   const typeQuery   = AB_TYPE_QUERY[type] || "restaurant";
@@ -2528,6 +2736,120 @@ function initAutoBotPersistence() {
     .forEach(id => document.getElementById(id)?.addEventListener("click", autoBotChanged));
 }
 initAutoBotPersistence();
+
+// ── Manual Post search-filter persistence (independent of Auto Bot) ─────────────
+
+function saveManualConfig() {
+  const config = {
+    type:       document.querySelector("#mmType .ab-pill.active")?.dataset?.val || "restaurant",
+    country:    document.getElementById("mmCountry")?.value   || "BE",
+    allRegions: document.querySelector("#mmRegionWrap .all-chip")?.classList.contains("active") ?? true,
+    regions:    [...document.querySelectorAll("#mmRegionWrap .ab-region-chip:not(.all-chip)")]
+                  .filter(c => c.classList.contains("active")).map(c => c.textContent.trim()),
+    minRatings: document.getElementById("mmMinRatings")?.value || "100",
+    minStars:   document.querySelector("#mmStars .ab-pill.active")?.dataset?.val || "4",
+    minPics:    document.querySelector("#mmPics .ab-pill.active")?.dataset?.val || "5",
+  };
+  chrome.storage.local.set({ manualPostConfig: config });
+}
+
+const MM_CONFIG_DEFAULTS = {
+  type: "restaurant", country: "BE", allRegions: true, regions: [],
+  minRatings: "100", minStars: "4", minPics: "5",
+};
+
+function loadManualConfig() {
+  chrome.storage.local.get({ manualPostConfig: null }, ({ manualPostConfig: raw }) => {
+    const cfg = { ...MM_CONFIG_DEFAULTS, ...(raw || {}) };
+
+    const pill = (groupId, val) =>
+      document.querySelectorAll(`#${groupId} .ab-pill`)
+        .forEach(p => p.classList.toggle("active", p.dataset.val === val));
+    const sel = (id, val) => { const e = document.getElementById(id); if (e && val != null) e.value = val; };
+
+    pill("mmType", cfg.type);
+    sel("mmCountry", cfg.country);
+    buildRegionChips(cfg.country, "mmRegionWrap");
+    setTimeout(() => {
+      if (cfg.allRegions) {
+        document.querySelector("#mmRegionWrap .all-chip")?.classList.add("active");
+      } else if (cfg.regions?.length) {
+        document.querySelector("#mmRegionWrap .all-chip")?.classList.remove("active");
+        document.querySelectorAll("#mmRegionWrap .ab-region-chip:not(.all-chip)")
+          .forEach(c => c.classList.toggle("active", cfg.regions.includes(c.textContent.trim())));
+      }
+    }, 60);
+
+    sel("mmMinRatings", cfg.minRatings);
+    const sliderVal = document.getElementById("mmMinRatingsVal");
+    if (sliderVal && cfg.minRatings) sliderVal.textContent = cfg.minRatings;
+
+    pill("mmStars", cfg.minStars);
+    pill("mmPics",  cfg.minPics);
+
+    updateManualConfigSummary();
+  });
+}
+
+// Debounced save — fires 600ms after last change
+let _mmSaveTimer = null;
+function manualConfigChanged() {
+  clearTimeout(_mmSaveTimer);
+  _mmSaveTimer = setTimeout(() => { saveManualConfig(); updateManualConfigSummary(); }, 600);
+}
+
+function initManualPersistence() {
+  document.getElementById("mmCountry")?.addEventListener("change", manualConfigChanged);
+  document.getElementById("mmMinRatings")?.addEventListener("input", manualConfigChanged);
+  ["mmType","mmStars","mmPics"].forEach(id =>
+    document.getElementById(id)?.addEventListener("click", manualConfigChanged));
+  document.getElementById("mmRegionWrap")?.addEventListener("click", manualConfigChanged);
+}
+initManualPersistence();
+
+// ── Manual Post config summary (shown when filters are collapsed) ───────────────
+function updateManualConfigSummary() {
+  const el = document.getElementById("mmConfigSummary");
+  if (!el) return;
+  const type    = document.querySelector("#mmType .ab-pill.active")?.dataset?.val || "restaurant";
+  const cc      = document.getElementById("mmCountry")?.value || "BE";
+  const country = AB_COUNTRY_NAMES[cc] || cc;
+  const allChip = document.querySelector("#mmRegionWrap .all-chip");
+  const region  = allChip?.classList.contains("active") ? "All regions"
+    : [...document.querySelectorAll("#mmRegionWrap .ab-region-chip:not(.all-chip)")]
+        .filter(c => c.classList.contains("active")).map(c => c.textContent.trim()).join(", ") || "All regions";
+  el.textContent = `${type.charAt(0).toUpperCase() + type.slice(1)} · ${country} · ${region}`;
+}
+
+// ── Manual Post collapsible filters toggle ───────────────────────────────────────
+document.getElementById("mmConfigToggle")?.addEventListener("click", () => {
+  const body  = document.getElementById("mmConfigBody");
+  const arrow = document.getElementById("mmConfigArrow");
+  if (!body) return;
+  const collapsed = body.classList.toggle("collapsed");
+  arrow?.classList.toggle("collapsed", collapsed);
+});
+
+// ── Manual Post: single-select pill groups (Type / Stars / Pics) ────────────────
+["mmType", "mmStars", "mmPics"].forEach(groupId => {
+  const group = document.getElementById(groupId);
+  if (!group) return;
+  group.addEventListener("click", e => {
+    const pill = e.target.closest(".ab-pill");
+    if (!pill) return;
+    group.querySelectorAll(".ab-pill").forEach(p => p.classList.remove("active"));
+    pill.classList.add("active");
+  });
+});
+
+// ── Manual Post: ratings slider live value ───────────────────────────────────────
+const mmSlider = document.getElementById("mmMinRatings");
+const mmSliderVal = document.getElementById("mmMinRatingsVal");
+if (mmSlider && mmSliderVal) {
+  mmSlider.addEventListener("input", () => {
+    mmSliderVal.textContent = Number(mmSlider.value).toLocaleString();
+  });
+}
 
 // ══════════════════════════════════════════════════════════════════════════════
 // AUTO BOT SCHEDULE LOGIC
@@ -3176,8 +3498,8 @@ const REGIONS = {
   ],
 };
 
-function buildRegionChips(countryCode) {
-  const wrap = document.getElementById("abRegionWrap");
+function buildRegionChips(countryCode, wrapId = "abRegionWrap") {
+  const wrap = document.getElementById(wrapId);
   if (!wrap) return;
   wrap.innerHTML = "";
   const regions = REGIONS[countryCode] || [];
@@ -3211,10 +3533,14 @@ function buildRegionChips(countryCode) {
 
 // Build chips for initial country (Belgium)
 buildRegionChips("BE");
+buildRegionChips("BE", "mmRegionWrap");
 
 // Rebuild when country changes
 document.getElementById("abCountry")?.addEventListener("change", e => {
   buildRegionChips(e.target.value);
+});
+document.getElementById("mmCountry")?.addEventListener("change", e => {
+  buildRegionChips(e.target.value, "mmRegionWrap");
 });
 
 // ── Single-select pill groups (Type / Stars / Pics) ───────────────────────────
@@ -3285,3 +3611,26 @@ if (abSlider && abSliderVal) {
 
 // Boot
 checkUsageWarning();
+
+// ── Test hooks (no-op in the extension; used by the Jest suite) ──────────────
+if (typeof module !== 'undefined' && module.exports) {
+  module.exports = {
+    doSearch,
+    searchRestaurantMulti,
+    searchAutoPlace,
+    renderResults,
+    renderSearchResultsDropdown,
+    hideSearchResultsDropdown,
+    getAutoBotSettings,
+    loadAutoBotConfig,
+    getManualSettings,
+    loadManualConfig,
+    saveManualConfig,
+    buildRegionChips,
+    MM_CONFIG_DEFAULTS,
+    AB_COUNTRY_NAMES,
+    AB_COUNTRY_BOUNDS,
+    AB_TYPE_QUERY,
+    getCurrentRestaurant: () => currentRestaurant,
+  };
+}
