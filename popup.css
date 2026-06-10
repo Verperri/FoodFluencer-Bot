@@ -166,6 +166,18 @@ h1 { font-size: 0.95rem; font-weight: 700; line-height: 1.2; }
 }
 .dismiss-btn:hover { background: rgba(220,38,38,.85); }
 .photo-item.replacing { opacity: .55; pointer-events: none; }
+.quality-badge {
+  position: absolute; bottom: 4px; right: 5px;
+  font-size: .52rem; font-weight: 700; letter-spacing: .06em;
+  padding: 1px 5px; border-radius: 20px; pointer-events: none;
+  transition: opacity .2s;
+}
+.quality-best {
+  background: rgba(16,185,129,.85); color: #fff;
+}
+.quality-lowres {
+  background: rgba(234,179,8,.90); color: #1a1a1a;
+}
 
 /* ── Divider ─────────────────────────────────────────────────────────────── */
 .divider { height: 1px; background: var(--border); margin: 2px 0; }
@@ -716,6 +728,7 @@ h1 { font-size: 0.95rem; font-weight: 700; line-height: 1.2; }
 .ab-sched-status.done     { background: #f0fdf4; color: #15803d; }
 .ab-sched-status.triggered{ background: #eff6ff; color: #1d4ed8; }
 .ab-sched-status.failed   { background: #fef2f2; color: #991b1b; }
+.ab-sched-status.unconfirmed { background: #fefce8; color: #a16207; }
 
 /* Activity log prominent mode */
 .ab-activity-log.prominent {

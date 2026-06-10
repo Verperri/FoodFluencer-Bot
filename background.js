@@ -339,6 +339,11 @@ async function fetchAsDataUrl(url, signal) {
 // A photo passes only when all four metrics are within acceptable bounds.
 // ═══════════════════════════════════════════════════════════════════════════════
 
+// Minimum acceptable SHORT-side resolution for a post-worthy source image.
+// Instagram renders at ~1080px; anything under this gets visibly soft once
+// upscaled, so we reject it here regardless of how sharp it looks downscaled.
+const MIN_SOURCE_DIM = 720;
+
 async function scoreImageQuality(dataUrl) {
   try {
     const SIZE = 150;
@@ -348,6 +353,10 @@ async function scoreImageQuality(dataUrl) {
     // Decode the data-URL into a bitmap and draw it at analysis resolution
     const blob   = await fetch(dataUrl).then(r => r.blob());
     const bitmap = await createImageBitmap(blob);
+    // Capture the TRUE source dimensions before we downscale to the analysis
+    // canvas — the resolution gate below depends on these, and they're the only
+    // way to catch low-res thumbnails (a 200px thumb looks fine at 150×150).
+    const srcW = bitmap.width, srcH = bitmap.height;
     ctx.drawImage(bitmap, 0, 0, SIZE, SIZE);
     bitmap.close();
 
@@ -403,19 +412,24 @@ async function scoreImageQuality(dataUrl) {
     const saturation = (satSum / total) * 100;
 
     // ── Gate each metric ──────────────────────────────────────────────────────
+    const shortSide = Math.min(srcW, srcH);
     const reasons = [];
+    if (shortSide   < MIN_SOURCE_DIM) reasons.push(`low resolution (${srcW}×${srcH}, short side ${shortSide}px < ${MIN_SOURCE_DIM})`);
     if (blurScore   <  80)  reasons.push(`blurry (Laplacian variance ${blurScore.toFixed(0)})`);
     if (brightness  <  40)  reasons.push(`too dark (brightness ${brightness.toFixed(0)}/255)`);
     if (brightness  > 220)  reasons.push(`overexposed (brightness ${brightness.toFixed(0)}/255)`);
     if (contrast    <  20)  reasons.push(`low contrast (σ ${contrast.toFixed(0)})`);
     if (saturation  <   8)  reasons.push(`near-greyscale (saturation ${saturation.toFixed(1)} %)`);
 
-    return { blur: blurScore, brightness, contrast, saturation, passed: reasons.length === 0, reasons };
+    return { blur: blurScore, brightness, contrast, saturation,
+             width: srcW, height: srcH,
+             passed: reasons.length === 0, reasons };
   } catch (e) {
     // If scoring itself fails for any reason, let the photo through rather than
     // silently dropping a potentially good image.
     bgLog('warn', `PhotoQuality: scoring error — letting photo through (${e.message})`);
-    return { blur: 999, brightness: 128, contrast: 50, saturation: 50, passed: true, reasons: [] };
+    return { blur: 999, brightness: 128, contrast: 50, saturation: 50,
+             width: 0, height: 0, passed: true, reasons: [] };
   }
 }
 
@@ -457,15 +471,15 @@ async function scrapeGoogleMapsPhotos(businessName, city) {
 
     // Pattern A: direct lh3 URL (already includes photo ID + optional size suffix)
     for (const m of html.matchAll(/https:\/\/lh3\.googleusercontent\.com\/p\/([A-Za-z0-9_\-]{20,})/g))
-      urls.add(`https://lh3.googleusercontent.com/p/${m[1]}=s1200`);
+      urls.add(`https://lh3.googleusercontent.com/p/${m[1]}=s2048`);
 
     // Pattern B: AF1Qip photo IDs embedded in protobuf JSON
     for (const m of html.matchAll(/AF1Qip([A-Za-z0-9_\-]{20,})/g))
-      urls.add(`https://lh3.googleusercontent.com/p/AF1Qip${m[1]}=s1200`);
+      urls.add(`https://lh3.googleusercontent.com/p/AF1Qip${m[1]}=s2048`);
 
     // Pattern C: gps-cs-s sub-path
     for (const m of html.matchAll(/https:\/\/lh3\.googleusercontent\.com\/gps-cs-s\/([A-Za-z0-9_\-]{20,})/g))
-      urls.add(`https://lh3.googleusercontent.com/gps-cs-s/${m[1]}=s1200`);
+      urls.add(`https://lh3.googleusercontent.com/gps-cs-s/${m[1]}=s2048`);
 
     const result = [...urls].slice(0, 12);
     bgLog('info', `PhotoScrape[GoogleMaps] found ${result.length} URLs`);
@@ -518,7 +532,13 @@ async function scrapeDDGPhotos(businessName, city, entityType) {
       .filter(r => !STOCK_RE.test(r.url || ''))
       .filter(r => (r.width / r.height) < 3 && (r.height / r.width) < 3);
 
-    // Use DDG proxy thumbnail — always accessible, avoids arbitrary domain CORS
+    // Use DDG proxy thumbnail — always fetchable (external-content.duckduckgo.com
+    // is in host_permissions), avoids arbitrary-domain CORS.
+    // KNOWN LIMITATION: these proxy thumbnails are low-res (~200px), so they are
+    // now rejected by the MIN_SOURCE_DIM resolution gate in scoreImageQuality and
+    // contribute little — the waterfall falls through to the high-res Google Maps
+    // scrape (=s2048) and Google Places API (2048px). To restore DDG as a high-res
+    // source, switch to `r.image` and add `https://*/*` to host_permissions.
     const urls = filtered.map(r => r.thumbnail || r.image).filter(Boolean).slice(0, 12);
 
     bgLog('info', `PhotoScrape[DDG] ${filtered.length} quality results from ${(data.results||[]).length} total`);
@@ -759,6 +779,8 @@ async function fetchPhotosWaterfall(businessName, address, entityType, minPics, 
             url: url.slice(0, 120),
             reasons: quality.reasons,
             metrics: {
+              width:      quality.width,
+              height:     quality.height,
               blur:       Math.round(quality.blur),
               brightness: Math.round(quality.brightness),
               contrast:   Math.round(quality.contrast),
@@ -826,7 +848,7 @@ async function fetchPhotosWaterfall(businessName, address, entityType, minPics, 
       bgLog('info', `PhotoWaterfall: need ${target - collected.length} more — trying Google Places API`);
       const needed   = target - collected.length;
       const uris     = await Promise.all(
-        placePhotoObjects.slice(0, needed + 2).map(p => resolvePhotoUriBG(p.name, 900, apiKey))
+        placePhotoObjects.slice(0, needed + 2).map(p => resolvePhotoUriBG(p.name, 2048, apiKey))
       );
       await collectFromUrls(uris, 'google_places');
     }
@@ -1226,6 +1248,30 @@ async function updateRunLogStatus(postIndex, status, platforms = null) {
   chrome.runtime.sendMessage({ type:"AUTO_BOT_STATUS_UPDATE", postIndex, status }).catch(() => {});
 }
 
+// ── MV3 service-worker keepalive ──────────────────────────────────────────────
+// During a long auto-post run the worker sits idle while awaiting an injector to
+// post (Instagram alone can take 30–60s). Chrome terminates an idle MV3 worker
+// after ~30s, which destroys the awaiting sequential loop — so later platforms
+// (e.g. TikTok after Instagram) never fire. Periodically calling a chrome API
+// resets the idle timer and keeps the worker alive for the whole run.
+let _keepAliveTimer = null;
+let _keepAliveRefs  = 0;
+function startKeepAlive() {
+  _keepAliveRefs++;
+  if (_keepAliveTimer) return;
+  _keepAliveTimer = setInterval(() => {
+    // The API call itself is the activity that resets the worker's idle timer.
+    chrome.runtime.getPlatformInfo(() => {});
+  }, 20000);
+}
+function stopKeepAlive() {
+  _keepAliveRefs = Math.max(0, _keepAliveRefs - 1);
+  if (_keepAliveRefs === 0 && _keepAliveTimer) {
+    clearInterval(_keepAliveTimer);
+    _keepAliveTimer = null;
+  }
+}
+
 // ── Main auto-posting function ────────────────────────────────────────────────
 async function autoPostNow(postIndex) {
   const data = await chrome.storage.local.get(["autoBotActive","autoBotSchedule","autoBotConfig"]);
@@ -1246,6 +1292,7 @@ async function autoPostNow(postIndex) {
   const runStart = Date.now();
   TechLog.info("POST", "run_start", { run_id: runId, run_type: "auto", postIndex, platforms: post.platforms });
 
+  startKeepAlive(); // keep the MV3 worker alive across the whole sequential run
   try {
     // 1 ── Find an entity ─────────────────────────────────────────────────────
     const t_search = Date.now();
@@ -1311,7 +1358,7 @@ async function autoPostNow(postIndex) {
     }
 
     // 6 ── Post to each platform ──────────────────────────────────────────────
-    let anyFailed = false;
+    let anyFailed = false, anyUnconfirmed = false;
     for (const platform of post.platforms) {
       const t_platform = Date.now();
       TechLog.info("POST", "platform_start", { run_id: runId, run_type: "auto",
@@ -1332,6 +1379,14 @@ async function autoPostNow(postIndex) {
         TechLog.error("POST", "platform_failed", { run_id: runId, run_type: "auto",
           platform, error: result.error, duration_ms: Date.now()-t_platform });
         bgLog("error", `Auto Bot: ${platform} failed — ${result.error}`);
+      } else if (result?.confirmed === false) {
+        // Timed out without an explicit completion signal — the post may or may
+        // not have published. Don't count it as success: "done" in the UI must
+        // mean every platform confirmed.
+        anyUnconfirmed = true;
+        TechLog.warn("POST", "platform_unconfirmed", { run_id: runId, run_type: "auto",
+          platform, duration_ms: Date.now()-t_platform });
+        bgLog("warn", `Auto Bot: ${platform} unconfirmed — no completion signal received`);
       } else {
         TechLog.info("POST", "platform_success", { run_id: runId, run_type: "auto",
           platform, duration_ms: Date.now()-t_platform });
@@ -1340,7 +1395,8 @@ async function autoPostNow(postIndex) {
         await new Promise(r => setTimeout(r, 4000));
     }
 
-    const finalStatus       = anyFailed ? "failed" : "done";
+    // "done" ONLY when every platform explicitly confirmed its post.
+    const finalStatus       = anyFailed ? "failed" : (anyUnconfirmed ? "unconfirmed" : "done");
     const total_duration_ms = Date.now()-runStart;
     // Pass post.platforms directly — prevents silent skip when schedule is stale
     await updateRunLogStatus(postIndex, finalStatus, post.platforms);
@@ -1355,6 +1411,8 @@ async function autoPostNow(postIndex) {
     TechLog._flush();
     bgLog("error", `Auto Bot post ${postIndex} failed`, err.message);
     await updateRunLogStatus(postIndex, "failed");
+  } finally {
+    stopKeepAlive();
   }
 }
 
@@ -2337,10 +2395,16 @@ async function handleSocialPost(opts, _attempt = 1) {
       setTimeout(() => chrome.runtime.onMessage.removeListener(closeOnDone), 600000);
     }
 
-    // ── Wait for completion signal (60 s fallback) ───────────────────────────
+    // ── Wait for completion signal ────────────────────────────────────────────
+    // Timeout = NO confirmation. We must not treat it as success ("done" in the
+    // schedule UI requires every platform to have actually confirmed), but we
+    // also must not mark it failed=true — that would trigger the auto-retry and
+    // risk a double post if the platform did publish without us seeing it.
+    // TikTok gets a longer window: video encode + upload can far exceed 60 s.
     if (autoPost) {
+      const confirmTimeoutMs = platform === 'tiktok' ? 240000 : 90000;
       const result = await new Promise(resolve => {
-        const timeout = setTimeout(() => { cleanup(); resolve({ failed: false }); }, 60000);
+        const timeout = setTimeout(() => { cleanup(); resolve({ failed: false, confirmed: false }); }, confirmTimeoutMs);
         function cleanup() { clearTimeout(timeout); chrome.runtime.onMessage.removeListener(listener); }
         function listener(msg, sender) {
           if (sender.tab?.id !== tab.id) return;
@@ -2350,11 +2414,13 @@ async function handleSocialPost(opts, _attempt = 1) {
             chrome.windows.update(winId, { state: 'minimized' }).catch(() => {});
             bgLog('info', 'TikTok: upload accepted — window minimised, posting continues silently');
           }
-          if (msg.type === "PLATFORM_POST_COMPLETE") { cleanup(); resolve({ failed: false }); }
-          if (msg.type === "PLATFORM_POST_FAILED")   { cleanup(); resolve({ failed: true, error: msg.error }); }
+          if (msg.type === "PLATFORM_POST_COMPLETE") { cleanup(); resolve({ failed: false, confirmed: true }); }
+          if (msg.type === "PLATFORM_POST_FAILED")   { cleanup(); resolve({ failed: true, confirmed: false, error: msg.error }); }
         }
         chrome.runtime.onMessage.addListener(listener);
       });
+      if (!result.failed && !result.confirmed)
+        bgLog('warn', `${platform}: no completion signal within ${confirmTimeoutMs/1000}s — post unconfirmed`);
       // Close the whole window (not just the tab) so no minimised window lingers
       setTimeout(() => chrome.windows.remove(winId).catch(() => {}), 3000);
 
@@ -2397,6 +2463,7 @@ async function handleSocialPost(opts, _attempt = 1) {
 
 function injectFacebook(photoDataUrls, caption, songName, location, opts) {
   /* ── helpers ── */
+  const { restaurantName = '' } = opts || {};
   const sleep = ms => new Promise(r => setTimeout(r, ms));
 
   const waitFor = (sel, ms = 8000) => new Promise(res => {
@@ -2424,6 +2491,128 @@ function injectFacebook(photoDataUrls, caption, songName, location, opts) {
     if (setter) setter.call(input, dt.files); else input.files = dt.files;
     input.dispatchEvent(new Event('change', { bubbles: true }));
     input.dispatchEvent(new Event('input',  { bubbles: true }));
+  }
+
+  // Cover overlay (restaurant/hotel/bar name + tagline on the darkest zone).
+  // Native-resolution, downscale-only — see injectInstagram for the rationale
+  // behind NOT rendering on a 2× canvas (that caused sharp text over a blurry photo).
+  async function applyCoverOverlay(dataUrl, name, addr) {
+    return new Promise(resolve => {
+      const img = new Image();
+      img.onload = () => {
+        try {
+          const MAX_W = 1440;
+          const srcW = img.naturalWidth  || 1080;
+          const srcH = img.naturalHeight || 1080;
+          const sc   = Math.min(1, MAX_W / srcW);   // downscale-only — never enlarges
+          const W = Math.round(srcW * sc);
+          const H = Math.round(srcH * sc);
+          const cv = document.createElement('canvas');
+          cv.width = W; cv.height = H;
+          const cx = cv.getContext('2d');
+          cx.drawImage(img, 0, 0, W, H);
+
+          function sampleLum(y0, h0) {
+            try {
+              const d = cx.getImageData(0, Math.round(y0), W, Math.max(1, Math.round(h0))).data;
+              let s = 0, n = 0;
+              for (let i = 0; i < d.length; i += 16) { s += 0.299*d[i]+0.587*d[i+1]+0.114*d[i+2]; n++; }
+              return n ? s/n : 128;
+            } catch(_) { return 128; }
+          }
+          const zones = [
+            { lum: sampleLum(0,       H*0.37), centerY: H*0.22 },
+            { lum: sampleLum(H*0.30,  H*0.40), centerY: H*0.50 },
+            { lum: sampleLum(H*0.63,  H*0.37), centerY: H*0.80 },
+          ];
+          const best = zones.reduce((a, b) => a.lum <= b.lum ? a : b);
+
+          const ref        = Math.min(W, H);
+          const nameSize   = Math.max(24, Math.round(ref * 0.058));
+          const tagSize    = Math.max(12, Math.round(ref * 0.022));
+          const cornerSize = Math.max(9,  Math.round(ref * 0.013));
+          const gap        = Math.round(nameSize * 0.38);
+          const maxTW      = W * 0.78;
+
+          const cityM = (addr||'').match(/\d{4}\s+([A-Za-zÀ-ÿ\s-]+),\s*Belgium/i);
+          const city  = (cityM?.[1] || (addr||'').split(',')[0] || '').trim();
+          const taglines = [
+            `Discover ${city}'s hidden gem ✨`,
+            `Best kept secret in ${city} 🍽`,
+            `A must-visit in ${city} 📍`,
+            `Taste the best of ${city} 🔥`,
+          ];
+          const tagline = city
+            ? taglines[Math.abs([...(name||'')].reduce((a,c)=>a+c.charCodeAt(0),0)) % taglines.length]
+            : 'Discover this hidden gem ✨';
+
+          cx.font = `400 ${nameSize}px "Cormorant Garamond",Georgia,Palatino,serif`;
+          const nameLines = (() => {
+            if (!name) return [''];
+            if (cx.measureText(name).width <= maxTW) return [name];
+            const words = name.split(' ');
+            let best2 = [name, ''], bestDiff = Infinity;
+            for (let i = 1; i < words.length; i++) {
+              const l1 = words.slice(0, i).join(' ');
+              const l2 = words.slice(i).join(' ');
+              const diff = Math.abs(cx.measureText(l1).width - cx.measureText(l2).width);
+              if (diff < bestDiff) { bestDiff = diff; best2 = [l1, l2]; }
+            }
+            return best2;
+          })();
+
+          const nameBlockH = nameLines.length > 1 ? nameSize * 2 + gap * 0.5 : nameSize;
+          const blockH = tagSize + gap + nameBlockH;
+          const padV  = nameSize * 0.9;
+
+          const vl = cx.createLinearGradient(0, best.centerY - blockH/2 - padV, 0, best.centerY + blockH/2 + padV);
+          vl.addColorStop(0,   'rgba(0,0,0,0.00)');
+          vl.addColorStop(0.3, 'rgba(0,0,0,0.42)');
+          vl.addColorStop(0.7, 'rgba(0,0,0,0.42)');
+          vl.addColorStop(1,   'rgba(0,0,0,0.00)');
+          cx.fillStyle = vl; cx.fillRect(0, 0, W, H);
+
+          const diag = Math.sqrt(W*W + H*H) / 2;
+          const ve = cx.createRadialGradient(W/2, H/2, diag*0.40, W/2, H/2, diag*0.95);
+          ve.addColorStop(0, 'rgba(0,0,0,0.00)');
+          ve.addColorStop(1, 'rgba(0,0,0,0.20)');
+          cx.fillStyle = ve; cx.fillRect(0, 0, W, H);
+
+          cx.fillStyle = '#fff'; cx.textAlign = 'center'; cx.textBaseline = 'top';
+          cx.shadowColor = 'rgba(0,0,0,0.65)'; cx.shadowOffsetX = 0;
+          let ty = best.centerY - blockH / 2;
+
+          cx.font = `300 italic ${tagSize}px "Cormorant Garamond",Georgia,Palatino,serif`;
+          cx.shadowBlur = Math.round(tagSize * 0.5); cx.shadowOffsetY = 1;
+          cx.fillText(tagline, W/2, ty, maxTW);
+          ty += tagSize + gap;
+
+          cx.font = `400 ${nameSize}px "Cormorant Garamond",Georgia,Palatino,serif`;
+          cx.shadowBlur = Math.round(nameSize * 0.22); cx.shadowOffsetY = 2;
+          if (nameLines.length > 1) {
+            cx.fillText(nameLines[0], W/2, ty, maxTW);
+            ty += nameSize + Math.round(gap * 0.5);
+            cx.fillText(nameLines[1], W/2, ty, maxTW);
+          } else {
+            cx.fillText(nameLines[0], W/2, ty, maxTW);
+          }
+
+          if (city) {
+            cx.font = `300 ${cornerSize}px "Cormorant Garamond",Georgia,Palatino,serif`;
+            cx.textAlign = 'right'; cx.textBaseline = 'bottom';
+            cx.shadowBlur = 2; cx.shadowOffsetY = 0;
+            cx.fillText(`${city}, Belgium`, W - Math.round(W*0.030), H - Math.round(H*0.022));
+          }
+
+          resolve(cv.toDataURL('image/jpeg', 0.95));
+        } catch(e) {
+          console.warn('FB cover overlay failed — using original:', e?.message);
+          resolve(dataUrl);
+        }
+      };
+      img.onerror = () => resolve(dataUrl);
+      img.src = dataUrl;
+    });
   }
 
   function step(n, total, html, type = 'info') {
@@ -2523,7 +2712,12 @@ function injectFacebook(photoDataUrls, caption, songName, location, opts) {
       step(3, total, 'Photo input not found — click <strong>Photo/Video</strong> and select from Downloads/FoodFluencer.', 'warn');
       return;
     }
-    const files = photoDataUrls.map((url, i) => dataUrlToFile(url, `restaurant-${i + 1}.jpg`));
+    // Apply cover overlay to the first photo (name + tagline), like Instagram/TikTok
+    const coveredFirst = (restaurantName && photoDataUrls.length > 0)
+      ? await applyCoverOverlay(photoDataUrls[0], restaurantName, location || '')
+      : photoDataUrls[0];
+    const allUrls = [coveredFirst, ...photoDataUrls.slice(1)];
+    const files = allUrls.map((url, i) => dataUrlToFile(url, `restaurant-${i + 1}.jpg`));
     step(3, total, `Uploading <strong>${files.length} photo${files.length > 1 ? 's' : ''}</strong>…`);
     setFilesOnInput(fileInput, files);
     await sleep(2200);
@@ -2566,6 +2760,26 @@ function injectFacebook(photoDataUrls, caption, songName, location, opts) {
       if (postBtn) {
         postBtn.click();
         step(4, total, '✅ Posted to Facebook!', 'success');
+
+        // ── Dismiss any post-confirmation dialog so the window doesn't linger ──
+        // and the next scheduled platform can proceed (mirrors Instagram).
+        // CONSERVATIVE: only match explicit "Done/OK" confirmation buttons — we
+        // deliberately do NOT click a Close/X here, because on Facebook the
+        // composer's X can pop a "Discard post?" prompt.
+        try {
+          const DONE_RE = /^(done|ok|gereed|klaar|fertig|terminé|listo|fatto)$/i;
+          const vis = el => !!(el && (el.offsetWidth || el.offsetHeight || el.getClientRects().length));
+          const findDone = () => {
+            const scope = document.querySelector('[role="dialog"]') || document.body;
+            return [...scope.querySelectorAll('[role="button"],button,[tabindex="0"],a')]
+              .find(el => DONE_RE.test((el.innerText || el.textContent || '').trim()) && vis(el)) || null;
+          };
+          let done = null;
+          const deadline = Date.now() + 5000;
+          while (!done && Date.now() < deadline) { done = findDone(); if (!done) await sleep(300); }
+          if (done) { done.click(); await sleep(500); }
+        } catch(_) {}
+
         document.dispatchEvent(new CustomEvent('__ffbot_complete', { detail:{ platform:'facebook' } }));
       } else {
         step(4, total, '⚠️ Could not find Post button', 'warn');
@@ -2795,29 +3009,29 @@ function injectInstagram(photoDataUrls, caption, songName, location, opts) {
         const img = new Image();
         img.onload = () => {
           try {
-            // ── Canvas: cap at 1080px wide, render at 2× for crisp text ───
-            // Rendering at double resolution prevents blurry text on
-            // high-DPI displays — the JPEG export captures the full
-            // 2× pixels, so Instagram sees a sharp image regardless of device.
-            const MAX_W = 1080;
+            // ── Canvas: render at the photo's NATIVE resolution (downscale-only) ──
+            // Critical: we must NOT upscale the photo bitmap. A previous version
+            // rendered onto a 2× canvas "for crisp text", but that stretched the
+            // photo across double the pixels it actually had → sharp text over a
+            // blurry, interpolated photo. Now the canvas matches the photo's real
+            // pixels (capped at MAX_W, never enlarged), so text and photo both
+            // render 1:1 and stay sharp. 1440px gives Instagram's encoder headroom.
+            const MAX_W = 1440;
             const srcW = img.naturalWidth  || 1080;
             const srcH = img.naturalHeight || 1080;
-            const sc   = Math.min(1, MAX_W / srcW);
-            const W = Math.round(srcW * sc);   // logical size (used for all coordinates)
+            const sc   = Math.min(1, MAX_W / srcW);   // downscale-only — never enlarges
+            const W = Math.round(srcW * sc);
             const H = Math.round(srcH * sc);
-            const DPR = 2;                     // render at 2× for sharp text
             const cv = document.createElement('canvas');
-            cv.width  = W * DPR;
-            cv.height = H * DPR;
+            cv.width  = W;
+            cv.height = H;
             const cx = cv.getContext('2d');
-            cx.scale(DPR, DPR);               // all drawing coords stay in logical pixels
             cx.drawImage(img, 0, 0, W, H);
 
             // ── Luminance: pick darkest of 3 horizontal zones ──────────────
-            // getImageData reads physical canvas pixels, so multiply by DPR.
             function sampleLum(y0, h0) {
               try {
-                const d = cx.getImageData(0, Math.round(y0*DPR), W*DPR, Math.max(1, Math.round(h0*DPR))).data;
+                const d = cx.getImageData(0, Math.round(y0), W, Math.max(1, Math.round(h0))).data;
                 let s = 0, n = 0;
                 for (let i = 0; i < d.length; i += 16) { s += 0.299*d[i]+0.587*d[i+1]+0.114*d[i+2]; n++; }
                 return n ? s/n : 128;
@@ -2926,7 +3140,7 @@ function injectInstagram(photoDataUrls, caption, songName, location, opts) {
               cx.fillText(`${city}, Belgium`, W - Math.round(W*0.030), H - Math.round(H*0.022));
             }
 
-            resolve(cv.toDataURL('image/jpeg', 0.93));
+            resolve(cv.toDataURL('image/jpeg', 0.95));
           } catch(e) {
             dbg(`Cover overlay failed: ${e.message} — using original`);
             resolve(dataUrl);
@@ -3399,6 +3613,49 @@ function injectInstagram(photoDataUrls, caption, songName, location, opts) {
           dbg('Confirmation text not found within 20 s — assuming success');
           step(total, total, '✅ Posted to Instagram!', 'success');
         }
+
+        // ── Dismiss the post-share confirmation dialog ─────────────────────────
+        // Instagram leaves a "Your post has been shared" modal open with a
+        // Done/Close control. If we don't dismiss it the window lingers and the
+        // next platform (e.g. TikTok) can stall. Find and click Done/Close/X.
+        try {
+          // "Done" across locales (incl. Dutch: Gereed/Klaar) + Close/OK
+          const DONE_RE  = /^(done|close|ok|gereed|klaar|sluiten|fertig|schließen|terminé|fermer|listo|cerrar|fatto|chiudi)$/i;
+          const CLOSE_AL = /^(close|sluiten|schließen|fermer|cerrar|chiudi|stäng)$/i;
+          function findDismiss() {
+            const dialog = document.querySelector('[role="dialog"]');
+            const roots  = [dialog, document.body].filter(Boolean);
+            // ① Text match — Done/Close/OK button
+            for (const root of roots) {
+              const btn = [...root.querySelectorAll('[role="button"],button,[tabindex="0"],a')]
+                .find(el => DONE_RE.test((el.innerText || el.textContent || '').trim()) && isVisible(el));
+              if (btn) return btn;
+            }
+            // ② aria-label X / Close (svg button in the dialog header)
+            for (const root of roots) {
+              const btn = [...root.querySelectorAll('[role="button"],button,[aria-label]')]
+                .find(el => CLOSE_AL.test(el.getAttribute('aria-label') || '') && isVisible(el));
+              if (btn) return btn;
+            }
+            return null;
+          }
+          let dismiss = null;
+          const dismissDeadline = Date.now() + 5000;
+          while (!dismiss && Date.now() < dismissDeadline) {
+            dismiss = findDismiss();
+            if (!dismiss) await sleep(300);
+          }
+          if (dismiss) {
+            reactClick(dismiss);
+            dbg(`Dismissed confirmation via "${(dismiss.innerText||dismiss.getAttribute('aria-label')||'close').trim()}"`);
+            await sleep(500);
+          } else {
+            dbg('No Done/Close control found — confirmation may auto-dismiss');
+          }
+        } catch(e) {
+          dbg(`Dismiss step error (non-fatal): ${e.message}`);
+        }
+
         document.dispatchEvent(new CustomEvent('__ffbot_complete', { detail:{ platform:'instagram' } }));
       } else {
         step(total, total, '⚠️ Share button not found — click it manually.', 'warn');
