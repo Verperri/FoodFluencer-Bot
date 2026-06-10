@@ -80,6 +80,8 @@ function openSettings() {
 
   loadDiagResults();
   refreshLogsBadges();
+  loadDiagnosticsSettings();
+  loadAdminSettings();
 
   panel.classList.remove('hidden');
   backdrop.classList.remove('hidden');
@@ -162,6 +164,8 @@ document.getElementById('stApiKeysHdr')  ?.addEventListener('click', () => toggl
 document.getElementById('stFeaturesHdr') ?.addEventListener('click', () => toggleDrawer('stFeaturesHdr', 'stFeaturesBody'));
 document.getElementById('stLogsHdr')     ?.addEventListener('click', () => { toggleDrawer('stLogsHdr', 'stLogsBody'); });
 document.getElementById('stDiagHdr')     ?.addEventListener('click', () => toggleDrawer('stDiagHdr',     'stDiagBody'));
+document.getElementById('stTelemetryHdr')?.addEventListener('click', () => toggleDrawer('stTelemetryHdr', 'stTelemetryBody'));
+document.getElementById('stAdminHdr')    ?.addEventListener('click', () => toggleDrawer('stAdminHdr',     'stAdminBody'));
 
 // API key sub-drawers
 document.getElementById('stGoogleHdr')?.addEventListener('click', e => { e.stopPropagation(); toggleDrawer('stGoogleHdr', 'stGoogleBody'); });
@@ -205,6 +209,129 @@ document.getElementById('settingsSaveFsqKey')?.addEventListener('click', () => {
     chrome.storage.local.get({ googleApiKey: '' }, ({ googleApiKey }) =>
       renderFeatureStatus('settingsFeatures', !!googleApiKey, true));
   });
+});
+
+// ── Diagnostics & Sharing — opt-in toggle + Install ID ───────────────────────
+document.getElementById('settingsTelemetryOptIn')?.addEventListener('change', e => {
+  chrome.storage.local.set({ telemetryOptIn: e.target.checked });
+});
+
+document.getElementById('settingsCopyInstallId')?.addEventListener('click', async () => {
+  const input  = document.getElementById('settingsInstallId');
+  const status = document.getElementById('settingsInstallIdStatus');
+  if (!input?.value) return;
+  try {
+    await navigator.clipboard.writeText(input.value);
+    if (status) { status.className = 'settings-key-status ok'; status.textContent = '✓ Copied to clipboard'; }
+  } catch (_) {
+    input.select();
+    if (status) { status.className = 'settings-key-status warn'; status.textContent = 'Select and copy manually.'; }
+  }
+});
+
+function loadDiagnosticsSettings() {
+  chrome.storage.local.get({ telemetryOptIn: false, installId: null }, async ({ telemetryOptIn, installId }) => {
+    const toggle = document.getElementById('settingsTelemetryOptIn');
+    if (toggle) toggle.checked = telemetryOptIn;
+
+    if (!installId) installId = await getInstallId();
+    const idInput = document.getElementById('settingsInstallId');
+    if (idInput) idInput.value = installId;
+  });
+}
+
+// ── Admin panel — maintainer-only access to the centralized telemetry store ──
+// The admin token is entered manually and stored only in this browser's
+// chrome.storage.local; it is never bundled with the extension, so other
+// users have no way to obtain it. Without a valid token the Worker's
+// /admin/* routes reject requests with 401. The "Unlock" step verifies the
+// token against the Worker before revealing the lookup tools.
+function loadAdminSettings() {
+  chrome.storage.local.get({ adminToken: '' }, ({ adminToken }) => {
+    document.getElementById('settingsAdminPanel')?.classList.toggle('hidden', !adminToken);
+    document.getElementById('settingsAdminTokenRow')?.classList.toggle('hidden', !!adminToken);
+    const status = document.getElementById('settingsAdminStatus');
+    if (status) {
+      status.className = 'settings-key-status ' + (adminToken ? 'ok' : '');
+      status.textContent = adminToken ? '✓ Unlocked' : '';
+    }
+  });
+}
+
+async function adminFetch(path) {
+  const endpoint = (typeof CONFIG !== 'undefined' && CONFIG.TELEMETRY_ENDPOINT) || '';
+  const status = document.getElementById('settingsAdminStatus');
+  const results = document.getElementById('settingsAdminResults');
+  if (!endpoint) {
+    if (status) { status.className = 'settings-key-status warn'; status.textContent = 'No telemetry endpoint configured.'; }
+    return null;
+  }
+  const { adminToken = '' } = await chrome.storage.local.get({ adminToken: '' });
+  if (!adminToken) return null;
+
+  try {
+    const res = await fetch(`${endpoint}${path}`, {
+      headers: { Authorization: `Bearer ${adminToken}` },
+    });
+    const data = await res.json();
+    if (!res.ok) {
+      if (status) { status.className = 'settings-key-status warn'; status.textContent = `✗ ${data.error || res.status}`; }
+      return null;
+    }
+    if (status) { status.className = 'settings-key-status ok'; status.textContent = '✓ Loaded'; }
+    if (results) results.textContent = JSON.stringify(data, null, 2);
+    return data;
+  } catch (e) {
+    if (status) { status.className = 'settings-key-status warn'; status.textContent = `✗ ${e.message}`; }
+    return null;
+  }
+}
+
+document.getElementById('settingsAdminSaveToken')?.addEventListener('click', async () => {
+  const input  = document.getElementById('settingsAdminToken');
+  const status = document.getElementById('settingsAdminStatus');
+  const val = (input?.value || '').trim();
+  if (!val) { if (status) { status.className = 'settings-key-status warn'; status.textContent = 'Enter the admin token.'; } return; }
+
+  const endpoint = (typeof CONFIG !== 'undefined' && CONFIG.TELEMETRY_ENDPOINT) || '';
+  if (!endpoint) { if (status) { status.className = 'settings-key-status warn'; status.textContent = 'No telemetry endpoint configured.'; } return; }
+
+  if (status) { status.className = 'settings-key-status'; status.textContent = 'Checking…'; }
+  try {
+    const res = await fetch(`${endpoint}/admin/installs`, { headers: { Authorization: `Bearer ${val}` } });
+    if (!res.ok) {
+      if (status) { status.className = 'settings-key-status warn'; status.textContent = res.status === 401 ? '✗ Invalid token' : `✗ ${res.status}`; }
+      return;
+    }
+    await chrome.storage.local.set({ adminToken: val });
+    if (input) input.value = '';
+    if (status) { status.className = 'settings-key-status ok'; status.textContent = '✓ Unlocked'; }
+    document.getElementById('settingsAdminPanel')?.classList.remove('hidden');
+    document.getElementById('settingsAdminTokenRow')?.classList.add('hidden');
+  } catch (e) {
+    if (status) { status.className = 'settings-key-status warn'; status.textContent = `✗ ${e.message}`; }
+  }
+});
+
+document.getElementById('settingsAdminLock')?.addEventListener('click', async () => {
+  await chrome.storage.local.remove('adminToken');
+  document.getElementById('settingsAdminPanel')?.classList.add('hidden');
+  document.getElementById('settingsAdminTokenRow')?.classList.remove('hidden');
+  document.getElementById('settingsAdminToken').value = '';
+  const results = document.getElementById('settingsAdminResults');
+  if (results) results.textContent = '';
+  const status = document.getElementById('settingsAdminStatus');
+  if (status) { status.className = 'settings-key-status'; status.textContent = ''; }
+});
+
+document.getElementById('settingsAdminFetchInstalls')?.addEventListener('click', () => adminFetch('/admin/installs'));
+document.getElementById('settingsAdminFetchLogs')?.addEventListener('click', () => {
+  const id = document.getElementById('settingsAdminInstallId')?.value.trim();
+  if (id) adminFetch(`/admin/logs?installId=${encodeURIComponent(id)}`);
+});
+document.getElementById('settingsAdminFetchFeedback')?.addEventListener('click', () => {
+  const id = document.getElementById('settingsAdminInstallId')?.value.trim();
+  if (id) adminFetch(`/admin/feedback?installId=${encodeURIComponent(id)}`);
 });
 
 // ── Logs & Statistics — sub-drawer wiring ────────────────────────────────────
@@ -624,6 +751,34 @@ const COST_PHOTO       = 0.007;
 const WARN_SOFT        = 5;
 const WARN_HARD        = 20;
 
+// ── Centralized telemetry (opt-in) ────────────────────────────────────────────
+// Mirrors the helper in background.js — see that file for the rationale.
+// Sends technical-log batches to the developer-run Cloudflare Worker, tagged
+// with an anonymous per-install UUID, only when the user has enabled
+// "Diagnostics & Sharing" in Settings and CONFIG.TELEMETRY_ENDPOINT is set.
+async function getInstallId() {
+  const { installId } = await chrome.storage.local.get({ installId: null });
+  if (installId) return installId;
+  const id = crypto.randomUUID();
+  await chrome.storage.local.set({ installId: id });
+  return id;
+}
+
+async function sendTelemetry(kind, payload) {
+  const endpoint = (typeof CONFIG !== 'undefined' && CONFIG.TELEMETRY_ENDPOINT) || '';
+  if (!endpoint) return;
+  try {
+    const { telemetryOptIn = false } = await chrome.storage.local.get({ telemetryOptIn: false });
+    if (!telemetryOptIn) return;
+    const installId = await getInstallId();
+    await fetch(`${endpoint}/v1/${kind}`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ installId, ts: new Date().toISOString(), ...payload }),
+    });
+  } catch (_) { /* telemetry is best-effort only */ }
+}
+
 // ══════════════════════════════════════════════════════════════════════════════
 // TECHNICAL LOGGER — structured action log for debugging and audit
 // ══════════════════════════════════════════════════════════════════════════════
@@ -661,6 +816,7 @@ const TechLog = {
       const updated = [...techLog, ...toFlush].slice(-1000); // keep last 1000 entries
       chrome.storage.local.set({ techLog: updated });
     });
+    sendTelemetry('logs', { entries: toFlush });
   },
 
   exportCSV() {
@@ -769,6 +925,52 @@ const IG_MAX_RATIO    = 1.91; // Instagram maximum aspect ratio (~landscape)
 // true source photo, not the small grid thumbnail.
 const QUALITY_SCAN_DIM = 2048;
 
+// ── Content appeal heuristics ─────────────────────────────────────────────────
+// Mirrors computeAppealMetrics() in background.js — see that file for the
+// rationale behind each metric. Kept as a duplicate here since popup.js and
+// the service worker run in separate execution contexts with no shared module.
+function computeAppealMetrics(data, gray, W, H) {
+  const total = W * H;
+
+  let rgSum = 0, ybSum = 0, rgSumSq = 0, ybSumSq = 0, rbSum = 0;
+  for (let i = 0; i < total; i++) {
+    const r = data[i * 4], g = data[i * 4 + 1], b = data[i * 4 + 2];
+    const rg = r - g;
+    const yb = 0.5 * (r + g) - b;
+    rgSum += rg; ybSum += yb;
+    rgSumSq += rg * rg; ybSumSq += yb * yb;
+    rbSum += (r - b);
+  }
+  const rgMean = rgSum / total, ybMean = ybSum / total;
+  const rgStd = Math.sqrt(Math.max(0, rgSumSq / total - rgMean * rgMean));
+  const ybStd = Math.sqrt(Math.max(0, ybSumSq / total - ybMean * ybMean));
+  const colorfulness = Math.sqrt(rgStd * rgStd + ybStd * ybStd) + 0.3 * Math.sqrt(rgMean * rgMean + ybMean * ybMean);
+  const warmth = rbSum / total;
+
+  const x0 = Math.floor(W * 0.25), x1 = Math.floor(W * 0.75);
+  const y0 = Math.floor(H * 0.25), y1 = Math.floor(H * 0.75);
+  let centerE = 0, centerN = 0, outerE = 0, outerN = 0;
+  for (let y = 1; y < H - 1; y++) {
+    for (let x = 1; x < W - 1; x++) {
+      const idx = y * W + x;
+      const lap = gray[idx - W] + gray[idx + W] + gray[idx - 1] + gray[idx + 1] - 4 * gray[idx];
+      const e = lap * lap;
+      if (x >= x0 && x < x1 && y >= y0 && y < y1) { centerE += e; centerN++; }
+      else { outerE += e; outerN++; }
+    }
+  }
+  const centerDensity = centerN ? centerE / centerN : 0;
+  const outerDensity  = outerN  ? outerE  / outerN  : 0;
+  const centerFocus = outerDensity > 0 ? centerDensity / outerDensity : 1;
+
+  const colorfulnessNorm = Math.max(0, Math.min(100, colorfulness * 1.2));
+  const warmthNorm       = Math.max(0, Math.min(100, ((warmth + 60) / 120) * 100));
+  const centerFocusNorm  = Math.max(0, Math.min(100, (centerFocus / 2) * 100));
+
+  const appeal = colorfulnessNorm * 0.4 + warmthNorm * 0.3 + centerFocusNorm * 0.3;
+  return { colorfulness, warmth, centerFocus, appeal };
+}
+
 // Returns { score, blurScore, meetsResolution, width, height }
 // score         — combined quality signal (higher = better)
 // blurScore     — Laplacian variance; higher means sharper
@@ -813,10 +1015,16 @@ async function scorePhotoQuality(uri) {
         // Penalise very dark (<40) or blown-out (>215)
         const brightnessPenalty = Math.max(0, 40 - mean) + Math.max(0, mean - 215);
         // Combined score: contrast + capped blur contribution - brightness penalty
-        const score = contrast + Math.min(blurScore * 0.12, 25) - brightnessPenalty * 0.5;
+        const baseScore = contrast + Math.min(blurScore * 0.12, 25) - brightnessPenalty * 0.5;
+
+        // Blend in content-appeal (colorfulness/warmth/center focus) so the
+        // "Best" cover pick also favours engaging-looking shots, not just
+        // technically clean ones.
+        const { colorfulness, warmth, centerFocus, appeal } = computeAppealMetrics(d, gray, SW, SH);
+        const score = baseScore * 0.5 + appeal * 0.5;
 
         const meetsResolution = Math.min(img.naturalWidth, img.naturalHeight) >= MIN_PHOTO_DIM;
-        resolve({ score, blurScore, meetsResolution,
+        resolve({ score, blurScore, meetsResolution, appeal, colorfulness, warmth, centerFocus,
                   width: img.naturalWidth, height: img.naturalHeight });
       } catch(_) {
         resolve({ score: 50, blurScore: 100, meetsResolution: true, width: 0, height: 0 });

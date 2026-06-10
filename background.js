@@ -1,4 +1,6 @@
-﻿// ── Human-like timing jitter ───────────────────────────────────────────────────
+﻿importScripts('config.js');
+
+// ── Human-like timing jitter ───────────────────────────────────────────────────
 // Adds randomized variance (±35% by default) to scripted delays so the auto-bot's
 // pacing doesn't follow a perfectly uniform, machine-like fingerprint that
 // platforms could use to flag the account for re-verification.
@@ -441,6 +443,68 @@ async function fetchAsDataUrl(url, signal) {
 // upscaled, so we reject it here regardless of how sharp it looks downscaled.
 const MIN_SOURCE_DIM = 720;
 
+// ── Content appeal heuristics ─────────────────────────────────────────────────
+// On top of the technical pass/fail gate, candidate photos are ranked by an
+// "appeal" score meant to proxy how engaging the content looks for a food/venue
+// post — favouring vibrant, warm-toned shots with a clear central subject over
+// flat, cold, or cluttered ones.
+//
+//   colorfulness  Hasler–Süsstrunk metric over the rg/yb opponent channels.
+//                 Vibrant, colourful shots (food close-ups) score high; drab
+//                 or monochrome scenes score low.
+//
+//   warmth        Mean (R - B) across pixels. Positive = warm tones (reds/
+//                 oranges/browns typical of appetising food shots).
+//
+//   centerFocus   Ratio of edge energy (Laplacian²) in the center 50% of the
+//                 frame vs. the surrounding border. >1 means the center is
+//                 more "in focus"/detailed than the edges — suggests a clear
+//                 subject rather than a busy or empty background.
+//
+// Returns { colorfulness, warmth, centerFocus, appeal } where `appeal` is a
+// 0-100 weighted blend of the normalised sub-scores.
+function computeAppealMetrics(data, gray, W, H) {
+  const total = W * H;
+
+  let rgSum = 0, ybSum = 0, rgSumSq = 0, ybSumSq = 0, rbSum = 0;
+  for (let i = 0; i < total; i++) {
+    const r = data[i * 4], g = data[i * 4 + 1], b = data[i * 4 + 2];
+    const rg = r - g;
+    const yb = 0.5 * (r + g) - b;
+    rgSum += rg; ybSum += yb;
+    rgSumSq += rg * rg; ybSumSq += yb * yb;
+    rbSum += (r - b);
+  }
+  const rgMean = rgSum / total, ybMean = ybSum / total;
+  const rgStd = Math.sqrt(Math.max(0, rgSumSq / total - rgMean * rgMean));
+  const ybStd = Math.sqrt(Math.max(0, ybSumSq / total - ybMean * ybMean));
+  const colorfulness = Math.sqrt(rgStd * rgStd + ybStd * ybStd) + 0.3 * Math.sqrt(rgMean * rgMean + ybMean * ybMean);
+  const warmth = rbSum / total;
+
+  const x0 = Math.floor(W * 0.25), x1 = Math.floor(W * 0.75);
+  const y0 = Math.floor(H * 0.25), y1 = Math.floor(H * 0.75);
+  let centerE = 0, centerN = 0, outerE = 0, outerN = 0;
+  for (let y = 1; y < H - 1; y++) {
+    for (let x = 1; x < W - 1; x++) {
+      const idx = y * W + x;
+      const lap = gray[idx - W] + gray[idx + W] + gray[idx - 1] + gray[idx + 1] - 4 * gray[idx];
+      const e = lap * lap;
+      if (x >= x0 && x < x1 && y >= y0 && y < y1) { centerE += e; centerN++; }
+      else { outerE += e; outerN++; }
+    }
+  }
+  const centerDensity = centerN ? centerE / centerN : 0;
+  const outerDensity  = outerN  ? outerE  / outerN  : 0;
+  const centerFocus = outerDensity > 0 ? centerDensity / outerDensity : 1;
+
+  const colorfulnessNorm = Math.max(0, Math.min(100, colorfulness * 1.2));
+  const warmthNorm       = Math.max(0, Math.min(100, ((warmth + 60) / 120) * 100));
+  const centerFocusNorm  = Math.max(0, Math.min(100, (centerFocus / 2) * 100));
+
+  const appeal = colorfulnessNorm * 0.4 + warmthNorm * 0.3 + centerFocusNorm * 0.3;
+  return { colorfulness, warmth, centerFocus, appeal };
+}
+
 async function scoreImageQuality(dataUrl) {
   try {
     const SIZE = 150;
@@ -518,7 +582,16 @@ async function scoreImageQuality(dataUrl) {
     if (contrast    <  20)  reasons.push(`low contrast (σ ${contrast.toFixed(0)})`);
     if (saturation  <   8)  reasons.push(`near-greyscale (saturation ${saturation.toFixed(1)} %)`);
 
+    // ── Appeal score & combined rank score ────────────────────────────────────
+    // qualityScore rewards sharpness/contrast beyond the bare pass thresholds;
+    // rankScore blends it 50/50 with the content-appeal score so the waterfall
+    // can pick the most engaging photo among several that all pass the gate.
+    const { colorfulness, warmth, centerFocus, appeal } = computeAppealMetrics(data, gray, SIZE, SIZE);
+    const qualityScore = Math.min(50, blurScore * 0.15) + Math.min(50, contrast);
+    const rankScore = qualityScore * 0.5 + appeal * 0.5;
+
     return { blur: blurScore, brightness, contrast, saturation,
+             colorfulness, warmth, centerFocus, appeal, rankScore,
              width: srcW, height: srcH,
              passed: reasons.length === 0, reasons };
   } catch (e) {
@@ -526,6 +599,7 @@ async function scoreImageQuality(dataUrl) {
     // silently dropping a potentially good image.
     bgLog('warn', `PhotoQuality: scoring error — letting photo through (${e.message})`);
     return { blur: 999, brightness: 128, contrast: 50, saturation: 50,
+             colorfulness: 0, warmth: 0, centerFocus: 1, appeal: 50, rankScore: 50,
              width: 0, height: 0, passed: true, reasons: [] };
   }
 }
@@ -837,6 +911,10 @@ async function fetchPhotosWaterfall(businessName, address, entityType, minPics, 
   const cityM = address.match(CITY_FROM_ADDRESS_RE_BG);
   const city  = (cityM?.[1] || address.split(',')[0] || '').trim();
   const target = Math.min(Math.max(minPics, SCRAPE_MIN), 5);
+  // Over-collect a small pool beyond `target` so the most engaging photos
+  // (highest rankScore — quality + content appeal) can be picked from a
+  // wider set rather than just the first `target` that pass the gate.
+  const poolTarget = Math.min(target + 2, 8);
 
   bgLog('info', `PhotoWaterfall start — "${businessName}" ${city}, target=${target}`);
   TechLog.info('PHOTO', 'waterfall_start', { businessName, city, entityType, target });
@@ -850,12 +928,12 @@ async function fetchPhotosWaterfall(businessName, address, entityType, minPics, 
   // moving on. Quality failures are logged and skipped; the loop simply
   // continues to the next URL in the same source's pool.
   async function collectFromUrls(urls, sourceName) {
-    const needed = target - collected.length;
+    const needed = poolTarget - collected.length;
     if (needed <= 0) return;
 
     let accepted = 0, rejected = 0;
     for (const url of urls) {
-      if (collected.length >= target) break;
+      if (collected.length >= poolTarget) break;
       try {
         const controller = new AbortController();
         const timeoutId  = setTimeout(() => controller.abort(), 9000);
@@ -887,17 +965,25 @@ async function fetchPhotosWaterfall(businessName, address, entityType, minPics, 
           continue;
         }
         accepted++;
-        bgLog('info', `PhotoQuality[${sourceName}]: ✓ blur=${quality.blur.toFixed(0)} bright=${quality.brightness.toFixed(0)} contrast=${quality.contrast.toFixed(0)} sat=${quality.saturation.toFixed(1)}% (${collected.length + 1}/${target})`);
+        bgLog('info', `PhotoQuality[${sourceName}]: ✓ blur=${quality.blur.toFixed(0)} bright=${quality.brightness.toFixed(0)} contrast=${quality.contrast.toFixed(0)} sat=${quality.saturation.toFixed(1)}% appeal=${quality.appeal.toFixed(0)} (${collected.length + 1}/${poolTarget})`);
         // ──────────────────────────────────────────────────────────────────
 
-        collected.push({ dataUrl, sourceUrl: url, source: sourceName });
+        collected.push({
+          dataUrl, sourceUrl: url, source: sourceName,
+          width: quality.width, height: quality.height,
+          blur: quality.blur, brightness: quality.brightness,
+          contrast: quality.contrast, saturation: quality.saturation,
+          colorfulness: quality.colorfulness, warmth: quality.warmth,
+          centerFocus: quality.centerFocus, appeal: quality.appeal,
+          rankScore: quality.rankScore,
+        });
       } catch(_) {}
     }
 
     if (accepted > 0) {
-      bgLog('info', `PhotoWaterfall[${sourceName}]: contributed ${accepted} photos (${rejected} rejected) — total ${collected.length}/${target}`);
+      bgLog('info', `PhotoWaterfall[${sourceName}]: contributed ${accepted} photos (${rejected} rejected) — total ${collected.length}/${poolTarget}`);
       TechLog.info('PHOTO', 'source_contribution', {
-        source: sourceName, accepted, rejected, total: collected.length, target,
+        source: sourceName, accepted, rejected, total: collected.length, target: poolTarget,
       });
     } else {
       bgLog('info', `PhotoWaterfall[${sourceName}]: 0 quality photos from ${urls.length} URLs (${rejected} rejected)`);
@@ -908,47 +994,79 @@ async function fetchPhotosWaterfall(businessName, address, entityType, minPics, 
   const gmUrls = await raceTimeout(scrapeGoogleMapsPhotos(businessName, city), 10000);
   if (gmUrls.length > 0) await collectFromUrls(gmUrls, 'google_maps');
 
-  // ── 2. DuckDuckGo — only if still short of target ─────────────────────────
-  if (collected.length < target) {
-    bgLog('info', `PhotoWaterfall: need ${target - collected.length} more — trying DuckDuckGo`);
+  // ── 2. DuckDuckGo — only if still short of pool ────────────────────────────
+  if (collected.length < poolTarget) {
+    bgLog('info', `PhotoWaterfall: need ${poolTarget - collected.length} more — trying DuckDuckGo`);
     const ddgUrls = await raceTimeout(scrapeDDGPhotos(businessName, city, entityType), 14000);
     if (ddgUrls.length > 0) await collectFromUrls(ddgUrls, 'duckduckgo');
   }
 
-  // ── 3. Yelp — only if still short of target ───────────────────────────────
-  if (collected.length < target) {
-    bgLog('info', `PhotoWaterfall: need ${target - collected.length} more — trying Yelp`);
+  // ── 3. Yelp — only if still short of pool ──────────────────────────────────
+  if (collected.length < poolTarget) {
+    bgLog('info', `PhotoWaterfall: need ${poolTarget - collected.length} more — trying Yelp`);
     const yelpUrls = await raceTimeout(scrapeYelpPhotos(businessName, city), 18000);
     if (yelpUrls.length > 0) await collectFromUrls(yelpUrls, 'yelp');
   }
 
-  // ── 3.5 TripAdvisor — only if still short of target ──────────────────────
-  if (collected.length < target) {
-    bgLog('info', `PhotoWaterfall: need ${target - collected.length} more — trying TripAdvisor`);
+  // ── 3.5 TripAdvisor — only if still short of pool ──────────────────────────
+  if (collected.length < poolTarget) {
+    bgLog('info', `PhotoWaterfall: need ${poolTarget - collected.length} more — trying TripAdvisor`);
     const taUrls = await raceTimeout(scrapeTripAdvisorPhotos(businessName, city), 20000);
     if (taUrls.length > 0) await collectFromUrls(taUrls, 'tripadvisor');
   }
 
   // ── 3.8 Foursquare API — quota-tracked, only if key configured ───────────
-  if (collected.length < target && foursquareApiKey) {
-    bgLog('info', `PhotoWaterfall: need ${target - collected.length} more — trying Foursquare`);
+  if (collected.length < poolTarget && foursquareApiKey) {
+    bgLog('info', `PhotoWaterfall: need ${poolTarget - collected.length} more — trying Foursquare`);
     const fsqUrls = await raceTimeout(fetchFoursquarePhotos(businessName, city, foursquareApiKey), 15000);
     if (fsqUrls.length > 0) await collectFromUrls(fsqUrls, 'foursquare');
   }
 
   // ── 4. Google Places API — last resort, quota-consuming ───────────────────
-  if (collected.length < target) {
+  if (collected.length < poolTarget) {
     if (!apiKey) {
       bgLog('warn', 'PhotoWaterfall: no API key — skipping Google Places fallback.');
       TechLog.warn('PHOTO', 'waterfall_no_api_key', { collected: collected.length });
     } else {
-      bgLog('info', `PhotoWaterfall: need ${target - collected.length} more — trying Google Places API`);
-      const needed   = target - collected.length;
+      bgLog('info', `PhotoWaterfall: need ${poolTarget - collected.length} more — trying Google Places API`);
+      const needed   = poolTarget - collected.length;
       const uris     = await Promise.all(
         placePhotoObjects.slice(0, needed + 2).map(p => resolvePhotoUriBG(p.name, 2048, apiKey))
       );
       await collectFromUrls(uris, 'google_places');
     }
+  }
+
+  // ── Rank by content appeal & trim to target ───────────────────────────────
+  // The pool may hold up to `poolTarget` quality-passing photos; keep the
+  // `target` highest-rankScore ones (quality + content appeal blend) so the
+  // most engaging shots make it into the post.
+  let droppedForTelemetry = [];
+  if (collected.length > target) {
+    collected.sort((a, b) => b.rankScore - a.rankScore);
+    droppedForTelemetry = collected.splice(target);
+    bgLog('info', `PhotoWaterfall: ranked pool of ${collected.length + droppedForTelemetry.length} — kept top ${target} by appeal`);
+    TechLog.info('PHOTO', 'appeal_ranking', {
+      kept: collected.map(p => ({ source: p.source, rankScore: +p.rankScore.toFixed(1), appeal: +p.appeal.toFixed(1) })),
+      dropped: droppedForTelemetry.map(p => ({ source: p.source, rankScore: +p.rankScore.toFixed(1), appeal: +p.appeal.toFixed(1) })),
+    });
+  }
+
+  // Send photo-level quality/appeal metrics for the centralized feedback loop
+  // (opt-in only — see sendTelemetry). No business names/addresses included.
+  if (collected.length > 0) {
+    const photoMetrics = p => ({
+      source: p.source, width: p.width, height: p.height,
+      blur: p.blur, brightness: p.brightness, contrast: p.contrast, saturation: p.saturation,
+      colorfulness: p.colorfulness, warmth: p.warmth, centerFocus: p.centerFocus,
+      appeal: p.appeal, rankScore: p.rankScore,
+    });
+    sendTelemetry('feedback', {
+      photos: [
+        ...collected.map(p => ({ ...photoMetrics(p), kept: true })),
+        ...droppedForTelemetry.map(p => ({ ...photoMetrics(p), kept: false })),
+      ],
+    });
   }
 
   // ── Final result ───────────────────────────────────────────────────────────
@@ -1521,6 +1639,35 @@ async function autoPostNow(postIndex) {
   }
 }
 
+// ── Centralized telemetry (opt-in) ────────────────────────────────────────────
+// Sends technical-log batches and photo-appeal feedback to the developer-run
+// Cloudflare Worker (cloud/worker.js), tagged with an anonymous per-install
+// UUID. Disabled unless the user enables "Diagnostics & Sharing" in Settings
+// AND CONFIG.TELEMETRY_ENDPOINT is configured. Best-effort — never blocks or
+// throws on failure.
+async function getInstallId() {
+  const { installId } = await chrome.storage.local.get({ installId: null });
+  if (installId) return installId;
+  const id = crypto.randomUUID();
+  await chrome.storage.local.set({ installId: id });
+  return id;
+}
+
+async function sendTelemetry(kind, payload) {
+  const endpoint = (typeof CONFIG !== 'undefined' && CONFIG.TELEMETRY_ENDPOINT) || '';
+  if (!endpoint) return;
+  try {
+    const { telemetryOptIn = false } = await chrome.storage.local.get({ telemetryOptIn: false });
+    if (!telemetryOptIn) return;
+    const installId = await getInstallId();
+    await fetch(`${endpoint}/v1/${kind}`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ installId, ts: new Date().toISOString(), ...payload }),
+    });
+  } catch (_) { /* telemetry is best-effort only */ }
+}
+
 // ── Technical logger (background context) ────────────────────────────────────
 const TechLog = {
   _buf: [],
@@ -1540,6 +1687,7 @@ const TechLog = {
     chrome.storage.local.get({ techLog:[] }, ({techLog}) => {
       chrome.storage.local.set({ techLog:[...techLog,...toFlush].slice(-1000) });
     });
+    sendTelemetry('logs', { entries: toFlush });
   },
 };
 
@@ -4876,6 +5024,9 @@ function injectTikTok(photoDataUrls, caption, songName, location, opts) {
 // Exposed for the Jest suite (test/injectors/*) — `module` is undefined in the
 // extension's service-worker context so this is a no-op at runtime.
 if (typeof module !== 'undefined' && module.exports) {
-  module.exports = { injectFacebook, injectInstagram, injectTikTok, INJECTORS };
+  module.exports = {
+    injectFacebook, injectInstagram, injectTikTok, INJECTORS,
+    sendTelemetry, getInstallId, TechLog, computeAppealMetrics, scoreImageQuality,
+  };
 }
 
