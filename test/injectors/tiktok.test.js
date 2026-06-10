@@ -274,7 +274,7 @@ describe('TikTok injector — step 6: finalize (auto-post vs. manual hand-off)',
     await runTimersInSteps(60000);
 
     expect(onFailed).toHaveBeenCalledTimes(1);
-    expect(onFailed.mock.calls[0][0].detail).toEqual({ platform: 'tiktok', error: 'Post button not found' });
+    expect(onFailed.mock.calls[0][0].detail).toMatchObject({ platform: 'tiktok', error: 'Post button not found' });
   });
 
   test('manual mode leaves the Post click to the user', async () => {

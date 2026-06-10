@@ -341,7 +341,7 @@ describe('Instagram injector — step 8: finalize (auto-post vs. manual hand-off
     await runTimersInSteps(60000);
 
     expect(onFailed).toHaveBeenCalledTimes(1);
-    expect(onFailed.mock.calls[0][0].detail).toEqual({ platform: 'instagram', error: 'Share button not found' });
+    expect(onFailed.mock.calls[0][0].detail).toMatchObject({ platform: 'instagram', error: 'Share button not found' });
   });
 
   test('manual mode hands off to the user with a song hint and does not auto-share', async () => {

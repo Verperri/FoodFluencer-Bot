@@ -2798,6 +2798,8 @@ function deactivateBot() {
     if (prev) updates.autoBotLastSchedule = prev;
     chrome.storage.local.set(updates);
   });
+  chrome.storage.local.remove("autoBotPaused");
+  hidePausedBanner();
   chrome.alarms.clearAll();
   updateBotUI(false);
   // Reset schedule-specific UI
@@ -2847,7 +2849,11 @@ function setupScheduleAlarms(schedule) {
   chrome.alarms.clearAll(() => {
     const now = Date.now();
     schedule.posts.forEach((post, idx) => {
-      const when = new Date(`${post.date}T${post.time}:00`).getTime();
+      const base = new Date(`${post.date}T${post.time}:00`).getTime();
+      // Add a random 0-15 min delay so posts don't fire at the exact same
+      // second every day — a uniform schedule is an easy automation signal.
+      // A little extra delay is harmless since this only runs a few times a day.
+      const when = base + Math.floor(Math.random() * 15 * 60 * 1000);
       if (when > now) chrome.alarms.create(`ffbot-auto-${idx}`, { when });
     });
     AppLog.info(`Set ${schedule.posts.length} alarms`);
@@ -3043,8 +3049,34 @@ function updateConfigSummary() {
   el.textContent = `${type.charAt(0).toUpperCase() + type.slice(1)} · ${country} · ${region}`;
 }
 
+// ── Paused banner ──────────────────────────────────────────────────────────────
+function showPausedBanner(reason) {
+  const banner = document.getElementById("abPausedBanner");
+  const reasonEl = document.getElementById("abPausedReason");
+  if (reasonEl) reasonEl.textContent = reason || "The bot needs your attention.";
+  banner?.classList.remove("hidden");
+}
+function hidePausedBanner() {
+  document.getElementById("abPausedBanner")?.classList.add("hidden");
+}
+document.getElementById("abPausedResumeBtn")?.addEventListener("click", () => {
+  chrome.storage.local.remove("autoBotPaused", () => {
+    hidePausedBanner();
+    // Re-arm alarms for any future posts so the schedule continues.
+    chrome.storage.local.get({ autoBotSchedule: null }, ({ autoBotSchedule }) => {
+      if (!autoBotSchedule) return;
+      setupScheduleAlarms(autoBotSchedule);
+      AppLog.info("Auto Bot resumed by user");
+      TechLog.info("SCHEDULE", "bot_resumed", {});
+    });
+  });
+});
+
 // Listen for status messages from background
 chrome.runtime.onMessage.addListener((msg) => {
+  if (msg.type === "AUTO_BOT_PAUSED") {
+    showPausedBanner(msg.reason);
+  }
   if (msg.type === "AUTO_BOT_TRIGGERED") {
     updateScheduledItemStatus(msg.logEntry.postIndex, "triggered");
     chrome.storage.local.get({ autoBotRunLog:[], autoBotSchedule:null }, ({ autoBotRunLog, autoBotSchedule }) => {
@@ -3066,8 +3098,8 @@ chrome.runtime.onMessage.addListener((msg) => {
 
 // Restore active state whenever Auto Bot mode is opened
 function restoreBotActiveState() {
-  chrome.storage.local.get({ autoBotActive:false, autoBotSchedule:null, autoBotRunLog:[] },
-    ({ autoBotActive: wasActive, autoBotSchedule: schedule, autoBotRunLog: runLog }) => {
+  chrome.storage.local.get({ autoBotActive:false, autoBotSchedule:null, autoBotRunLog:[], autoBotPaused:null },
+    ({ autoBotActive: wasActive, autoBotSchedule: schedule, autoBotRunLog: runLog, autoBotPaused }) => {
       autoBotActive = wasActive;
       refreshActivityLog();
       if (wasActive && schedule) {
@@ -3080,6 +3112,8 @@ function restoreBotActiveState() {
       } else {
         updateBotUI(false);
       }
+      if (autoBotPaused) showPausedBanner(autoBotPaused.reason);
+      else hidePausedBanner();
     }
   );
 }

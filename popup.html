@@ -220,6 +220,16 @@
         </div>
       </div>
 
+      <!-- ── Paused banner (visible when the bot hit an unrecoverable issue) ── -->
+      <div id="abPausedBanner" class="ab-paused-banner hidden">
+        <div class="ab-paused-icon">⏸</div>
+        <div class="ab-paused-info">
+          <span class="ab-paused-title">Auto Bot Paused</span>
+          <span class="ab-paused-reason" id="abPausedReason"></span>
+        </div>
+        <button class="btn-secondary ab-paused-resume" id="abPausedResumeBtn">Resume</button>
+      </div>
+
       <div class="autobot-body">
 
         <!-- ── Config collapse toggle ───────────────────────────── -->

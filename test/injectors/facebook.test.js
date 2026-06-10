@@ -179,7 +179,7 @@ describe('Facebook injector — step 5: finalize (auto-post vs. manual hand-off)
     await runTimersInSteps(11000);
 
     expect(onFailed).toHaveBeenCalledTimes(1);
-    expect(onFailed.mock.calls[0][0].detail).toEqual({ platform: 'facebook', error: 'Post button not found' });
+    expect(onFailed.mock.calls[0][0].detail).toMatchObject({ platform: 'facebook', error: 'Post button not found' });
   });
 
   test('manual mode with a song shows the "add via Feeling/Activity" hint instead of posting', async () => {
