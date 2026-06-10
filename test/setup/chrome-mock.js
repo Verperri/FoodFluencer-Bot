@@ -13,6 +13,15 @@ if (typeof TextEncoder === 'undefined') {
   global.TextDecoder = TextDecoder;
 }
 
+// jsdom's `crypto` global doesn't implement randomUUID() — used by
+// getInstallId() in background.js/popup.js to generate the anonymous
+// per-install telemetry ID. Polyfill from Node's crypto module.
+if (typeof crypto === 'undefined' || typeof crypto.randomUUID !== 'function') {
+  const nodeCrypto = require('crypto');
+  if (typeof global.crypto === 'undefined') global.crypto = {};
+  global.crypto.randomUUID = () => nodeCrypto.randomUUID();
+}
+
 function listenerSet() {
   return { addListener: jest.fn(), removeListener: jest.fn(), hasListener: jest.fn() };
 }
@@ -105,6 +114,17 @@ if (typeof HTMLInputElement !== 'undefined') {
       set(fl) { this._mockFileList = fl; },
     });
   }
+}
+
+// background.js is a classic (non-module) service worker and loads config.js
+// via importScripts(), which doesn't exist under Node/Jest. Stub it to set
+// the same global CONFIG that config.js defines.
+if (typeof global.importScripts === 'undefined') {
+  global.importScripts = () => {
+    if (typeof global.CONFIG === 'undefined') {
+      global.CONFIG = { REGION: 'be', MAX_PHOTOS: 5, TELEMETRY_ENDPOINT: '' };
+    }
+  };
 }
 
 global.chrome = {

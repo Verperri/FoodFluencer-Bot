@@ -1,0 +1,11 @@
+name = "foodfluencer-telemetry"
+main = "worker.js"
+compatibility_date = "2024-01-01"
+
+[[d1_databases]]
+binding = "DB"
+database_name = "foodfluencer-telemetry"
+database_id = "88fb87ba-3997-4520-bcf5-22363de27be6"
+
+# Set the admin token as a secret (never committed):
+#   wrangler secret put ADMIN_TOKEN

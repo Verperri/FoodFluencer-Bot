@@ -789,6 +789,64 @@
         </div>
       </div>
 
+      <!-- ── Diagnostics & Sharing ──────────────────────────────────── -->
+      <div class="settings-section">
+        <div class="st-drawer-hdr collapsed" id="stTelemetryHdr">
+          <span class="st-drawer-title">📡 Diagnostics &amp; Sharing</span>
+          <span class="st-drawer-arrow">▼</span>
+        </div>
+        <div class="st-drawer-body collapsed" id="stTelemetryBody">
+          <p class="settings-desc">
+            Optionally share anonymized technical logs and photo-quality data to help
+            improve photo selection. No business names, addresses, or account
+            credentials are ever sent.
+          </p>
+          <label class="ab-checkbox"><input type="checkbox" id="settingsTelemetryOptIn" /><span>Share anonymized diagnostics</span></label>
+          <div class="settings-desc" style="margin-top:10px">
+            <strong>Install ID</strong> — share this with support if you're reporting an issue:
+          </div>
+          <div style="display:flex; gap:6px; margin-top:4px">
+            <input id="settingsInstallId" type="text" readonly style="flex:1; font-size:.72rem" />
+            <button id="settingsCopyInstallId" class="btn btn--ghost btn--sm">📋 Copy</button>
+          </div>
+          <div id="settingsInstallIdStatus" class="settings-key-status"></div>
+        </div>
+      </div>
+
+      <!-- ── Admin (maintainer only) ───────────────────────────────── -->
+      <!-- Hidden behind an admin token entered manually by the maintainer.
+           The token is stored only in this browser's chrome.storage.local
+           and is never bundled with the extension, so other users have no
+           way to discover or reuse it. -->
+      <div class="settings-section">
+        <div class="st-drawer-hdr collapsed" id="stAdminHdr">
+          <span class="st-drawer-title">🔑 Admin</span>
+          <span class="st-drawer-arrow">▼</span>
+        </div>
+        <div class="st-drawer-body collapsed" id="stAdminBody">
+          <p class="settings-desc">For the project maintainer only — query the centralized telemetry store directly using the admin token.</p>
+          <div id="settingsAdminTokenRow" style="display:flex; gap:6px; margin-top:4px">
+            <input id="settingsAdminToken" type="password" placeholder="Admin token" autocomplete="off" style="flex:1" />
+            <button id="settingsAdminSaveToken" class="btn btn--primary btn--sm">Unlock</button>
+          </div>
+          <div id="settingsAdminStatus" class="settings-key-status"></div>
+
+          <div id="settingsAdminPanel" class="hidden" style="margin-top:10px">
+            <p class="settings-desc">Look up another user's data using their Install ID (Settings → Diagnostics &amp; Sharing on their end).</p>
+            <div style="display:flex; gap:6px; align-items:center">
+              <input id="settingsAdminInstallId" type="text" placeholder="Install ID to inspect" style="flex:1; font-size:.72rem" />
+            </div>
+            <div style="display:flex; gap:6px; margin-top:6px">
+              <button id="settingsAdminFetchLogs" class="btn btn--ghost btn--sm" style="flex:1">📄 View Logs</button>
+              <button id="settingsAdminFetchFeedback" class="btn btn--ghost btn--sm" style="flex:1">🖼 View Feedback</button>
+            </div>
+            <button id="settingsAdminFetchInstalls" class="btn btn--ghost btn--sm" style="margin-top:6px;width:100%">📋 List recent installs</button>
+            <button id="settingsAdminLock" class="btn btn--ghost btn--sm" style="margin-top:6px;width:100%">🔒 Lock</button>
+            <pre id="settingsAdminResults" class="stl-entries" style="margin-top:8px;max-height:200px;overflow:auto"></pre>
+          </div>
+        </div>
+      </div>
+
       <!-- ── Tests ───────────────────────────────────────────────── -->
       <div class="settings-section">
         <div class="st-drawer-hdr collapsed" id="stDiagHdr">
