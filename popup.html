@@ -84,6 +84,83 @@
         <p class="hint">Get a free key at <strong>foursquare.com/developers</strong>.</p>
       </section>
 
+      <!-- ⓪ Search filters (independent of the Auto Bot configuration) -->
+      <section class="mm-filters">
+        <div class="ab-collapse-hdr" id="mmConfigToggle">
+          <span class="ab-collapse-hdr-title">⚙ Search Filters</span>
+          <span class="ab-config-summary" id="mmConfigSummary"></span>
+          <span class="ab-collapse-arrow collapsed" id="mmConfigArrow">▼</span>
+        </div>
+
+        <div id="mmConfigBody" class="collapsed">
+
+          <!-- ── Type ─────────────────────────────────────────────── -->
+          <div class="ab-group">
+            <label class="ab-label">Type</label>
+            <div class="pill-row" id="mmType">
+              <button class="ab-pill active" data-val="restaurant">🍽️ Restaurant</button>
+              <button class="ab-pill" data-val="hotel">🏨 Hotel</button>
+              <button class="ab-pill" data-val="bar">🍺 Bar</button>
+            </div>
+          </div>
+
+          <!-- ── Country ──────────────────────────────────────────── -->
+          <div class="ab-group">
+            <label class="ab-label" for="mmCountry">Country</label>
+            <select id="mmCountry" class="ab-select">
+              <option value="BE">Belgium</option>
+              <option value="FR">France</option>
+              <option value="DE">Germany</option>
+              <option value="LU">Luxembourg</option>
+              <option value="NL">The Netherlands</option>
+            </select>
+          </div>
+
+          <!-- ── Region (multi-select, province-level) ────────────── -->
+          <div class="ab-group">
+            <label class="ab-label">Region <span class="ab-label-hint">(multi-select)</span></label>
+            <div class="ab-region-wrap" id="mmRegionWrap">
+              <!-- populated by JS based on country -->
+            </div>
+          </div>
+
+          <!-- ── Minimum Ratings ──────────────────────────────────── -->
+          <div class="ab-group">
+            <label class="ab-label">
+              Minimum Ratings
+              <span class="ab-slider-val" id="mmMinRatingsVal">100</span>
+            </label>
+            <input type="range" id="mmMinRatings" class="ab-slider"
+              min="0" max="500" step="10" value="100" />
+            <div class="ab-slider-range">
+              <span>0</span><span>500</span>
+            </div>
+          </div>
+
+          <!-- ── Minimum Stars ─────────────────────────────────────── -->
+          <div class="ab-group">
+            <label class="ab-label">Minimum Stars</label>
+            <div class="pill-row" id="mmStars">
+              <button class="ab-pill" data-val="3">⭐ 3.0</button>
+              <button class="ab-pill" data-val="3.5">⭐ 3.5</button>
+              <button class="ab-pill active" data-val="4">⭐ 4.0</button>
+              <button class="ab-pill" data-val="4.5">⭐ 4.5</button>
+            </div>
+          </div>
+
+          <!-- ── Minimum Pictures ─────────────────────────────────── -->
+          <div class="ab-group">
+            <label class="ab-label">Minimum Pictures</label>
+            <div class="pill-row" id="mmPics">
+              <button class="ab-pill" data-val="3">3</button>
+              <button class="ab-pill" data-val="4">4</button>
+              <button class="ab-pill active" data-val="5">5</button>
+            </div>
+          </div>
+
+        </div>
+      </section>
+
       <!-- ① Search -->
       <section class="search-section">
         <div class="input-row">
@@ -91,8 +168,9 @@
             placeholder="e.g. Comme Chez Soi, Brussels"
             autocomplete="off" />
           <button id="searchBtn" class="btn btn--primary">Search</button>
-          <button id="randomBtn" class="btn btn--random" title="Pick a random Belgian restaurant">🎲</button>
+          <button id="randomBtn" class="btn btn--random" title="Pick a random place using the Search Filters above">🎲</button>
         </div>
+        <div id="searchResultsDropdown" class="search-results-dropdown hidden"></div>
       </section>
 
       <!-- ② Restaurant result + photos -->
@@ -176,9 +254,12 @@
 
         <div class="divider"></div>
 
-        <!-- Export -->
+        <!-- Export / Post -->
         <div class="export-section">
-          <button id="exportBtn" class="btn btn--export">⬇ Export &amp; Post</button>
+          <div class="export-row">
+            <button id="postBtn" class="btn btn--export">📤 Post</button>
+            <button id="exportBtn" class="btn btn--export btn--export-secondary">⬇ Export</button>
+          </div>
         </div>
 
       </section>

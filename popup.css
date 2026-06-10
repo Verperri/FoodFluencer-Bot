@@ -124,6 +124,11 @@ h1 { font-size: 0.95rem; font-weight: 700; line-height: 1.2; }
 .photo-item {
   background: var(--surface); border: 1px solid var(--border);
   border-radius: 8px; overflow: hidden; position: relative; box-shadow: var(--shadow);
+  cursor: grab;
+}
+.photo-item.dragging { opacity: .35; cursor: grabbing; }
+.photo-item.drag-over {
+  outline: 2px dashed var(--accent); outline-offset: -2px;
 }
 .photo-item img { width: 100%; aspect-ratio: 4/3; object-fit: cover; display: block; }
 .loading-thumb {
@@ -143,10 +148,12 @@ h1 { font-size: 0.95rem; font-weight: 700; line-height: 1.2; }
 }
 .cover-badge {
   position: absolute; top: 5px; left: 5px; z-index: 6;
-  background: var(--accent); color: #fff;
+  background: var(--accent); color: #fff; border: none;
   font-size: .52rem; font-weight: 700; letter-spacing: .1em;
   text-transform: uppercase; padding: 2px 6px; border-radius: 4px;
+  cursor: pointer; transition: background .15s; line-height: 1.4;
 }
+.cover-badge:hover { background: rgba(220,38,38,.85); }
 .make-cover-btn {
   position: absolute; top: 4px; left: 5px; z-index: 5;
   background: rgba(0,0,0,.55); color: #fff; border: none;
@@ -194,6 +201,21 @@ h1 { font-size: 0.95rem; font-weight: 700; line-height: 1.2; }
 
 /* ── Results wrapper ─────────────────────────────────────────────────────── */
 .results-section { display: flex; flex-direction: column; gap: 9px; }
+
+/* ── Search results dropdown ─────────────────────────────────────────────── */
+.search-results-dropdown {
+  margin-top: 6px; display: flex; flex-direction: column; gap: 3px;
+  max-height: 220px; overflow-y: auto;
+  border: 1px solid var(--border); border-radius: 8px; padding: 4px;
+  background: #fff;
+}
+.search-result-item {
+  padding: 6px 8px; border-radius: 7px; cursor: pointer; transition: background .12s;
+}
+.search-result-item:hover { background: #f0f0f0; }
+.search-result-name    { font-size: 0.78rem; font-weight: 600; }
+.search-result-address { font-size: 0.71rem; color: var(--muted); }
+.search-result-meta    { font-size: 0.71rem; color: var(--muted); margin-top: 1px; }
 
 /* ── Song results ────────────────────────────────────────────────────────── */
 .song-results {
@@ -250,13 +272,20 @@ h1 { font-size: 0.95rem; font-weight: 700; line-height: 1.2; }
 
 /* ── Caption + export ────────────────────────────────────────────────────── */
 .export-section { display: flex; flex-direction: column; gap: 7px; }
+.export-row { display: flex; gap: 7px; }
 .btn--export {
   width: 100%; background: var(--accent); color: #fff; padding: 10px;
   font-size: 0.85rem; border-radius: var(--radius); box-shadow: var(--shadow);
   border: none; cursor: pointer; font-weight: 700; transition: background .15s;
 }
+.export-row .btn--export { flex: 1; width: auto; }
 .btn--export:not(:disabled):hover { background: var(--accent2); }
 .btn--export:disabled { opacity: .5; cursor: not-allowed; }
+.btn--export-secondary {
+  background: var(--surface); color: var(--text); border: 1.5px solid var(--border);
+  box-shadow: none;
+}
+.btn--export-secondary:not(:disabled):hover { background: var(--accent); color: #fff; }
 
 /* ── Status ──────────────────────────────────────────────────────────────── */
 .status {
@@ -688,6 +717,11 @@ h1 { font-size: 0.95rem; font-weight: 700; line-height: 1.2; }
 .ab-collapse-arrow.collapsed { transform: rotate(-90deg); }
 
 #abConfigBody.collapsed { display: none; }
+
+/* ── Manual Post search filters (independent of Auto Bot config) ── */
+.mm-filters { display: flex; flex-direction: column; gap: 0; }
+#mmConfigBody { display: flex; flex-direction: column; gap: 14px; padding-top: 6px; margin-top: 8px; }
+#mmConfigBody.collapsed { display: none; }
 
 /* Schedule button active (Deactivate) */
 .btn--schedule.is-active {

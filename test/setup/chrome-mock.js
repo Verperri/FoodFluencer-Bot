@@ -123,7 +123,9 @@ global.chrome = {
     local: {
       get: jest.fn((_keys, cb) => cb && cb({})),
       set: jest.fn((_items, cb) => cb && cb()),
+      remove: jest.fn((_keys, cb) => cb && cb()),
     },
+    onChanged: listenerSet(),
   },
   scripting: {
     executeScript: jest.fn(() => Promise.resolve([{ result: undefined }])),
