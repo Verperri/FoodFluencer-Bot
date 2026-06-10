@@ -661,6 +661,19 @@ h1 { font-size: 0.95rem; font-weight: 700; line-height: 1.2; }
 .ab-bot-status-next  { font-size: .7rem;  color: #166534; }
 .ab-bot-status-progress { font-size: .72rem; font-weight: 600; color: #15803d; white-space: nowrap; }
 
+/* ── Paused banner ── */
+.ab-paused-banner {
+  display: flex; align-items: center; gap: 10px;
+  background: #fef2f2; border: 1.5px solid #ef4444;
+  border-radius: var(--radius); padding: 10px 13px;
+  margin-bottom: 4px;
+}
+.ab-paused-icon { font-size: 1.1rem; flex-shrink: 0; }
+.ab-paused-info { flex: 1; min-width: 0; display: flex; flex-direction: column; }
+.ab-paused-title  { font-size: .78rem; font-weight: 700; color: #b91c1c; }
+.ab-paused-reason { font-size: .7rem;  color: #991b1b; }
+.ab-paused-resume { flex-shrink: 0; font-size: .72rem; padding: 5px 10px; }
+
 /* ── Config collapse toggle header ── */
 .ab-collapse-hdr {
   display: flex; align-items: center; gap: 8px;

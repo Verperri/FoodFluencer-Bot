@@ -1,4 +1,84 @@
-﻿// ── First-install flag ────────────────────────────────────────────────────────
+﻿// ── Human-like timing jitter ───────────────────────────────────────────────────
+// Adds randomized variance (±35% by default) to scripted delays so the auto-bot's
+// pacing doesn't follow a perfectly uniform, machine-like fingerprint that
+// platforms could use to flag the account for re-verification.
+function jitter(ms, variance = 0.35) {
+  return Math.round(ms + (Math.random() * 2 - 1) * ms * variance);
+}
+function sleep(ms, variance = 0.35) {
+  return new Promise(r => setTimeout(r, jitter(ms, variance)));
+}
+
+// ── Post-failure failsafe ────────────────────────────────────────────────────
+// Classifies a failed post by inspecting the error message and a snippet of
+// the page captured at the moment of failure. This lets the bot react
+// differently depending on *why* a post was rejected, rather than blindly
+// retrying every failure the same way.
+//
+//  - login_required / captcha / rate_limited: nothing the bot can fix on its
+//    own — pause the whole auto-bot and surface the reason to the user so
+//    they can re-authenticate / wait it out before resuming.
+//  - content_blocked: retrying with the exact same caption/media would just
+//    fail again — don't retry, move on to the next platform/post.
+//  - ui_changed / unknown: likely transient (a selector didn't match in time,
+//    a dialog appeared late, etc.) — keep the existing retry-once behaviour.
+const FAILURE_PATTERNS = [
+  { category: 'login_required', re: /log\s*in|sign\s*in|session.{0,15}expired|enter your password/i },
+  { category: 'captcha',        re: /captcha|verify you.?re human|confirm it.?s you|suspicious activity|unusual activity|we.?ve detected/i },
+  { category: 'rate_limited',   re: /try again later|temporarily (blocked|restricted|unavailable)|action blocked|too many (requests|attempts)|restrict certain activity/i },
+  { category: 'content_blocked', re: /violat|against our community|community guideline|community standard|removed for|doesn.?t follow our/i },
+];
+function classifyFailure(error = '', pageSnippet = '') {
+  const text = `${error} ${pageSnippet}`;
+  for (const { category, re } of FAILURE_PATTERNS) if (re.test(text)) return category;
+  if (/not found/i.test(error)) return 'ui_changed';
+  return 'unknown';
+}
+
+// Categories that the bot cannot recover from by itself — pause and wait for the user.
+const PAUSE_CATEGORIES = new Set(['login_required', 'captcha', 'rate_limited']);
+const PAUSE_REASONS = {
+  login_required: 'You appear to be logged out of {platform} — please log back in, then resume the bot.',
+  captcha:        '{platform} is showing a verification/CAPTCHA challenge — please complete it manually in your browser, then resume the bot.',
+  rate_limited:   '{platform} is rate-limiting or temporarily restricting posts — the bot has been paused to avoid further action-blocks. Wait a while before resuming.',
+};
+
+// Appends a failure record to the rolling failure log (capped at 50 entries)
+// so it can be inspected later — both for debugging and for the "what went
+// wrong on the page" data needed to refine the failsafes over time.
+async function recordFailure(postIndex, platform, result) {
+  const entry = {
+    id:          `fail-${Date.now()}-${platform}`,
+    ts:          new Date().toISOString(),
+    postIndex, platform,
+    error:       result.error || '',
+    category:    result.category || 'unknown',
+    pageSnippet: result.pageSnippet || '',
+    url:         result.url || '',
+  };
+  const { autoBotFailureLog = [] } = await chrome.storage.local.get({ autoBotFailureLog: [] });
+  await chrome.storage.local.set({ autoBotFailureLog: [...autoBotFailureLog, entry].slice(-50) });
+  TechLog.warn('POST', 'failure_recorded', entry);
+  return entry;
+}
+
+// Pauses the auto-bot: clears all pending alarms and stores the reason so the
+// popup can surface it and offer a "Resume" action once the user has dealt
+// with whatever needs manual attention.
+async function pauseAutoBot({ category, platform, postIndex }) {
+  const reason = (PAUSE_REASONS[category] || `${platform} reported an issue that needs manual attention.`)
+    .replace('{platform}', platform);
+  await chrome.storage.local.set({
+    autoBotPaused: { reason, category, platform, postIndex, ts: new Date().toISOString() },
+  });
+  await chrome.alarms.clearAll();
+  bgLog('error', `Auto Bot paused — ${reason}`);
+  TechLog.error('POST', 'auto_bot_paused', { category, platform, postIndex, reason });
+  TechLog._flush();
+  chrome.runtime.sendMessage({ type: 'AUTO_BOT_PAUSED', reason, category, platform }).catch(() => {});
+}
+
+// ── First-install flag ────────────────────────────────────────────────────────
 // Sets hasSeenOnboarding:false on fresh install so the popup shows onboarding.
 chrome.runtime.onInstalled.addListener((details) => {
   if (details.reason === 'install') {
@@ -15,8 +95,9 @@ chrome.alarms.onAlarm.addListener((alarm) => {
 
   const postIndex = parseInt(alarm.name.replace("ffbot-auto-", ""), 10);
 
-  chrome.storage.local.get(["autoBotActive", "autoBotSchedule", "autoBotRunLog"], (data) => {
+  chrome.storage.local.get(["autoBotActive", "autoBotSchedule", "autoBotRunLog", "autoBotPaused"], (data) => {
     if (!data.autoBotActive) return; // bot was deactivated
+    if (data.autoBotPaused) return;  // bot is paused pending manual attention
 
     const post = data.autoBotSchedule?.posts?.[postIndex];
     if (!post) return;
@@ -59,6 +140,22 @@ const AB_PLACES_PHOTO  = "https://places.googleapis.com/v1";
 const AB_ITUNES_SEARCH = "https://itunes.apple.com/search";
 
 const AB_TYPE_QUERY_BG = { restaurant:"restaurant", hotel:"hotel", bar:"bar" };
+
+// Extra hashtags rotated into the caption's hashtag block so it isn't an
+// identical, repeating block every post — a recurring exact hashtag set
+// across posts is a common spam/automation signal.
+const AB_EXTRA_HASHTAG_POOL = [
+  "Foodie", "Foodstagram", "InstaFood", "EatLocal", "FoodPics",
+  "TastyTravels", "FoodLovers", "Yummy", "FoodieLife", "EatExplore",
+];
+function pickExtraHashtags(count = 2) {
+  const pool = [...AB_EXTRA_HASHTAG_POOL];
+  const picked = [];
+  while (picked.length < count && pool.length) {
+    picked.push(pool.splice(Math.floor(Math.random() * pool.length), 1)[0]);
+  }
+  return picked;
+}
 const AB_COUNTRY_NAMES_BG = { BE:"Belgium", FR:"France", DE:"Germany", LU:"Luxembourg", NL:"The Netherlands" };
 const AB_BOUNDS_BG = {
   BE: { low:{latitude:49.5,longitude:2.5},  high:{latitude:51.5,longitude:6.4}  },
@@ -580,7 +677,7 @@ async function scrapeYelpPhotos(businessName, city) {
 
     const allPhotos = new Set();
     for (const tab of ['food', 'inside', 'outside']) {
-      await new Promise(r => setTimeout(r, 600)); // polite crawl delay
+      await sleep(600); // polite crawl delay
       try {
         const photoRes = await fetch(`https://www.yelp.com/biz/${slug}/photos?tab=${tab}`, {
           headers: { 'User-Agent': SCRAPE_UA, 'Referer': 'https://www.yelp.com/' },
@@ -629,7 +726,7 @@ async function scrapeTripAdvisorPhotos(businessName, city) {
     const slug = slugM[1].split('?')[0]; // strip query params
     bgLog('info', `PhotoScrape[TripAdvisor] slug: ${slug}`);
 
-    await new Promise(r => setTimeout(r, 800)); // polite crawl delay
+    await sleep(800); // polite crawl delay
 
     // Fetch the /Photos sub-page for this listing
     const photoPageUrl = `https://www.tripadvisor.com${slug.replace(/-Reviews-/, '-Photos-')}`;
@@ -1204,7 +1301,9 @@ function getAutoCaptionBG(name, address, type, language, captionOpts, songInfo, 
   if (captionOpts.song && songInfo)   parts.push(`🎵 ${songInfo.name} – ${songInfo.artist}`);
   if (captionOpts.hashtags) {
     const tc = tLabel.charAt(0).toUpperCase() + tLabel.slice(1);
-    parts.push(`\n#${cityTag} #FoodFluencer #${tc}Photography #Foodie #Belgium`);
+    const extras = pickExtraHashtags(2).map(h => `#${h}`).join(" ");
+    // Hashtag block always goes last — never interleaved with the caption text.
+    parts.push(`\n#${cityTag} #FoodFluencer #${tc}Photography ${extras} #Belgium`);
   }
   return parts.join("\n").trim();
 }
@@ -1274,8 +1373,9 @@ function stopKeepAlive() {
 
 // ── Main auto-posting function ────────────────────────────────────────────────
 async function autoPostNow(postIndex) {
-  const data = await chrome.storage.local.get(["autoBotActive","autoBotSchedule","autoBotConfig"]);
+  const data = await chrome.storage.local.get(["autoBotActive","autoBotSchedule","autoBotConfig","autoBotPaused"]);
   if (!data.autoBotActive) return;
+  if (data.autoBotPaused) return; // bot is paused pending manual attention
 
   const post   = data.autoBotSchedule?.posts?.[postIndex];
   const config = data.autoBotConfig;
@@ -1377,8 +1477,13 @@ async function autoPostNow(postIndex) {
       if (result?.failed) {
         anyFailed = true;
         TechLog.error("POST", "platform_failed", { run_id: runId, run_type: "auto",
-          platform, error: result.error, duration_ms: Date.now()-t_platform });
+          platform, error: result.error, category: result.category, duration_ms: Date.now()-t_platform });
         bgLog("error", `Auto Bot: ${platform} failed — ${result.error}`);
+        await recordFailure(postIndex, platform, result);
+        if (PAUSE_CATEGORIES.has(result.category)) {
+          await pauseAutoBot({ category: result.category, platform, postIndex });
+          break; // stop posting to further platforms — bot is paused
+        }
       } else if (result?.confirmed === false) {
         // Timed out without an explicit completion signal — the post may or may
         // not have published. Don't count it as success: "done" in the UI must
@@ -1392,7 +1497,7 @@ async function autoPostNow(postIndex) {
           platform, duration_ms: Date.now()-t_platform });
       }
       if (post.platforms.indexOf(platform) < post.platforms.length - 1)
-        await new Promise(r => setTimeout(r, 4000));
+        await sleep(4000); // pause between platforms — randomized to avoid a robotic cadence
     }
 
     // "done" ONLY when every platform explicitly confirmed its post.
@@ -1630,7 +1735,7 @@ async function testSilentInstagram() {
     ok: loadResult === 'complete' });
 
   // Extra hydration buffer (SPA)
-  await new Promise(r => setTimeout(r, 4000));
+  await sleep(4000);
   await pushStep({ step: 2, ts: ts(), label: 'Waiting for the page to finish settling…' });
 
   // Step 3 — Inject relay + probe
@@ -1732,7 +1837,8 @@ async function testSilentInstagram() {
       world: 'MAIN',
       args: [testPhotos.dataUrls[0] || null, testCaption, testLocation],
       func: async (testPhotoDataUrl, caption, location) => {
-        const sleep = ms => new Promise(r => setTimeout(r, ms));
+        // Jittered (±35%) so action pacing doesn't look machine-uniform
+        const sleep = ms => new Promise(r => setTimeout(r, Math.round(ms + (Math.random() * 2 - 1) * ms * 0.35)));
         const out = { composerOpened: false, photoAttached: false, captionFieldFound: false,
           locationFieldFound: false, shareBtnFound: false, shareBtnEnabled: false, error: null };
         function findByText(re, root) {
@@ -1983,7 +2089,7 @@ async function testSilentTikTok() {
   // Step 4 — Briefly focus the window to let TikTok initialise upload handlers
   await pushStep({ step: 4, ts: ts(), label: 'Briefly activating the window so TikTok can finish preparing the upload page…' });
   await chrome.windows.update(winId, { focused: true });
-  await new Promise(r => setTimeout(r, 2500)); // allow TikTok to initialise
+  await sleep(2500); // allow TikTok to initialise
   await chrome.windows.update(winId, { state: 'minimized' });
   await new Promise(r => setTimeout(r, 500));
 
@@ -2125,7 +2231,8 @@ async function testSilentTikTok() {
       target: { tabId }, world: 'MAIN',
       args: [testCaption, testLocation],
       func: async (caption, location) => {
-        const sleep = ms => new Promise(r => setTimeout(r, ms));
+        // Jittered (±35%) so action pacing doesn't look machine-uniform
+        const sleep = ms => new Promise(r => setTimeout(r, Math.round(ms + (Math.random() * 2 - 1) * ms * 0.35)));
         const out = { videoAttached: false, captionFieldFound: false, locationFieldFound: false,
           postBtnFound: false, postBtnEnabled: false, error: null };
         async function waitFor(fn, timeout=45000, interval=400) {
@@ -2332,7 +2439,7 @@ async function handleSocialPost(opts, _attempt = 1) {
   }
 
   // SPA hydration buffer
-  await new Promise(r => setTimeout(r, platform === 'tiktok' ? 2000 : 4000));
+  await sleep(platform === 'tiktok' ? 2000 : 4000);
 
   try {
     // ── Relay script (ISOLATED world) ───────────────────────────────────────
@@ -2415,7 +2522,7 @@ async function handleSocialPost(opts, _attempt = 1) {
             bgLog('info', 'TikTok: upload accepted — window minimised, posting continues silently');
           }
           if (msg.type === "PLATFORM_POST_COMPLETE") { cleanup(); resolve({ failed: false, confirmed: true }); }
-          if (msg.type === "PLATFORM_POST_FAILED")   { cleanup(); resolve({ failed: true, confirmed: false, error: msg.error }); }
+          if (msg.type === "PLATFORM_POST_FAILED")   { cleanup(); resolve({ failed: true, confirmed: false, error: msg.error, pageSnippet: msg.pageSnippet, url: msg.url }); }
         }
         chrome.runtime.onMessage.addListener(listener);
       });
@@ -2424,13 +2531,18 @@ async function handleSocialPost(opts, _attempt = 1) {
       // Close the whole window (not just the tab) so no minimised window lingers
       setTimeout(() => chrome.windows.remove(winId).catch(() => {}), 3000);
 
-      // Auto-retry once on failure (autoPost only)
-      if (result.failed && _attempt < 2) {
-        bgLog('warn', `${platform} post failed — retrying after 12s (attempt ${_attempt}/2)`, result.error);
-        TechLog.warn('POST', 'injection_retry', { platform, attempt: _attempt, error: result.error });
-        TechLog._flush();
-        await new Promise(r => setTimeout(r, 12000));
-        return handleSocialPost(opts, _attempt + 1);
+      if (result.failed) {
+        result.category = classifyFailure(result.error, result.pageSnippet);
+        // Only retry transient-looking failures — retrying a content-policy
+        // rejection or a login/captcha wall with the same content/session
+        // would just fail again the same way.
+        if (autoPost && _attempt < 2 && !PAUSE_CATEGORIES.has(result.category) && result.category !== 'content_blocked') {
+          bgLog('warn', `${platform} post failed — retrying after 12s (attempt ${_attempt}/2)`, result.error);
+          TechLog.warn('POST', 'injection_retry', { platform, attempt: _attempt, error: result.error, category: result.category });
+          TechLog._flush();
+          await sleep(12000);
+          return handleSocialPost(opts, _attempt + 1);
+        }
       }
 
       return result;
@@ -2439,14 +2551,16 @@ async function handleSocialPost(opts, _attempt = 1) {
   } catch (err) {
     bgLog('error', `Inject failed on ${platform}`, String(err));
     if (autoPost) chrome.windows.remove(winId).catch(() => {});
-    const errResult = { failed: true, error: String(err) };
+    const errResult = { failed: true, error: String(err), category: classifyFailure(String(err)) };
 
-    // Auto-retry once on inject-level error (autoPost only)
+    // Auto-retry once on inject-level error (autoPost only) — these are
+    // generally transient (script injection / page-load issues), not
+    // platform-side rejections, so always eligible for the single retry.
     if (autoPost && _attempt < 2) {
       bgLog('warn', `${platform} inject error — retrying after 12s (attempt ${_attempt}/2)`, String(err));
-      TechLog.warn('POST', 'injection_retry', { platform, attempt: _attempt, error: String(err) });
+      TechLog.warn('POST', 'injection_retry', { platform, attempt: _attempt, error: String(err), category: errResult.category });
       TechLog._flush();
-      await new Promise(r => setTimeout(r, 12000));
+      await sleep(12000);
       return handleSocialPost(opts, _attempt + 1);
     }
 
@@ -2464,7 +2578,17 @@ async function handleSocialPost(opts, _attempt = 1) {
 function injectFacebook(photoDataUrls, caption, songName, location, opts) {
   /* ── helpers ── */
   const { restaurantName = '' } = opts || {};
-  const sleep = ms => new Promise(r => setTimeout(r, ms));
+  // Jittered (±35%) so action pacing doesn't look machine-uniform
+  const sleep = ms => new Promise(r => setTimeout(r, Math.round(ms + (Math.random() * 2 - 1) * ms * 0.35)));
+  // Captures the page state at the moment of failure so the bot can later
+  // classify *why* a post was rejected (login wall, captcha, rate limit, etc.)
+  function capturePageContext() {
+    try {
+      const dialog = document.querySelector('[role="alert"],[role="dialog"]');
+      const text = (dialog?.innerText || document.body.innerText || '').replace(/\s+/g, ' ').trim();
+      return { url: window.location.href, pageSnippet: text.slice(0, 400) };
+    } catch (_) { return { url: window.location.href, pageSnippet: '' }; }
+  }
 
   const waitFor = (sel, ms = 8000) => new Promise(res => {
     if (document.querySelector(sel)) return res(document.querySelector(sel));
@@ -2783,7 +2907,7 @@ function injectFacebook(photoDataUrls, caption, songName, location, opts) {
         document.dispatchEvent(new CustomEvent('__ffbot_complete', { detail:{ platform:'facebook' } }));
       } else {
         step(4, total, '⚠️ Could not find Post button', 'warn');
-        document.dispatchEvent(new CustomEvent('__ffbot_failed', { detail:{ platform:'facebook', error:'Post button not found' } }));
+        document.dispatchEvent(new CustomEvent('__ffbot_failed', { detail:{ platform:'facebook', error:'Post button not found', ...capturePageContext() } }));
       }
     } else if (songName) {
       step(5, total, `Add <em>"${songName}"</em> via <strong>Feeling/Activity → Music</strong>, then click <strong>Post</strong>.`, 'success');
@@ -2797,7 +2921,17 @@ function injectFacebook(photoDataUrls, caption, songName, location, opts) {
 
 function injectInstagram(photoDataUrls, caption, songName, location, opts) {
   const { restaurantName = '' } = opts || {};
-  const sleep = ms => new Promise(r => setTimeout(r, ms));
+  // Jittered (±35%) so action pacing doesn't look machine-uniform
+  const sleep = ms => new Promise(r => setTimeout(r, Math.round(ms + (Math.random() * 2 - 1) * ms * 0.35)));
+  // Captures the page state at the moment of failure so the bot can later
+  // classify *why* a post was rejected (login wall, captcha, rate limit, etc.)
+  function capturePageContext() {
+    try {
+      const dialog = document.querySelector('[role="alert"],[role="dialog"]');
+      const text = (dialog?.innerText || document.body.innerText || '').replace(/\s+/g, ' ').trim();
+      return { url: window.location.href, pageSnippet: text.slice(0, 400) };
+    } catch (_) { return { url: window.location.href, pageSnippet: '' }; }
+  }
 
   const waitFor = (sel, ms = 12000) => new Promise(res => {
     const el = document.querySelector(sel); if (el) return res(el);
@@ -3659,7 +3793,7 @@ function injectInstagram(photoDataUrls, caption, songName, location, opts) {
         document.dispatchEvent(new CustomEvent('__ffbot_complete', { detail:{ platform:'instagram' } }));
       } else {
         step(total, total, '⚠️ Share button not found — click it manually.', 'warn');
-        document.dispatchEvent(new CustomEvent('__ffbot_failed', { detail:{ platform:'instagram', error:'Share button not found' } }));
+        document.dispatchEvent(new CustomEvent('__ffbot_failed', { detail:{ platform:'instagram', error:'Share button not found', ...capturePageContext() } }));
       }
     } else {
       const songHint = songName ? ` &nbsp;🎵 Tap <strong>Add music</strong> → <em>"${songName}"</em>.` : '';
@@ -3676,7 +3810,17 @@ function injectInstagram(photoDataUrls, caption, songName, location, opts) {
 
 function injectTikTok(photoDataUrls, caption, songName, location, opts) {
   const { tiktokAudioDataUrl = null } = opts || {};
-  const sleep = ms => new Promise(r => setTimeout(r, ms));
+  // Jittered (±35%) so action pacing doesn't look machine-uniform
+  const sleep = ms => new Promise(r => setTimeout(r, Math.round(ms + (Math.random() * 2 - 1) * ms * 0.35)));
+  // Captures the page state at the moment of failure so the bot can later
+  // classify *why* a post was rejected (login wall, captcha, rate limit, etc.)
+  function capturePageContext() {
+    try {
+      const dialog = document.querySelector('[role="alert"],[role="dialog"]');
+      const text = (dialog?.innerText || document.body.innerText || '').replace(/\s+/g, ' ').trim();
+      return { url: window.location.href, pageSnippet: text.slice(0, 400) };
+    } catch (_) { return { url: window.location.href, pageSnippet: '' }; }
+  }
   const waitFor = (sel, ms = 12000) => new Promise(res => {
     const el = document.querySelector(sel); if (el) return res(el);
     const t = Date.now(); const iv = setInterval(() => {
@@ -4253,7 +4397,7 @@ function injectTikTok(photoDataUrls, caption, songName, location, opts) {
       banner(3, `⚠️ TikTok rejected: "<em>${visibleErr}</em>". Check the page for details.`, 'warn');
       step('upload_rejected', visibleErr);
       document.dispatchEvent(new CustomEvent('__ffbot_event', { detail:{ type:'TIKTOK_UPLOAD_ERROR', matched:visibleErr, context:'post-check', autoPost:opts?.autoPost }}));
-      document.dispatchEvent(new CustomEvent('__ffbot_failed', { detail:{ platform:'tiktok', error:'Upload rejected: '+visibleErr }}));
+      document.dispatchEvent(new CustomEvent('__ffbot_failed', { detail:{ platform:'tiktok', error:'Upload rejected: '+visibleErr, ...capturePageContext() }}));
       return;
     }
     if (result === 'timeout') {
@@ -4710,7 +4854,7 @@ function injectTikTok(photoDataUrls, caption, songName, location, opts) {
           banner(5, `⚠️ TikTok post failed: ${postError}`, 'warn');
           step('post_failed', postError);
           document.dispatchEvent(new CustomEvent('__ffbot_event', { detail:{ type:'TIKTOK_UPLOAD_ERROR', matched:postError, context:'post-completion' }}));
-          document.dispatchEvent(new CustomEvent('__ffbot_failed', { detail:{ platform:'tiktok', error:postError }}));
+          document.dispatchEvent(new CustomEvent('__ffbot_failed', { detail:{ platform:'tiktok', error:postError, ...capturePageContext() }}));
         } else {
           banner(5, `✅ Posted to TikTok!${note}`, 'success');
           step('post_success');
@@ -4720,7 +4864,7 @@ function injectTikTok(photoDataUrls, caption, songName, location, opts) {
         banner(5, '⚠️ Post button not found — please click Post manually.', 'warn');
         step('find_post_button_failed', 'no matching button after 12 attempts');
         checkForErrorPage();
-        document.dispatchEvent(new CustomEvent('__ffbot_failed', { detail:{ platform:'tiktok', error:'Post button not found' }}));
+        document.dispatchEvent(new CustomEvent('__ffbot_failed', { detail:{ platform:'tiktok', error:'Post button not found', ...capturePageContext() }}));
       }
     } else {
       banner(5, `✅ All set!${note} Review &amp; click <strong>Post</strong>.`, 'success');
