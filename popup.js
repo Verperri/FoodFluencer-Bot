@@ -754,21 +754,116 @@ async function ensureCoverFont() {
 }
 ensureCoverFont();
 
-// Short tagline for cover — varies per restaurant (consistent per name)
+// Short tagline for cover — varies per venue (consistent per name)
 function getCoverTagline(restaurantName, city) {
   const seed = restaurantName.split('').reduce((a, c) => a + c.charCodeAt(0), 0);
   const c = city || 'Belgium';
   const lines = [
     `Must visit in ${c} 📍`,
     `Hidden gem in ${c} ✨`,
-    `Have you been here? 🍽️`,
-    `${c}'s finest dining`,
-    `Worth every bite 😍`,
-    `Don't miss this spot! 🔥`,
+    `Have you been here? 🔥`,
+    `${c}'s finest spot`,
+    `Worth every visit 😍`,
+    `Don't miss this place! ✨`,
     `A must in ${c}!`,
     `Next stop: ${c} 📍`,
+    `Taste the best of ${c} 🔥`,
+    `Discover ${c} 🌟`,
   ];
   return lines[seed % lines.length];
+}
+
+// ── Photo quality scoring ─────────────────────────────────────────────────────
+
+const MIN_PHOTO_DIM   = 720;  // minimum short-side pixels for a post-worthy photo
+const IG_MIN_RATIO    = 0.8;  // Instagram minimum aspect ratio (4:5 portrait)
+const IG_MAX_RATIO    = 1.91; // Instagram maximum aspect ratio (~landscape)
+
+// Returns { score, blurScore, meetsResolution, width, height }
+// score         — combined quality signal (higher = better)
+// blurScore     — Laplacian variance; higher means sharper
+// meetsResolution — false if the actual delivered image is below MIN_PHOTO_DIM
+async function scorePhotoQuality(uri) {
+  return new Promise(resolve => {
+    const img = new Image();
+    img.crossOrigin = 'anonymous';
+    img.onload = () => {
+      try {
+        const SW = Math.min(img.naturalWidth,  200);
+        const SH = Math.min(img.naturalHeight, 200);
+        const c = document.createElement('canvas');
+        c.width = SW; c.height = SH;
+        const ctx = c.getContext('2d');
+        ctx.drawImage(img, 0, 0, SW, SH);
+        const d = ctx.getImageData(0, 0, SW, SH).data;
+
+        // Build grayscale array + luminance stats
+        const gray = new Float32Array(SW * SH);
+        let sum = 0, sumSq = 0;
+        for (let i = 0; i < SW * SH; i++) {
+          const lum = 0.299 * d[i*4] + 0.587 * d[i*4+1] + 0.114 * d[i*4+2];
+          gray[i] = lum; sum += lum; sumSq += lum * lum;
+        }
+        const mean = sum / (SW * SH);
+        const contrast = Math.sqrt(Math.max(0, sumSq / (SW * SH) - mean * mean));
+
+        // Laplacian variance — measures edge energy; low = blurry
+        let lapSum = 0, lapSumSq = 0, lapN = 0;
+        for (let y = 1; y < SH - 1; y++) {
+          for (let x = 1; x < SW - 1; x++) {
+            const lap = 4 * gray[y*SW+x]
+              - gray[(y-1)*SW+x] - gray[(y+1)*SW+x]
+              - gray[y*SW+x-1]   - gray[y*SW+x+1];
+            lapSum += lap; lapSumSq += lap * lap; lapN++;
+          }
+        }
+        const lapMean  = lapSum / lapN;
+        const blurScore = lapSumSq / lapN - lapMean * lapMean; // higher = sharper
+
+        // Penalise very dark (<40) or blown-out (>215)
+        const brightnessPenalty = Math.max(0, 40 - mean) + Math.max(0, mean - 215);
+        // Combined score: contrast + capped blur contribution - brightness penalty
+        const score = contrast + Math.min(blurScore * 0.12, 25) - brightnessPenalty * 0.5;
+
+        const meetsResolution = Math.min(img.naturalWidth, img.naturalHeight) >= MIN_PHOTO_DIM;
+        resolve({ score, blurScore, meetsResolution,
+                  width: img.naturalWidth, height: img.naturalHeight });
+      } catch(_) {
+        resolve({ score: 50, blurScore: 100, meetsResolution: true, width: 0, height: 0 });
+      }
+    };
+    img.onerror = () =>
+      resolve({ score: 50, blurScore: 100, meetsResolution: true, width: 0, height: 0 });
+    img.src = uri;
+  });
+}
+
+function updateQualityBadges() {
+  if (!currentRestaurant) return;
+  const scored = currentRestaurant.photos
+    .map((p, i) => ({ i, score: p.qualityScore ?? -Infinity, ok: p.meetsResolution !== false }))
+    .filter(p => p.score > -Infinity);
+  if (!scored.length) return;
+  const eligibleForBest = scored.filter(p => p.ok);
+  const bestIdx = eligibleForBest.length >= 2
+    ? eligibleForBest.reduce((a, b) => a.score >= b.score ? a : b).i
+    : -1;
+  const grid = $('photoGrid');
+  currentRestaurant.photos.forEach((p, i) => {
+    const slot  = grid?.querySelector(`[data-slot="${i}"]`);
+    const badge = slot?.querySelector('.quality-badge');
+    if (!badge) return;
+    if (p.meetsResolution === false) {
+      badge.textContent = '⚠ Low res';
+      badge.className   = 'quality-badge quality-lowres';
+    } else if (i === bestIdx) {
+      badge.textContent = '◆ Best';
+      badge.className   = 'quality-badge quality-best';
+    } else {
+      badge.textContent = '';
+      badge.className   = 'quality-badge';
+    }
+  });
 }
 
 async function createCoverOverlay(imgUri, restaurantName, address) {
@@ -779,14 +874,31 @@ async function createCoverOverlay(imgUri, restaurantName, address) {
     const img = new Image();
     img.crossOrigin = 'anonymous';
     img.onload = () => { try {
-      const W = img.naturalWidth  || 900;
-      const H = img.naturalHeight || 900;
+      // NOTE: this overlay is now used for the GRID PREVIEW only. The real
+      // post overlay is applied inside each platform injector at native
+      // resolution. Never upscale here — downscale-only keeps the preview sharp.
+      const MAX_DIM = 1440;
+      const srcW = img.naturalWidth  || 900;
+      const srcH = img.naturalHeight || 900;
+
+      // Crop to Instagram-valid aspect ratio (centre crop)
+      const ratio = srcW / srcH;
+      let cropW = srcW, cropH = srcH;
+      if (ratio < IG_MIN_RATIO)      cropH = Math.round(srcW / IG_MIN_RATIO);
+      else if (ratio > IG_MAX_RATIO) cropW = Math.round(srcH * IG_MAX_RATIO);
+      const cropOffX = Math.round((srcW - cropW) / 2);
+      const cropOffY = Math.round((srcH - cropH) / 2);
+
+      // Downscale-only — clamp the long side to MAX_DIM, never enlarge
+      const downScale = Math.min(1, MAX_DIM / Math.max(cropW, cropH));
+      const W = Math.round(cropW * downScale);
+      const H = Math.round(cropH * downScale);
       const canvas = document.createElement('canvas');
       canvas.width = W; canvas.height = H;
       const ctx = canvas.getContext('2d');
 
-      // Draw base image
-      ctx.drawImage(img, 0, 0, W, H);
+      // Draw base image — crop and (down)scale in one pass
+      ctx.drawImage(img, cropOffX, cropOffY, cropW, cropH, 0, 0, W, H);
 
       // ── Find the darkest vertical zone for best text readability ──────────
       function sampleLuminance(x, y, w, h) {
@@ -870,7 +982,7 @@ async function createCoverOverlay(imgUri, restaurantName, address) {
         ctx.fillText(`${city}, Belgium`, W - pad, H - pad);
       }
 
-      const result = canvas.toDataURL('image/jpeg', 0.93);
+      const result = canvas.toDataURL('image/jpeg', 0.97);
       coverOverlayCache.set(key, result);
       resolve(result);
     } catch(e) { resolve(null); } }; // try/catch ensures promise always resolves
@@ -1217,11 +1329,26 @@ function fillPhotoSlot(div, uri, index) {
       ? '<span class="cover-badge">Cover</span>'
       : `<button class="make-cover-btn" title="Set as cover photo">⭐ Cover</button>`}
     <span class="photo-label">${isCover ? '★' : index + 1}</span>
+    <span class="quality-badge"></span>
     <button class="dismiss-btn" title="Replace with another photo">✕</button>`;
 
-  // Show cover overlay preview on the cover photo
+  // Score quality (contrast + blur + resolution) and update grid badges
+  scorePhotoQuality(uri).then(({ score, meetsResolution }) => {
+    if (currentRestaurant?.photos[index]) {
+      currentRestaurant.photos[index].qualityScore    = score;
+      currentRestaurant.photos[index].meetsResolution = meetsResolution;
+      updateQualityBadges();
+    }
+  });
+
+  // Show cover overlay preview on the cover photo — use 1600px source for quality
   if (isCover && currentRestaurant) {
-    createCoverOverlay(uri, currentRestaurant.name, currentRestaurant.address)
+    const photoName = currentRestaurant.photos[index]?.name;
+    const hiResPromise = photoName
+      ? resolvePhotoUri(photoName, 1600)
+      : Promise.resolve(uri);
+    hiResPromise
+      .then(hiResUri => createCoverOverlay(hiResUri || uri, currentRestaurant.name, currentRestaurant.address))
       .then(overlayUri => {
         if (overlayUri) {
           const imgEl = div.querySelector('img');
@@ -1456,16 +1583,25 @@ $("removeSongBtn").addEventListener("click", () => {
 
 $("exportBtn").addEventListener("click", exportAndPost);
 
-async function photoToDataUrl(uri, maxWidth = 900) {
+async function photoToDataUrl(uri, maxWidth = 1440) {
   const res    = await fetch(uri);
   const blob   = await res.blob();
   const bitmap = await createImageBitmap(blob);
-  const scale  = Math.min(1, maxWidth / bitmap.width);
+
+  // Crop to Instagram-valid aspect ratio (centre crop)
+  const ratio = bitmap.width / bitmap.height;
+  let cropW = bitmap.width, cropH = bitmap.height;
+  if (ratio < IG_MIN_RATIO)      cropH = Math.round(bitmap.width / IG_MIN_RATIO);
+  else if (ratio > IG_MAX_RATIO) cropW = Math.round(bitmap.height * IG_MAX_RATIO);
+  const cropOffX = Math.round((bitmap.width  - cropW) / 2);
+  const cropOffY = Math.round((bitmap.height - cropH) / 2);
+
+  const scale = Math.min(1, maxWidth / cropW);
   const canvas = document.createElement("canvas");
-  canvas.width  = Math.round(bitmap.width  * scale);
-  canvas.height = Math.round(bitmap.height * scale);
-  canvas.getContext("2d").drawImage(bitmap, 0, 0, canvas.width, canvas.height);
-  return canvas.toDataURL("image/jpeg", 0.82);
+  canvas.width  = Math.round(cropW * scale);
+  canvas.height = Math.round(cropH * scale);
+  canvas.getContext("2d").drawImage(bitmap, cropOffX, cropOffY, cropW, cropH, 0, 0, canvas.width, canvas.height);
+  return canvas.toDataURL("image/jpeg", 0.95);
 }
 
 async function exportAndPost() {
@@ -1489,10 +1625,34 @@ async function exportAndPost() {
   // ── 1. Resolve full-res photo URIs from Google Places CDN ─────────────────
   const t_photos = Date.now();
   TechLog.info("MEDIA", "photos_start", { run_id: runId, run_type: "manual", name });
+
+  // Build a pool of candidate photo names: selected photos first, then unused extras
+  const selectedNames = new Set(photos.map(p => p.name));
+  const extraPhotos   = (currentRestaurant.allPhotos || []).filter(p => !selectedNames.has(p.name));
+  const candidates    = [...photos, ...extraPhotos];
+
   const photoUris = [];
-  for (const photo of photos) {
+  const usedNames = new Set();
+  for (const photo of candidates) {
+    if (photoUris.length >= photos.length) break; // collected enough
+    if (usedNames.has(photo.name)) continue;
     try {
-      photoUris.push(await resolvePhotoUri(photo.name, 1200));
+      const uri = await resolvePhotoUri(photo.name, 2048);
+      // Resolution gate: load the image and verify delivered dimensions
+      const dims = await new Promise(res => {
+        const img = new Image();
+        img.onload  = () => res({ w: img.naturalWidth,  h: img.naturalHeight });
+        img.onerror = () => res({ w: 0, h: 0 });
+        img.src = uri;
+      });
+      const shortSide = Math.min(dims.w, dims.h);
+      if (shortSide > 0 && shortSide < MIN_PHOTO_DIM) {
+        AppLog.warn(`Photo below ${MIN_PHOTO_DIM}px short side (${dims.w}×${dims.h}), trying next`, { photo: photo.name });
+        usedNames.add(photo.name);
+        continue; // skip — try next candidate
+      }
+      photoUris.push(uri);
+      usedNames.add(photo.name);
     } catch (e) {
       AppLog.error("Photo resolve failed", { photo: photo.name, error: String(e) });
       console.warn("Photo resolve failed:", e);
@@ -1523,16 +1683,16 @@ async function exportAndPost() {
     const covIdx   = Math.min(coverPhotoIndex, photoUris.length - 1);
     const photoDataUrls = [];
 
-    // Cover photo: apply restaurant name + location overlay
+    // Cover photo at index 0 — sent PLAIN (no overlay baked here).
+    // The text/vignette overlay is applied once, inside each platform injector,
+    // at the photo's native resolution. Pre-baking here would force an
+    // upscale + double JPEG re-encode + double overlay → blurry result.
     try {
-      setStatus("Rendering cover photo overlay…");
       const coverUri = photoUris[covIdx];
-      const overlay  = await createCoverOverlay(coverUri, name, address);
-      photoDataUrls.push(overlay || await photoToDataUrl(coverUri));
-      AppLog.info("Cover overlay applied", { index: covIdx });
+      photoDataUrls.push(await photoToDataUrl(coverUri));
+      AppLog.info("Cover photo prepared (overlay applied in injector)", { index: covIdx });
     } catch(e) {
-      AppLog.warn("Cover overlay failed, using plain photo", String(e));
-      try { photoDataUrls.push(await photoToDataUrl(photoUris[covIdx])); } catch(_) {}
+      AppLog.warn("Cover photo prep failed", String(e));
     }
 
     // Remaining photos in original order (skip cover)
@@ -2695,7 +2855,15 @@ function setupScheduleAlarms(schedule) {
 }
 
 // ── Render scheduled posts list ───────────────────────────────────────────────
-function renderScheduledPosts(schedule) {
+const SCHED_STATUS_LABELS = {
+  pending:     "⏳ Pending",
+  triggered:   "🔄 Posting…",
+  done:        "✓ Done",
+  failed:      "✗ Failed",
+  unconfirmed: "⚠ Unconfirmed",
+};
+
+function renderScheduledPosts(schedule, runLog = []) {
   const body  = document.getElementById("abSchedBody");
   const badge = document.getElementById("abSchedCount");
   const title = document.querySelector("#abScheduledSection .ab-collapse-hdr-title");
@@ -2726,7 +2894,6 @@ function renderScheduledPosts(schedule) {
     grouped[post.date].push({ ...post, idx });
   });
 
-  const now = new Date();
   Object.entries(grouped).sort(([a],[b]) => a.localeCompare(b)).forEach(([date, posts]) => {
     const dayEl  = document.createElement("div");
     dayEl.className = "ab-sched-day-group";
@@ -2735,9 +2902,12 @@ function renderScheduledPosts(schedule) {
     dayEl.innerHTML = `<div class="ab-sched-day-label">${dayLbl}</div>`;
 
     posts.forEach(post => {
-      const postTime = new Date(`${date}T${post.time}:00`);
-      const isPast   = postTime < now;
       const plat = post.platforms.map(p => ({ instagram:"📸 IG", facebook:"👥 FB", tiktok:"🎵 TT" }[p] || p)).join("  ");
+
+      // Status comes from the ACTUAL run log — never from the clock.
+      // "✓ Done" is only shown when the run confirmed success on every platform.
+      const logStatus = runLog.find(e => e.postIndex === post.idx)?.status;
+      const status    = SCHED_STATUS_LABELS[logStatus] ? logStatus : "pending";
 
       const item = document.createElement("div");
       item.className = "ab-sched-item";
@@ -2745,8 +2915,8 @@ function renderScheduledPosts(schedule) {
       item.innerHTML = `
         <span class="ab-sched-time">${escapeHtml(post.time)}</span>
         <span class="ab-sched-platforms">${escapeHtml(plat)}</span>
-        <span class="ab-sched-status ${isPast ? 'done' : 'pending'}" id="abSchedStatus-${post.idx}">
-          ${isPast ? "✓ Done" : "⏳ Pending"}
+        <span class="ab-sched-status ${status}" id="abSchedStatus-${post.idx}">
+          ${SCHED_STATUS_LABELS[status]}
         </span>`;
       dayEl.appendChild(item);
     });
@@ -2757,8 +2927,7 @@ function renderScheduledPosts(schedule) {
 function updateScheduledItemStatus(idx, status) {
   const el = document.getElementById(`abSchedStatus-${idx}`);
   if (!el) return;
-  const labels = { pending:"⏳ Pending", triggered:"🔄 Posting…", done:"✓ Done", failed:"✗ Failed" };
-  el.textContent = labels[status] || status;
+  el.textContent = SCHED_STATUS_LABELS[status] || status;
   el.className   = `ab-sched-status ${status}`;
 }
 
@@ -2903,7 +3072,7 @@ function restoreBotActiveState() {
       refreshActivityLog();
       if (wasActive && schedule) {
         updateBotUI(true);
-        renderScheduledPosts(schedule);
+        renderScheduledPosts(schedule, runLog);
         const done = runLog.filter(e => e.status === "done").length;
         updateProgress(done, schedule.totalPosts);
         updateNextPostLabel(schedule);
