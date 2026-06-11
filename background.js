@@ -2984,12 +2984,13 @@ async function testSilentTikTok() {
             stream.getTracks().forEach(t => t.stop());
             const blob = new Blob(chunks, { type: mime });
             const ext  = mime.includes('mp4') ? 'mp4' : 'webm';
-            const dataUrl = await new Promise((resolve, reject) => {
-              const reader = new FileReader();
-              reader.onload = () => resolve(reader.result);
-              reader.onerror = () => reject(reader.error || new Error('FileReader failed'));
-              reader.readAsDataURL(blob);
-            });
+            const buf = new Uint8Array(await blob.arrayBuffer());
+            let binary = '';
+            const chunkSize = 0x8000;
+            for (let i = 0; i < buf.length; i += chunkSize) {
+              binary += String.fromCharCode(...buf.subarray(i, i + chunkSize));
+            }
+            const dataUrl = `data:${mime};base64,${btoa(binary)}`;
             return { ok: true, dataUrl, mime, fileName: `ffbot-diagnostic-test.${ext}` };
           } catch (e) { return { ok: false, error: e.message }; }
         },
@@ -5205,6 +5206,21 @@ function injectTikTok(photoDataUrls, caption, songName, location, opts) {
     ['change','input'].forEach(ev => input.dispatchEvent(new Event(ev, { bubbles: true })));
   }
 
+  // Converts a File/Blob to a data URL via arrayBuffer() + manual base64
+  // encoding (chunked to avoid call-stack limits on large buffers). Avoids
+  // FileReader.readAsDataURL, whose jsdom implementation relies on a
+  // real-clock timer that fake timers can't advance — purely Promise/microtask
+  // based here, so it behaves the same under tests and real browsers.
+  async function fileToDataUrl(file) {
+    const buf = new Uint8Array(await file.arrayBuffer());
+    let binary = '';
+    const chunkSize = 0x8000;
+    for (let i = 0; i < buf.length; i += chunkSize) {
+      binary += String.fromCharCode(...buf.subarray(i, i + chunkSize));
+    }
+    return `data:${file.type};base64,${btoa(binary)}`;
+  }
+
   // ── MAIN-world -> background request/response bridge ────────────────────
   // Dispatches an __ffbot_event with a requestId and awaits the matching
   // __ffbot_response_<requestId> custom event (relayed via the ISOLATED-world
@@ -5252,12 +5268,7 @@ function injectTikTok(photoDataUrls, caption, songName, location, opts) {
     // anti-automation checks on synthetic DataTransfer events.
     step('inject_file_cdp_attempt');
     try {
-      const dataUrl = await new Promise((resolve, reject) => {
-        const reader = new FileReader();
-        reader.onload = () => resolve(reader.result);
-        reader.onerror = () => reject(reader.error || new Error('FileReader failed'));
-        reader.readAsDataURL(file);
-      });
+      const dataUrl = await fileToDataUrl(file);
       const response = await requestBackground({
         type: 'INJECT_FILE_CDP', dataUrl, fileName: file.name, selector: 'input[type="file"]',
       }, 30000);
