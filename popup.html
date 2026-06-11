@@ -84,195 +84,372 @@
         <p class="hint">Get a free key at <strong>foursquare.com/developers</strong>.</p>
       </section>
 
-      <!-- ⓪ Search filters (independent of the Auto Bot configuration) -->
-      <section class="mm-filters">
-        <div class="ab-collapse-hdr" id="mmConfigToggle">
-          <span class="ab-collapse-hdr-title">⚙ Search Filters</span>
-          <span class="ab-config-summary" id="mmConfigSummary"></span>
-          <span class="ab-collapse-arrow collapsed" id="mmConfigArrow">▼</span>
-        </div>
+      <!-- ── Search mode: Manual Search vs Bot Search ─────────────── -->
+      <div class="search-mode-toggle">
+        <button class="search-mode-btn active" id="searchModeManual" data-mode="manual">✍️ Manual Search</button>
+        <button class="search-mode-btn" id="searchModeBot" data-mode="bot">🤖 Bot Search</button>
+      </div>
 
-        <div id="mmConfigBody" class="collapsed">
-
-          <!-- ── Type ─────────────────────────────────────────────── -->
-          <div class="ab-group">
-            <label class="ab-label">Type</label>
-            <div class="pill-row" id="mmType">
-              <button class="ab-pill active" data-val="restaurant">🍽️ Restaurant</button>
-              <button class="ab-pill" data-val="hotel">🏨 Hotel</button>
-              <button class="ab-pill" data-val="bar">🍺 Bar</button>
-            </div>
-          </div>
-
-          <!-- ── Country ──────────────────────────────────────────── -->
-          <div class="ab-group">
-            <label class="ab-label" for="mmCountry">Country</label>
-            <select id="mmCountry" class="ab-select">
-              <option value="BE">Belgium</option>
-              <option value="FR">France</option>
-              <option value="DE">Germany</option>
-              <option value="LU">Luxembourg</option>
-              <option value="NL">The Netherlands</option>
-            </select>
-          </div>
-
-          <!-- ── Region (multi-select, province-level) ────────────── -->
-          <div class="ab-group">
-            <label class="ab-label">Region <span class="ab-label-hint">(multi-select)</span></label>
-            <div class="ab-region-wrap" id="mmRegionWrap">
-              <!-- populated by JS based on country -->
-            </div>
-          </div>
-
-          <!-- ── Minimum Ratings ──────────────────────────────────── -->
-          <div class="ab-group">
-            <label class="ab-label">
-              Minimum Ratings
-              <span class="ab-slider-val" id="mmMinRatingsVal">100</span>
-            </label>
-            <input type="range" id="mmMinRatings" class="ab-slider"
-              min="0" max="500" step="10" value="100" />
-            <div class="ab-slider-range">
-              <span>0</span><span>500</span>
-            </div>
-          </div>
-
-          <!-- ── Minimum Stars ─────────────────────────────────────── -->
-          <div class="ab-group">
-            <label class="ab-label">Minimum Stars</label>
-            <div class="pill-row" id="mmStars">
-              <button class="ab-pill" data-val="3">⭐ 3.0</button>
-              <button class="ab-pill" data-val="3.5">⭐ 3.5</button>
-              <button class="ab-pill active" data-val="4">⭐ 4.0</button>
-              <button class="ab-pill" data-val="4.5">⭐ 4.5</button>
-            </div>
-          </div>
-
-          <!-- ── Minimum Pictures ─────────────────────────────────── -->
-          <div class="ab-group">
-            <label class="ab-label">Minimum Pictures</label>
-            <div class="pill-row" id="mmPics">
-              <button class="ab-pill" data-val="3">3</button>
-              <button class="ab-pill" data-val="4">4</button>
-              <button class="ab-pill active" data-val="5">5</button>
-            </div>
-          </div>
-
-        </div>
-      </section>
-
-      <!-- ① Search -->
-      <section class="search-section">
+      <!-- ① Manual Search: type & pick a place from the dropdown ───── -->
+      <section class="search-section" id="manualSearchPanel">
         <div class="input-row">
           <input id="query" type="text"
             placeholder="e.g. Comme Chez Soi, Brussels"
             autocomplete="off" />
           <button id="searchBtn" class="btn btn--primary">Search</button>
-          <button id="randomBtn" class="btn btn--random" title="Pick a random place using the Search Filters above">🎲</button>
         </div>
         <div id="searchResultsDropdown" class="search-results-dropdown hidden"></div>
+        <div id="resultsAnchorManual"></div>
       </section>
 
-      <!-- ② Restaurant result + photos -->
-      <section id="results" class="results-section hidden">
+      <!-- ① Bot Search: Bot Configuration (Singular Horeca Post / Region Round-Up Post) -->
+      <section class="bot-config-wrap hidden" id="botSearchPanel">
 
-        <div class="restaurant-card">
-          <div class="restaurant-info">
-            <h2 id="restaurantName"></h2>
-            <p id="restaurantAddress" class="address"></p>
-            <p id="restaurantMeta" class="meta"></p>
-            <a id="restaurantMapsLink" href="#" target="_blank" class="maps-link">View on Google Maps ↗</a>
-          </div>
-        </div>
-
-        <div id="photoGrid" class="photo-grid"></div>
-
-        <div class="divider"></div>
-
-        <!-- ③ Song search -->
-        <div class="card-section">
-          <p class="section-label">🎵 Add a song to your post</p>
-          <div class="input-row">
-            <input id="songQuery" type="text" placeholder="Search artist or track…" autocomplete="off" />
-            <button id="songSearchBtn" class="btn btn--ghost-accent">Search</button>
-          </div>
-          <div id="songResults" class="song-results hidden"></div>
-          <div id="selectedSong" class="selected-song hidden">
-            <img id="selectedSongArt" src="" alt="" />
-            <div class="selected-song-info">
-              <span id="selectedSongName" class="song-name"></span>
-              <span id="selectedSongArtist" class="song-artist"></span>
+          <!-- ── Subsection: Singular Horeca Post ──────────────────── -->
+          <div class="bot-subsection" id="mmSubsection">
+            <div class="ab-collapse-hdr" id="mmConfigToggle">
+              <span class="ab-collapse-hdr-title">🍽️ Singular Horeca Post</span>
+              <span class="ab-config-summary" id="mmConfigSummary"></span>
+              <span class="ab-collapse-arrow collapsed" id="mmConfigArrow">▼</span>
             </div>
-            <button id="removeSongBtn" class="btn-icon" title="Remove song">✕</button>
-          </div>
-        </div>
 
-        <div class="divider"></div>
+            <div id="mmConfigBody" class="collapsed">
 
-        <!-- ④ Caption editor -->
-        <div class="card-section">
-          <div class="section-header">
-            <p class="section-label">✍️ Caption</p>
-            <button id="refreshCaptionBtn" class="btn-link" title="Regenerate caption">↺ Regenerate</button>
-          </div>
-          <textarea id="caption" class="caption-input" rows="4"
-            placeholder="Caption will be auto-filled after searching a restaurant…"></textarea>
-        </div>
+              <!-- ── Type ─────────────────────────────────────────── -->
+              <div class="ab-group">
+                <label class="ab-label">Type</label>
+                <div class="pill-row" id="mmType">
+                  <button class="ab-pill active" data-val="restaurant">🍽️ Restaurant</button>
+                  <button class="ab-pill" data-val="hotel">🏨 Hotel</button>
+                  <button class="ab-pill" data-val="bar">🍺 Bar</button>
+                </div>
+              </div>
 
-        <div class="divider"></div>
+              <!-- ── Country ──────────────────────────────────────── -->
+              <div class="ab-group">
+                <label class="ab-label" for="mmCountry">Country</label>
+                <select id="mmCountry" class="ab-select">
+                  <option value="BE">Belgium</option>
+                  <option value="FR">France</option>
+                  <option value="DE">Germany</option>
+                  <option value="LU">Luxembourg</option>
+                  <option value="NL">The Netherlands</option>
+                </select>
+              </div>
 
-        <!-- ⑤ Social media platforms -->
-        <div class="card-section">
-          <p class="section-label">📲 Post to social media</p>
-          <div class="social-icons">
+              <!-- ── Region (multi-select, province-level) ─────────── -->
+              <div class="ab-group">
+                <label class="ab-label">Region <span class="ab-label-hint">(multi-select)</span></label>
+                <div class="ab-region-wrap" id="mmRegionWrap">
+                  <!-- populated by JS based on country -->
+                </div>
+              </div>
 
-            <button class="social-btn" data-platform="facebook" title="Facebook">
-              <svg viewBox="0 0 24 24" fill="currentColor">
-                <path d="M18 2h-3a5 5 0 0 0-5 5v3H7v4h3v8h4v-8h3l1-4h-4V7a1 1 0 0 1 1-1h3z"/>
-              </svg>
-              <span>Facebook</span>
-            </button>
+              <!-- ── Minimum Ratings ─────────────────────────────────── -->
+              <div class="ab-group">
+                <label class="ab-label">
+                  Minimum Ratings
+                  <span class="ab-slider-val" id="mmMinRatingsVal">100</span>
+                </label>
+                <input type="range" id="mmMinRatings" class="ab-slider"
+                  min="0" max="500" step="10" value="100" />
+                <div class="ab-slider-range">
+                  <span>0</span><span>500</span>
+                </div>
+              </div>
 
-            <button class="social-btn" data-platform="instagram" title="Instagram">
-              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8">
-                <rect x="2" y="2" width="20" height="20" rx="5" ry="5"/>
-                <circle cx="12" cy="12" r="4.5"/>
-                <circle cx="17.5" cy="6.5" r="1" fill="currentColor" stroke="none"/>
-              </svg>
-              <span>Instagram</span>
-            </button>
+              <!-- ── Minimum Stars ────────────────────────────────────── -->
+              <div class="ab-group">
+                <label class="ab-label">Minimum Stars</label>
+                <div class="pill-row" id="mmStars">
+                  <button class="ab-pill" data-val="3">⭐ 3.0</button>
+                  <button class="ab-pill" data-val="3.5">⭐ 3.5</button>
+                  <button class="ab-pill active" data-val="4">⭐ 4.0</button>
+                  <button class="ab-pill" data-val="4.5">⭐ 4.5</button>
+                </div>
+              </div>
 
-            <button class="social-btn" data-platform="tiktok" title="TikTok">
-              <svg viewBox="0 0 24 24" fill="currentColor">
-                <path d="M19.59 6.69a4.83 4.83 0 0 1-3.77-4.25V2h-3.45v13.67a2.89 2.89 0 0 1-2.88 2.5 2.89 2.89 0 0 1-2.89-2.89 2.89 2.89 0 0 1 2.89-2.89c.28 0 .54.04.79.1V9.01a6.33 6.33 0 0 0-.79-.05 6.34 6.34 0 0 0-6.34 6.34 6.34 6.34 0 0 0 6.34 6.34 6.34 6.34 0 0 0 6.33-6.34V8.73a8.18 8.18 0 0 0 4.78 1.52V6.8a4.85 4.85 0 0 1-1.01-.11z"/>
-              </svg>
-              <span>TikTok</span>
-            </button>
+              <!-- ── Minimum Pictures ─────────────────────────────────── -->
+              <div class="ab-group">
+                <label class="ab-label">Minimum Pictures</label>
+                <div class="pill-row" id="mmPics">
+                  <button class="ab-pill" data-val="3">3</button>
+                  <button class="ab-pill" data-val="4">4</button>
+                  <button class="ab-pill active" data-val="5">5</button>
+                </div>
+              </div>
 
-          </div>
-        </div>
+              <!-- ── Find a place ─────────────────────────────────────── -->
+              <div class="ab-group">
+                <button class="btn btn--random" id="randomBtn" type="button">🎲 Find a Place with these Filters</button>
+                <p class="ab-preview-hint">Picks a random place that matches the filters above and loads it below for posting</p>
+              </div>
 
-        <div class="divider"></div>
+            </div><!-- /mmConfigBody -->
 
-        <!-- Export / Post -->
-        <div class="export-section">
-          <div class="export-row">
-            <button id="postBtn" class="btn btn--export">📤 Post</button>
-            <button id="exportBtn" class="btn btn--export btn--export-secondary">⬇ Export</button>
-          </div>
-        </div>
+            <!-- ── Result preview + post now ─────────────────────────── -->
+            <div id="resultsAnchorBot"></div>
+            <section id="results" class="results-section auto-preview-panel hidden">
+
+              <div class="auto-preview-hdr">
+                <span class="auto-preview-hdr-title">👁 Place Preview</span>
+                <button class="btn-icon" id="mmPreviewClose" title="Close preview">✕</button>
+              </div>
+
+              <div class="restaurant-card">
+                <div class="restaurant-info">
+                  <h2 id="restaurantName"></h2>
+                  <p id="restaurantAddress" class="address"></p>
+                  <p id="restaurantMeta" class="meta"></p>
+                  <a id="restaurantMapsLink" href="#" target="_blank" class="maps-link">View on Google Maps ↗</a>
+                </div>
+              </div>
+
+              <div id="photoGrid" class="photo-grid"></div>
+
+              <div class="divider"></div>
+
+              <!-- ③ Song search -->
+              <div class="card-section">
+                <p class="section-label">🎵 Add a song to your post</p>
+                <div class="input-row">
+                  <input id="songQuery" type="text" placeholder="Search artist or track…" autocomplete="off" />
+                  <button id="songSearchBtn" class="btn btn--ghost-accent">Search</button>
+                </div>
+                <div id="songResults" class="song-results hidden"></div>
+                <div id="selectedSong" class="selected-song hidden">
+                  <img id="selectedSongArt" src="" alt="" />
+                  <div class="selected-song-info">
+                    <span id="selectedSongName" class="song-name"></span>
+                    <span id="selectedSongArtist" class="song-artist"></span>
+                  </div>
+                  <button id="removeSongBtn" class="btn-icon" title="Remove song">✕</button>
+                </div>
+              </div>
+
+              <div class="divider"></div>
+
+              <!-- ④ Caption editor -->
+              <div class="card-section">
+                <div class="section-header">
+                  <p class="section-label">✍️ Caption</p>
+                  <button id="refreshCaptionBtn" class="btn-link" title="Regenerate caption">↺ Regenerate</button>
+                </div>
+                <textarea id="caption" class="caption-input" rows="4"
+                  placeholder="Caption will be auto-filled after searching a restaurant…"></textarea>
+              </div>
+
+              <div class="divider"></div>
+
+              <!-- ⑤ Social media platforms -->
+              <div class="card-section">
+                <p class="section-label">📲 Post to social media</p>
+                <div class="social-icons">
+
+                  <button class="social-btn" data-platform="facebook" title="Facebook">
+                    <svg viewBox="0 0 24 24" fill="currentColor">
+                      <path d="M18 2h-3a5 5 0 0 0-5 5v3H7v4h3v8h4v-8h3l1-4h-4V7a1 1 0 0 1 1-1h3z"/>
+                    </svg>
+                    <span>Facebook</span>
+                  </button>
+
+                  <button class="social-btn" data-platform="instagram" title="Instagram">
+                    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8">
+                      <rect x="2" y="2" width="20" height="20" rx="5" ry="5"/>
+                      <circle cx="12" cy="12" r="4.5"/>
+                      <circle cx="17.5" cy="6.5" r="1" fill="currentColor" stroke="none"/>
+                    </svg>
+                    <span>Instagram</span>
+                  </button>
+
+                  <button class="social-btn" data-platform="tiktok" title="TikTok">
+                    <svg viewBox="0 0 24 24" fill="currentColor">
+                      <path d="M19.59 6.69a4.83 4.83 0 0 1-3.77-4.25V2h-3.45v13.67a2.89 2.89 0 0 1-2.88 2.5 2.89 2.89 0 0 1-2.89-2.89 2.89 2.89 0 0 1 2.89-2.89c.28 0 .54.04.79.1V9.01a6.33 6.33 0 0 0-.79-.05 6.34 6.34 0 0 0-6.34 6.34 6.34 6.34 0 0 0 6.34 6.34 6.34 6.34 0 0 0 6.33-6.34V8.73a8.18 8.18 0 0 0 4.78 1.52V6.8a4.85 4.85 0 0 1-1.01-.11z"/>
+                    </svg>
+                    <span>TikTok</span>
+                  </button>
+
+                </div>
+              </div>
+
+              <div class="divider"></div>
+
+              <!-- Export / Post -->
+              <div class="export-section">
+                <div class="export-row">
+                  <button id="postBtn" class="btn btn--export">📤 Post</button>
+                  <button id="exportBtn" class="btn btn--export btn--export-secondary">⬇ Export</button>
+                </div>
+              </div>
+
+            </section>
+
+          </div><!-- /Singular Horeca Post -->
+
+          <!-- ── Subsection: Region Round-Up Post ──────────────────── -->
+          <div class="bot-subsection" id="mrSubsection">
+            <div class="ab-collapse-hdr" id="mrConfigToggle">
+              <span class="ab-collapse-hdr-title">🔝 Region Round-Up Post</span>
+              <span class="ab-config-summary" id="mrConfigSummary"></span>
+              <span class="ab-collapse-arrow collapsed" id="mrConfigArrow">▼</span>
+            </div>
+
+            <div id="mrConfigBody" class="collapsed">
+
+              <!-- ── Type ─────────────────────────────────────────── -->
+              <div class="ab-group">
+                <label class="ab-label">Entity Type</label>
+                <div class="pill-row" id="mrType">
+                  <button class="ab-pill active" data-val="restaurant">🍽️ Restaurant</button>
+                  <button class="ab-pill" data-val="hotel">🏨 Hotel</button>
+                  <button class="ab-pill" data-val="bar">🍺 Bar</button>
+                </div>
+              </div>
+
+              <!-- ── Country / Region ───────────────────────────────── -->
+              <div class="ab-group">
+                <label class="ab-label" for="mrCountry">Country</label>
+                <select id="mrCountry" class="ab-select">
+                  <option value="BE">Belgium</option>
+                  <option value="FR">France</option>
+                  <option value="DE">Germany</option>
+                  <option value="LU">Luxembourg</option>
+                  <option value="NL">The Netherlands</option>
+                </select>
+              </div>
+
+              <div class="ab-group">
+                <label class="ab-label" for="mrRegion">Region <span class="ab-label-hint">(single region)</span></label>
+                <select id="mrRegion" class="ab-select">
+                  <!-- populated by JS based on country -->
+                </select>
+              </div>
+
+              <!-- ── Roundup Size ───────────────────────────────────── -->
+              <div class="ab-group">
+                <label class="ab-label">Roundup Size</label>
+                <div class="pill-row" id="mrSize">
+                  <button class="ab-pill" data-val="3">Top 3</button>
+                  <button class="ab-pill active" data-val="5">Top 5</button>
+                  <button class="ab-pill" data-val="10">Top 10</button>
+                </div>
+              </div>
+
+              <!-- ── Ranking Criteria ──────────────────────────────── -->
+              <div class="ab-group">
+                <label class="ab-label">Ranking Criteria</label>
+                <div class="pill-row" id="mrRanking">
+                  <button class="ab-pill active" data-val="rating">Highest Rated</button>
+                  <button class="ab-pill" data-val="reviews">Most Reviewed</button>
+                </div>
+              </div>
+
+              <!-- ── Minimum Ratings ────────────────────────────────── -->
+              <div class="ab-group">
+                <label class="ab-label">
+                  Minimum Ratings
+                  <span class="ab-slider-val" id="mrMinRatingsVal">100</span>
+                </label>
+                <input type="range" id="mrMinRatings" class="ab-slider"
+                  min="0" max="500" step="10" value="100" />
+                <div class="ab-slider-range">
+                  <span>0</span><span>500</span>
+                </div>
+              </div>
+
+              <!-- ── Minimum Stars ──────────────────────────────────── -->
+              <div class="ab-group">
+                <label class="ab-label">Minimum Stars</label>
+                <div class="pill-row" id="mrMinStars">
+                  <button class="ab-pill" data-val="3">⭐ 3.0</button>
+                  <button class="ab-pill" data-val="3.5">⭐ 3.5</button>
+                  <button class="ab-pill active" data-val="4">⭐ 4.0</button>
+                  <button class="ab-pill" data-val="4.5">⭐ 4.5</button>
+                </div>
+              </div>
+
+              <!-- ── Caption Content ────────────────────────────────── -->
+              <div class="ab-group">
+                <label class="ab-label">Caption Content</label>
+
+                <div class="ab-caption-lang-row">
+                  <label class="ab-caption-lang-label" for="mrLanguage">Language</label>
+                  <select id="mrLanguage" class="ab-select ab-select--sm">
+                    <option value="nl">Dutch</option>
+                    <option value="en">English</option>
+                    <option value="fr">French</option>
+                    <option value="de">German</option>
+                  </select>
+                </div>
+
+                <div class="ab-checkbox-grid">
+                  <label class="ab-checkbox"><input type="checkbox" checked id="mrCapRatings" /><span>Ratings</span></label>
+                  <label class="ab-checkbox"><input type="checkbox" checked id="mrCapReviewCount" /><span>Review Counts</span></label>
+                  <label class="ab-checkbox"><input type="checkbox" id="mrCapHashtags" /><span>Hashtags</span></label>
+                </div>
+              </div>
+
+              <!-- ── Generate ───────────────────────────────────────── -->
+              <div class="ab-group">
+                <button class="btn btn--preview-example" type="button" id="mrGenerateBtn">
+                  <span class="preview-icon">🔍</span>
+                  Generate Top N List
+                </button>
+                <p class="ab-preview-hint">Searches for the top-ranked places and prepares a ready-to-post roundup</p>
+              </div>
+
+            </div><!-- /mrConfigBody -->
+
+            <!-- ── Result preview + post now ─────────────────────────── -->
+            <div id="mrPreview" class="auto-preview-panel hidden">
+              <div class="auto-preview-hdr">
+                <span class="auto-preview-hdr-title">👁 Roundup Preview</span>
+                <button class="btn-icon" id="mrPreviewClose" title="Close preview">✕</button>
+              </div>
+              <div id="mrPreviewContent"></div>
+
+              <div class="ab-group">
+                <label class="ab-label">Post to Social Media <span class="ab-label-hint">(multi-select)</span></label>
+                <div class="social-icons">
+
+                  <button class="social-btn active" data-platform="facebook" id="mrSocialFB" title="Facebook">
+                    <svg viewBox="0 0 24 24" fill="currentColor">
+                      <path d="M18 2h-3a5 5 0 0 0-5 5v3H7v4h3v8h4v-8h3l1-4h-4V7a1 1 0 0 1 1-1h3z"/>
+                    </svg>
+                    <span>Facebook</span>
+                  </button>
+
+                  <button class="social-btn active" data-platform="instagram" id="mrSocialIG" title="Instagram">
+                    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8">
+                      <rect x="2" y="2" width="20" height="20" rx="5" ry="5"/>
+                      <circle cx="12" cy="12" r="4.5"/>
+                      <circle cx="17.5" cy="6.5" r="1" fill="currentColor" stroke="none"/>
+                    </svg>
+                    <span>Instagram</span>
+                  </button>
+
+                  <button class="social-btn" data-platform="tiktok" id="mrSocialTT" title="TikTok">
+                    <svg viewBox="0 0 24 24" fill="currentColor">
+                      <path d="M19.59 6.69a4.83 4.83 0 0 1-3.77-4.25V2h-3.45v13.67a2.89 2.89 0 0 1-2.88 2.5 2.89 2.89 0 0 1-2.89-2.89 2.89 2.89 0 0 1 2.89-2.89c.28 0 .54.04.79.1V9.01a6.33 6.33 0 0 0-.79-.05 6.34 6.34 0 0 0-6.34 6.34 6.34 6.34 0 0 0 6.34 6.34 6.34 6.34 0 0 0 6.33-6.34V8.73a8.18 8.18 0 0 0 4.78 1.52V6.8a4.85 4.85 0 0 1-1.01-.11z"/>
+                    </svg>
+                    <span>TikTok</span>
+                  </button>
+
+                </div>
+              </div>
+
+              <div class="export-row">
+                <button id="mrPostBtn" class="btn btn--export">📤 Post Roundup Now</button>
+                <button id="mrExportBtn" class="btn btn--export btn--export-secondary">⬇ Export</button>
+              </div>
+            </div>
+          </div><!-- /Region Round-Up Post -->
 
       </section>
+      <!-- /Bot Search -->
 
       <!-- Status bar -->
       <div id="status" class="status hidden"></div>
-
-      <!-- Settings footer -->
-      <footer class="settings-footer hidden" id="settingsFooter">
-        <button id="changeKeyBtn"   class="btn btn--ghost">⚙ API key</button>
-        <button id="usageStatsBtn"  class="btn btn--ghost">📊 Usage</button>
-        <button id="exportLogsBtn"  class="btn btn--ghost">📋 Logs</button>
-      </footer>
 
     </div><!-- /manualMode -->
 
@@ -289,33 +466,68 @@
         <button class="btn-settings" id="settingsBtnAuto" title="Settings">⚙</button>
       </div>
 
-      <!-- ── Bot status bar (visible only when active) ──────────── -->
-      <div id="abBotStatus" class="ab-bot-status hidden">
-        <div class="ab-bot-dot"></div>
-        <div class="ab-bot-status-info">
-          <span class="ab-bot-status-title">Auto Bot is Active</span>
-          <span class="ab-bot-status-next" id="abBotNextPost">Calculating next post…</span>
-        </div>
-        <div class="ab-bot-status-progress">
-          <span id="abBotProgressText">0 / 0 posts</span>
-        </div>
-      </div>
+      <!-- ── Active Bots overview (visible only when ≥1 bot is active/paused) ── -->
+      <div id="abActiveBotsWrap" class="ab-active-bots hidden">
+        <div class="ab-active-bots-hdr">🟢 Active Bots</div>
 
-      <!-- ── Paused banner (visible when the bot hit an unrecoverable issue) ── -->
-      <div id="abPausedBanner" class="ab-paused-banner hidden">
-        <div class="ab-paused-icon">⏸</div>
-        <div class="ab-paused-info">
-          <span class="ab-paused-title">Auto Bot Paused</span>
-          <span class="ab-paused-reason" id="abPausedReason"></span>
+        <!-- ── Singular Horeca Post status row ─────────────────── -->
+        <div id="abBotStatus" class="ab-bot-row hidden">
+          <div class="ab-bot-dot"></div>
+          <div class="ab-bot-row-info">
+            <span class="ab-bot-row-title">🍽️ Singular Horeca Post</span>
+            <span class="ab-bot-row-next" id="abBotNextPost">Calculating next post…</span>
+          </div>
+          <span class="ab-bot-row-progress" id="abBotProgressText">0 / 0 posts</span>
         </div>
-        <button class="btn-secondary ab-paused-resume" id="abPausedResumeBtn">Resume</button>
+
+        <!-- ── Paused banner (visible when the bot hit an unrecoverable issue) ── -->
+        <div id="abPausedBanner" class="ab-paused-row hidden">
+          <div class="ab-paused-icon">⏸</div>
+          <div class="ab-paused-info">
+            <span class="ab-paused-title">🍽️ Singular Horeca Post Paused</span>
+            <span class="ab-paused-reason" id="abPausedReason"></span>
+          </div>
+          <button class="btn-secondary ab-paused-resume" id="abPausedResumeBtn">Resume</button>
+        </div>
+
+        <!-- ── Region Round-Up Post status row ─────────────────── -->
+        <div id="rrBotStatus" class="ab-bot-row hidden">
+          <div class="ab-bot-dot"></div>
+          <div class="ab-bot-row-info">
+            <span class="ab-bot-row-title">🔝 Region Round-Up Post</span>
+            <span class="ab-bot-row-next" id="rrBotNextPost">Calculating next post…</span>
+          </div>
+          <span class="ab-bot-row-progress" id="rrBotProgressText">0 / 0 posts</span>
+        </div>
+
+        <!-- ── Roundup paused banner ───────────────────────────────── -->
+        <div id="rrPausedBanner" class="ab-paused-row hidden">
+          <div class="ab-paused-icon">⏸</div>
+          <div class="ab-paused-info">
+            <span class="ab-paused-title">🔝 Region Round-Up Post Paused</span>
+            <span class="ab-paused-reason" id="rrPausedReason"></span>
+          </div>
+          <button class="btn-secondary ab-paused-resume" id="rrPausedResumeBtn">Resume</button>
+        </div>
       </div>
 
       <div class="autobot-body">
 
+        <!-- ── Bot Configuration wrapper ─────────────────────────── -->
+        <div class="bot-config-wrap" id="abBotConfigWrap">
+          <div class="ab-collapse-hdr bot-config-hdr" id="abBotConfigToggle">
+            <span class="ab-collapse-hdr-title">🤖 Bot Configuration</span>
+            <span class="ab-collapse-arrow" id="abBotConfigArrow">▼</span>
+          </div>
+
+          <div id="abBotConfigBody">
+
+          <!-- ── Subsection: Singular Horeca Post ──────────────────── -->
+          <div class="bot-subsection">
+
         <!-- ── Config collapse toggle ───────────────────────────── -->
         <div class="ab-collapse-hdr" id="abConfigToggle">
-          <span class="ab-collapse-hdr-title">⚙ Configuration</span>
+          <span class="ab-collapse-hdr-title">🍽️ Singular Horeca Post</span>
           <span class="ab-config-summary" id="abConfigSummary"></span>
           <span class="ab-collapse-arrow" id="abConfigArrow">▼</span>
         </div>
@@ -441,126 +653,408 @@
           <div id="autoPreviewContent"></div>
         </div>
 
-        <!-- ── Schedule ─────────────────────────────────────────── -->
-        <div class="ab-group ab-schedule-section">
-          <label class="ab-label">⏰ Schedule</label>
-
-          <!-- Frequency -->
-          <div class="ab-sched-field">
-            <div class="ab-field-hdr">
-              <span class="ab-field-name">Frequency</span>
-              <button class="ab-rand-btn" id="abFreqRand">🎲 Random</button>
-            </div>
-            <p class="ab-field-hint ab-rand-hint hidden" id="abFreqRandHint">Random mode: up to 2 posts per day · up to 20 posts per week</p>
-            <div class="ab-freq-row" id="abFreqRow">
-              <input type="number" id="abFreqNum" class="ab-num-input" value="1" min="1" max="99" />
-              <span class="ab-per-text">post per</span>
-              <select id="abFreqPeriod" class="ab-select ab-select--sm">
-                <option value="day">Day</option>
-                <option value="week">Week</option>
-                <option value="month">Month</option>
-              </select>
-            </div>
-          </div>
-
-          <!-- Posting Window -->
-          <div class="ab-sched-field">
-            <div class="ab-field-hdr">
-              <span class="ab-field-name">Posting Window</span>
-              <button class="ab-rand-btn" id="abWindowRand">🎲 Random</button>
-            </div>
-            <p class="ab-field-hint ab-rand-hint hidden" id="abWindowRandHint">Random mode: the bot can post at any time during the day (00:00 – 23:59)</p>
-            <div class="ab-window-row" id="abWindowRow">
-              <span class="ab-wlabel">From</span>
-              <select class="ab-select ab-select--xs" id="abFromH"><!-- JS --></select>
-              <span class="ab-tsep">:</span>
-              <select class="ab-select ab-select--xs" id="abFromM">
-                <option value="00" selected>00</option>
-                <option value="30">30</option>
-              </select>
-              <select class="ab-select ab-select--xs" id="abFromAP">
-                <option value="AM">AM</option>
-                <option value="PM" selected>PM</option>
-              </select>
-
-              <span class="ab-wlabel ab-wlabel--to">To</span>
-              <select class="ab-select ab-select--xs" id="abToH"><!-- JS --></select>
-              <span class="ab-tsep">:</span>
-              <select class="ab-select ab-select--xs" id="abToM">
-                <option value="00" selected>00</option>
-                <option value="30">30</option>
-              </select>
-              <select class="ab-select ab-select--xs" id="abToAP">
-                <option value="AM">AM</option>
-                <option value="PM" selected>PM</option>
-              </select>
-            </div>
-          </div>
-        </div>
-
-        <!-- ── Post to Social Media ─────────────────────────────── -->
-        <div class="ab-group">
-          <label class="ab-label">Post to Social Media <span class="ab-label-hint">(multi-select)</span></label>
-          <div class="social-icons">
-
-            <button class="social-btn active" data-platform="facebook" id="abSocialFB" title="Facebook">
-              <svg viewBox="0 0 24 24" fill="currentColor">
-                <path d="M18 2h-3a5 5 0 0 0-5 5v3H7v4h3v8h4v-8h3l1-4h-4V7a1 1 0 0 1 1-1h3z"/>
-              </svg>
-              <span>Facebook</span>
-            </button>
-
-            <button class="social-btn active" data-platform="instagram" id="abSocialIG" title="Instagram">
-              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8">
-                <rect x="2" y="2" width="20" height="20" rx="5" ry="5"/>
-                <circle cx="12" cy="12" r="4.5"/>
-                <circle cx="17.5" cy="6.5" r="1" fill="currentColor" stroke="none"/>
-              </svg>
-              <span>Instagram</span>
-            </button>
-
-            <button class="social-btn active" data-platform="tiktok" id="abSocialTT" title="TikTok">
-              <svg viewBox="0 0 24 24" fill="currentColor">
-                <path d="M19.59 6.69a4.83 4.83 0 0 1-3.77-4.25V2h-3.45v13.67a2.89 2.89 0 0 1-2.88 2.5 2.89 2.89 0 0 1-2.89-2.89 2.89 2.89 0 0 1 2.89-2.89c.28 0 .54.04.79.1V9.01a6.33 6.33 0 0 0-.79-.05 6.34 6.34 0 0 0-6.34 6.34 6.34 6.34 0 0 0 6.34 6.34 6.34 6.34 0 0 0 6.33-6.34V8.73a8.18 8.18 0 0 0 4.78 1.52V6.8a4.85 4.85 0 0 1-1.01-.11z"/>
-              </svg>
-              <span>TikTok</span>
-            </button>
-
-          </div>
-        </div>
-
         </div><!-- /abConfigBody -->
 
-        <!-- ── Schedule / Deactivate button ────────────────────── -->
-        <div class="ab-actions">
-          <button class="btn btn--export btn--schedule" type="button" id="abScheduleBtn">
-            ⏰ Schedule Auto Bot
+          </div><!-- /Singular Horeca Post -->
+
+          <!-- ── Subsection: Region Round-Up Post ──────────────────── -->
+          <div class="bot-subsection">
+
+        <!-- ── Config collapse toggle ──────────────────────────────── -->
+        <div class="ab-collapse-hdr" id="rrConfigToggle">
+          <span class="ab-collapse-hdr-title">🔝 Region Round-Up Post</span>
+          <span class="ab-config-summary" id="rrConfigSummary"></span>
+          <span class="ab-collapse-arrow collapsed" id="rrConfigArrow">▼</span>
+        </div>
+
+        <!-- ── Collapsible config body ─────────────────────────────── -->
+        <div id="rrConfigBody" class="collapsed">
+        <p class="autobot-intro">Post a ranked "Top N" list of places in a single region — its own independent schedule, separate from the spotlight posts above.</p>
+
+        <!-- ── Type ─────────────────────────────────────────────── -->
+        <div class="ab-group">
+          <label class="ab-label">Entity Type</label>
+          <div class="pill-row" id="rrType">
+            <button class="ab-pill active" data-val="restaurant">🍽️ Restaurant</button>
+            <button class="ab-pill" data-val="hotel">🏨 Hotel</button>
+            <button class="ab-pill" data-val="bar">🍺 Bar</button>
+          </div>
+        </div>
+
+        <!-- ── Country / Region ───────────────────────────────────── -->
+        <div class="ab-group">
+          <label class="ab-label" for="rrCountry">Country</label>
+          <select id="rrCountry" class="ab-select">
+            <option value="BE">Belgium</option>
+            <option value="FR">France</option>
+            <option value="DE">Germany</option>
+            <option value="LU">Luxembourg</option>
+            <option value="NL">The Netherlands</option>
+          </select>
+        </div>
+
+        <div class="ab-group">
+          <label class="ab-label" for="rrRegion">Region <span class="ab-label-hint">(single region)</span></label>
+          <select id="rrRegion" class="ab-select">
+            <!-- populated by JS based on country -->
+          </select>
+        </div>
+
+        <!-- ── Roundup Size ────────────────────────────────────────── -->
+        <div class="ab-group">
+          <label class="ab-label">Roundup Size</label>
+          <div class="pill-row" id="rrSize">
+            <button class="ab-pill" data-val="3">Top 3</button>
+            <button class="ab-pill active" data-val="5">Top 5</button>
+            <button class="ab-pill" data-val="10">Top 10</button>
+          </div>
+        </div>
+
+        <!-- ── Ranking Criteria ────────────────────────────────────── -->
+        <div class="ab-group">
+          <label class="ab-label">Ranking Criteria</label>
+          <div class="pill-row" id="rrRanking">
+            <button class="ab-pill active" data-val="rating">Highest Rated</button>
+            <button class="ab-pill" data-val="reviews">Most Reviewed</button>
+          </div>
+        </div>
+
+        <!-- ── Minimum Ratings ─────────────────────────────────────── -->
+        <div class="ab-group">
+          <label class="ab-label">
+            Minimum Ratings
+            <span class="ab-slider-val" id="rrMinRatingsVal">100</span>
+          </label>
+          <input type="range" id="rrMinRatings" class="ab-slider"
+            min="0" max="500" step="10" value="100" />
+          <div class="ab-slider-range">
+            <span>0</span><span>500</span>
+          </div>
+        </div>
+
+        <!-- ── Minimum Stars ───────────────────────────────────────── -->
+        <div class="ab-group">
+          <label class="ab-label">Minimum Stars</label>
+          <div class="pill-row" id="rrMinStars">
+            <button class="ab-pill" data-val="3">⭐ 3.0</button>
+            <button class="ab-pill" data-val="3.5">⭐ 3.5</button>
+            <button class="ab-pill active" data-val="4">⭐ 4.0</button>
+            <button class="ab-pill" data-val="4.5">⭐ 4.5</button>
+          </div>
+        </div>
+
+        <!-- ── Caption Content ─────────────────────────────────────── -->
+        <div class="ab-group">
+          <label class="ab-label">Caption Content</label>
+
+          <div class="ab-caption-lang-row">
+            <label class="ab-caption-lang-label" for="rrLanguage">Language</label>
+            <select id="rrLanguage" class="ab-select ab-select--sm">
+              <option value="nl">Dutch</option>
+              <option value="en">English</option>
+              <option value="fr">French</option>
+              <option value="de">German</option>
+            </select>
+          </div>
+
+          <div class="ab-checkbox-grid">
+            <label class="ab-checkbox"><input type="checkbox" checked id="rrCapRatings" /><span>Ratings</span></label>
+            <label class="ab-checkbox"><input type="checkbox" checked id="rrCapReviewCount" /><span>Review Counts</span></label>
+            <label class="ab-checkbox"><input type="checkbox" id="rrCapHashtags" /><span>Hashtags</span></label>
+          </div>
+        </div>
+
+        <!-- ── Preview Example ─────────────────────────────────────── -->
+        <div class="ab-group">
+          <button class="btn btn--preview-example" type="button" id="rrPreviewBtn">
+            <span class="preview-icon">👁</span>
+            Preview Example Roundup Post
           </button>
+          <p class="ab-preview-hint">See what a generated roundup post will look like based on your settings above</p>
         </div>
 
-        <!-- ── Progress bar (visible when active) ───────────────── -->
-        <div id="abProgressWrap" class="ab-progress-wrap hidden">
-          <div class="ab-progress-bar">
-            <div class="ab-progress-fill" id="abProgressFill" style="width:0%"></div>
+        <div id="rrPreview" class="auto-preview-panel hidden">
+          <div class="auto-preview-hdr">
+            <span class="auto-preview-hdr-title">👁 Example Roundup Preview</span>
+            <button class="btn-icon" id="rrPreviewClose" title="Close preview">✕</button>
           </div>
-          <span class="ab-progress-label" id="abProgressLabel">0 of 0 posts published</span>
+          <div id="rrPreviewContent"></div>
         </div>
 
-        <!-- ── Scheduled Posts panel (visible when active) ──────── -->
-        <div id="abScheduledSection" class="ab-scheduled-section hidden">
-          <div class="ab-collapse-hdr" id="abSchedToggle">
-            <span class="ab-collapse-hdr-title">📅 Scheduled Posts</span>
-            <span class="ab-sched-badge" id="abSchedCount">0</span>
-            <span class="ab-collapse-arrow" id="abSchedArrow">▼</span>
-          </div>
-          <div id="abSchedBody" class="ab-sched-body">
-            <!-- rendered by JS -->
-          </div>
-        </div>
+        </div><!-- /rrConfigBody -->
+
+          </div><!-- /Region Round-Up Post -->
+
+          <!-- ── Subsection: Scheduling & Activation (both bot types) ─ -->
+          <div class="bot-subsection">
+
+            <div class="ab-collapse-hdr bot-config-hdr ab-collapse-hdr--static">
+              <span class="ab-collapse-hdr-title">⏰ Scheduling &amp; Activation</span>
+            </div>
+            <p class="autobot-intro">Configure each bot type's schedule independently below, then activate. Both schedules run concurrently and their posts appear in the matching "Scheduled" section.</p>
+
+            <!-- ══ Singular Horeca Post schedule ══ -->
+            <div class="ab-schedule-group">
+              <div class="ab-collapse-hdr ab-schedule-group-hdr" id="abScheduleToggle">
+                <span class="ab-collapse-hdr-title">🍽️ Singular Horeca Post</span>
+                <span class="ab-config-summary" id="abScheduleSummary">Not scheduled</span>
+                <span class="ab-collapse-arrow collapsed" id="abScheduleArrow">▼</span>
+              </div>
+
+              <div id="abScheduleBody" class="ab-schedule-body collapsed">
+
+              <!-- ── Schedule ─────────────────────────────────────────── -->
+              <div class="ab-group ab-schedule-section">
+                <label class="ab-label">⏰ Schedule</label>
+
+                <!-- Frequency -->
+                <div class="ab-sched-field">
+                  <div class="ab-field-hdr">
+                    <span class="ab-field-name">Frequency</span>
+                    <button class="ab-rand-btn" id="abFreqRand">🎲 Random</button>
+                  </div>
+                  <p class="ab-field-hint ab-rand-hint hidden" id="abFreqRandHint">Random mode: up to 2 posts per day · up to 20 posts per week</p>
+                  <div class="ab-freq-row" id="abFreqRow">
+                    <input type="number" id="abFreqNum" class="ab-num-input" value="1" min="1" max="99" />
+                    <span class="ab-per-text">post per</span>
+                    <select id="abFreqPeriod" class="ab-select ab-select--sm">
+                      <option value="day">Day</option>
+                      <option value="week">Week</option>
+                      <option value="month">Month</option>
+                    </select>
+                  </div>
+                </div>
+
+                <!-- Posting Window -->
+                <div class="ab-sched-field">
+                  <div class="ab-field-hdr">
+                    <span class="ab-field-name">Posting Window</span>
+                    <button class="ab-rand-btn" id="abWindowRand">🎲 Random</button>
+                  </div>
+                  <p class="ab-field-hint ab-rand-hint hidden" id="abWindowRandHint">Random mode: the bot can post at any time during the day (00:00 – 23:59)</p>
+                  <div class="ab-window-row" id="abWindowRow">
+                    <span class="ab-wlabel">From</span>
+                    <select class="ab-select ab-select--xs" id="abFromH"><!-- JS --></select>
+                    <span class="ab-tsep">:</span>
+                    <select class="ab-select ab-select--xs" id="abFromM">
+                      <option value="00" selected>00</option>
+                      <option value="30">30</option>
+                    </select>
+                    <select class="ab-select ab-select--xs" id="abFromAP">
+                      <option value="AM">AM</option>
+                      <option value="PM" selected>PM</option>
+                    </select>
+
+                    <span class="ab-wlabel ab-wlabel--to">To</span>
+                    <select class="ab-select ab-select--xs" id="abToH"><!-- JS --></select>
+                    <span class="ab-tsep">:</span>
+                    <select class="ab-select ab-select--xs" id="abToM">
+                      <option value="00" selected>00</option>
+                      <option value="30">30</option>
+                    </select>
+                    <select class="ab-select ab-select--xs" id="abToAP">
+                      <option value="AM">AM</option>
+                      <option value="PM" selected>PM</option>
+                    </select>
+                  </div>
+                </div>
+              </div>
+
+              <!-- ── Post to Social Media ─────────────────────────────── -->
+              <div class="ab-group">
+                <label class="ab-label">Post to Social Media <span class="ab-label-hint">(multi-select)</span></label>
+                <div class="social-icons">
+
+                  <button class="social-btn active" data-platform="facebook" id="abSocialFB" title="Facebook">
+                    <svg viewBox="0 0 24 24" fill="currentColor">
+                      <path d="M18 2h-3a5 5 0 0 0-5 5v3H7v4h3v8h4v-8h3l1-4h-4V7a1 1 0 0 1 1-1h3z"/>
+                    </svg>
+                    <span>Facebook</span>
+                  </button>
+
+                  <button class="social-btn active" data-platform="instagram" id="abSocialIG" title="Instagram">
+                    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8">
+                      <rect x="2" y="2" width="20" height="20" rx="5" ry="5"/>
+                      <circle cx="12" cy="12" r="4.5"/>
+                      <circle cx="17.5" cy="6.5" r="1" fill="currentColor" stroke="none"/>
+                    </svg>
+                    <span>Instagram</span>
+                  </button>
+
+                  <button class="social-btn active" data-platform="tiktok" id="abSocialTT" title="TikTok">
+                    <svg viewBox="0 0 24 24" fill="currentColor">
+                      <path d="M19.59 6.69a4.83 4.83 0 0 1-3.77-4.25V2h-3.45v13.67a2.89 2.89 0 0 1-2.88 2.5 2.89 2.89 0 0 1-2.89-2.89 2.89 2.89 0 0 1 2.89-2.89c.28 0 .54.04.79.1V9.01a6.33 6.33 0 0 0-.79-.05 6.34 6.34 0 0 0-6.34 6.34 6.34 6.34 0 0 0 6.34 6.34 6.34 6.34 0 0 0 6.33-6.34V8.73a8.18 8.18 0 0 0 4.78 1.52V6.8a4.85 4.85 0 0 1-1.01-.11z"/>
+                    </svg>
+                    <span>TikTok</span>
+                  </button>
+
+                </div>
+              </div>
+
+              <!-- ── Schedule / Deactivate button ─────────────────────── -->
+              <div class="ab-actions">
+                <button class="btn btn--export btn--schedule" type="button" id="abScheduleBtn">
+                  ⏰ Schedule Auto Bot
+                </button>
+              </div>
+
+              <!-- ── Progress bar (visible when active) ───────────────── -->
+              <div id="abProgressWrap" class="ab-progress-wrap hidden">
+                <div class="ab-progress-bar">
+                  <div class="ab-progress-fill" id="abProgressFill" style="width:0%"></div>
+                </div>
+                <span class="ab-progress-label" id="abProgressLabel">0 of 0 posts published</span>
+              </div>
+
+              <!-- ── Scheduled Posts panel (visible when active) ──────── -->
+              <div id="abScheduledSection" class="ab-scheduled-section hidden">
+                <div class="ab-collapse-hdr" id="abSchedToggle">
+                  <span class="ab-collapse-hdr-title">📅 Scheduled Posts</span>
+                  <span class="ab-sched-badge" id="abSchedCount">0</span>
+                  <span class="ab-collapse-arrow" id="abSchedArrow">▼</span>
+                </div>
+                <div id="abSchedBody" class="ab-sched-body">
+                  <!-- rendered by JS -->
+                </div>
+              </div>
+
+              </div><!-- /abScheduleBody -->
+            </div><!-- /ab-schedule-group -->
+
+            <!-- ══ Region Round-Up Post schedule ══ -->
+            <div class="ab-schedule-group">
+              <div class="ab-collapse-hdr ab-schedule-group-hdr" id="rrScheduleToggle">
+                <span class="ab-collapse-hdr-title">🔝 Region Round-Up Post</span>
+                <span class="ab-config-summary" id="rrScheduleSummary">Not scheduled</span>
+                <span class="ab-collapse-arrow collapsed" id="rrScheduleArrow">▼</span>
+              </div>
+
+              <div id="rrScheduleBody" class="ab-schedule-body collapsed">
+
+              <!-- ── Schedule ────────────────────────────────────────────── -->
+              <div class="ab-group ab-schedule-section">
+                <label class="ab-label">⏰ Schedule</label>
+
+                <div class="ab-sched-field">
+                  <div class="ab-field-hdr">
+                    <span class="ab-field-name">Frequency</span>
+                    <button class="ab-rand-btn" id="rrFreqRand">🎲 Random</button>
+                  </div>
+                  <p class="ab-field-hint ab-rand-hint hidden" id="rrFreqRandHint">Random mode: up to 2 posts per day · up to 20 posts per week</p>
+                  <div class="ab-freq-row" id="rrFreqRow">
+                    <input type="number" id="rrFreqNum" class="ab-num-input" value="1" min="1" max="99" />
+                    <span class="ab-per-text">post per</span>
+                    <select id="rrFreqPeriod" class="ab-select ab-select--sm">
+                      <option value="day">Day</option>
+                      <option value="week" selected>Week</option>
+                      <option value="month">Month</option>
+                    </select>
+                  </div>
+                </div>
+
+                <div class="ab-sched-field">
+                  <div class="ab-field-hdr">
+                    <span class="ab-field-name">Posting Window</span>
+                    <button class="ab-rand-btn" id="rrWindowRand">🎲 Random</button>
+                  </div>
+                  <p class="ab-field-hint ab-rand-hint hidden" id="rrWindowRandHint">Random mode: the bot can post at any time during the day (00:00 – 23:59)</p>
+                  <div class="ab-window-row" id="rrWindowRow">
+                    <span class="ab-wlabel">From</span>
+                    <select class="ab-select ab-select--xs" id="rrFromH"><!-- JS --></select>
+                    <span class="ab-tsep">:</span>
+                    <select class="ab-select ab-select--xs" id="rrFromM">
+                      <option value="00" selected>00</option>
+                      <option value="30">30</option>
+                    </select>
+                    <select class="ab-select ab-select--xs" id="rrFromAP">
+                      <option value="AM">AM</option>
+                      <option value="PM" selected>PM</option>
+                    </select>
+
+                    <span class="ab-wlabel ab-wlabel--to">To</span>
+                    <select class="ab-select ab-select--xs" id="rrToH"><!-- JS --></select>
+                    <span class="ab-tsep">:</span>
+                    <select class="ab-select ab-select--xs" id="rrToM">
+                      <option value="00" selected>00</option>
+                      <option value="30">30</option>
+                    </select>
+                    <select class="ab-select ab-select--xs" id="rrToAP">
+                      <option value="AM">AM</option>
+                      <option value="PM" selected>PM</option>
+                    </select>
+                  </div>
+                </div>
+              </div>
+
+              <!-- ── Post to Social Media ────────────────────────────────── -->
+              <div class="ab-group">
+                <label class="ab-label">Post to Social Media <span class="ab-label-hint">(multi-select)</span></label>
+                <div class="social-icons">
+
+                  <button class="social-btn active" data-platform="facebook" id="rrSocialFB" title="Facebook">
+                    <svg viewBox="0 0 24 24" fill="currentColor">
+                      <path d="M18 2h-3a5 5 0 0 0-5 5v3H7v4h3v8h4v-8h3l1-4h-4V7a1 1 0 0 1 1-1h3z"/>
+                    </svg>
+                    <span>Facebook</span>
+                  </button>
+
+                  <button class="social-btn active" data-platform="instagram" id="rrSocialIG" title="Instagram">
+                    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8">
+                      <rect x="2" y="2" width="20" height="20" rx="5" ry="5"/>
+                      <circle cx="12" cy="12" r="4.5"/>
+                      <circle cx="17.5" cy="6.5" r="1" fill="currentColor" stroke="none"/>
+                    </svg>
+                    <span>Instagram</span>
+                  </button>
+
+                  <button class="social-btn" data-platform="tiktok" id="rrSocialTT" title="TikTok">
+                    <svg viewBox="0 0 24 24" fill="currentColor">
+                      <path d="M19.59 6.69a4.83 4.83 0 0 1-3.77-4.25V2h-3.45v13.67a2.89 2.89 0 0 1-2.88 2.5 2.89 2.89 0 0 1-2.89-2.89 2.89 2.89 0 0 1 2.89-2.89c.28 0 .54.04.79.1V9.01a6.33 6.33 0 0 0-.79-.05 6.34 6.34 0 0 0-6.34 6.34 6.34 6.34 0 0 0 6.34 6.34 6.34 6.34 0 0 0 6.33-6.34V8.73a8.18 8.18 0 0 0 4.78 1.52V6.8a4.85 4.85 0 0 1-1.01-.11z"/>
+                    </svg>
+                    <span>TikTok</span>
+                  </button>
+
+                </div>
+              </div>
+
+              <!-- ── Schedule / Deactivate button ─────────────────────────── -->
+              <div class="ab-actions">
+                <button class="btn btn--export btn--schedule" type="button" id="rrScheduleBtn">
+                  ⏰ Schedule Region Roundup
+                </button>
+              </div>
+
+              <!-- ── Progress bar ─────────────────────────────────────────── -->
+              <div id="rrProgressWrap" class="ab-progress-wrap hidden">
+                <div class="ab-progress-bar">
+                  <div class="ab-progress-fill" id="rrProgressFill" style="width:0%"></div>
+                </div>
+                <span class="ab-progress-label" id="rrProgressLabel">0 of 0 posts published</span>
+              </div>
+
+              <!-- ── Scheduled Posts panel ────────────────────────────────── -->
+              <div id="rrScheduledSection" class="ab-scheduled-section hidden">
+                <div class="ab-collapse-hdr" id="rrSchedToggle">
+                  <span class="ab-collapse-hdr-title">📅 Scheduled Roundups</span>
+                  <span class="ab-sched-badge" id="rrSchedCount">0</span>
+                  <span class="ab-collapse-arrow" id="rrSchedArrow">▼</span>
+                </div>
+                <div id="rrSchedBody" class="ab-sched-body">
+                  <!-- rendered by JS -->
+                </div>
+              </div>
+
+              </div><!-- /rrScheduleBody -->
+            </div><!-- /ab-schedule-group -->
+
+          </div><!-- /Scheduling & Activation -->
+
+          </div><!-- /abBotConfigBody -->
+        </div><!-- /abBotConfigWrap -->
 
         <!-- ── Activity Log ──────────────────────────────────────── -->
         <div class="ab-activity-log" id="abActivityLog">
-          <div class="ab-log-header">
+          <div class="ab-log-header" id="abLogToggle">
             <span class="ab-log-title">📊 Activity Log</span>
             <div class="ab-log-controls">
               <!-- Filter button + dropdown in one positioned wrapper -->
@@ -577,8 +1071,13 @@
               </div>
               <button class="ab-log-reset-btn" id="abLogResetBtn" title="Reset activity log">↺</button>
             </div>
+            <span class="ab-collapse-arrow collapsed" id="abLogArrow">▼</span>
           </div>
-          <div class="ab-log-items">
+          <div class="ab-log-total">
+            <span>Total published</span>
+            <strong class="ab-log-total-val" id="abLogTotal">0 posts</strong>
+          </div>
+          <div class="ab-log-items collapsed" id="abLogItems">
 
             <div class="ab-log-item">
               <div class="ab-log-platform">
@@ -612,10 +1111,6 @@
               <span class="ab-log-count" id="abLogTT">0 posts</span>
             </div>
 
-          </div>
-          <div class="ab-log-total">
-            <span>Total published</span>
-            <strong class="ab-log-total-val" id="abLogTotal">0 posts</strong>
           </div>
         </div>
 

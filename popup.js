@@ -883,9 +883,15 @@ const uriCache        = new Map(); // "photoName|maxWidth" → uri
 let selectedSong      = null;
 let activePlatforms   = new Set();
 let coverPhotoIndex   = 0;         // index into currentRestaurant.photos[]
+let captionOpenerOffset = 0;       // bumped each time the caption is regenerated
 const coverOverlayCache = new Map(); // "photoName|restaurantName" → overlayDataUrl
 
 const $ = id => document.getElementById(id);
+
+// ── Manual Post: search mode helper ─────────────────────────────────────────────
+function isBotSearchMode() {
+  return !!document.getElementById("searchModeBot")?.classList.contains("active");
+}
 
 // ── Cover photo overlay ───────────────────────────────────────────────────────
 
@@ -1231,8 +1237,22 @@ function saveState() {
       caption:         $("caption")?.value || "",
       activePlatforms: [...activePlatforms],
       coverPhotoIndex,
+      resultsTarget,
     },
   });
+}
+
+// ── Place Preview: move the shared #results panel between the Manual Search
+// and Bot Search ("Singular Horeca Post") sections, depending on which flow
+// produced the result, so the preview always appears where the user is
+// looking. ──────────────────────────────────────────────────────────────────
+let resultsTarget = "bot";
+function moveResultsTo(target) {
+  resultsTarget = target;
+  const results = $("results");
+  const anchor  = document.getElementById(target === "manual" ? "resultsAnchorManual" : "resultsAnchorBot");
+  if (!results || !anchor) return;
+  anchor.insertAdjacentElement("afterend", results);
 }
 
 // Debounced save for caption edits
@@ -1287,6 +1307,14 @@ function restoreState(saved) {
     document.querySelector(`.social-btn[data-platform="${p}"]`)?.classList.add("active");
   });
 
+  // Show the preview in whichever section the place was originally found from.
+  const target = saved.resultsTarget === "manual" ? "manual" : "bot";
+  moveResultsTo(target);
+  if (target === "manual") {
+    if (isBotSearchMode()) setSearchMode("manual");
+  } else if (!isBotSearchMode()) {
+    setSearchMode("bot");
+  }
   $("results").classList.remove("hidden");
 }
 
@@ -1319,8 +1347,9 @@ chrome.storage.local.get(
 
 function showKeySetup(show) {
   $("keySetup").classList.toggle("hidden", !show);
+  document.querySelector(".search-mode-toggle")?.classList.toggle("hidden", show);
   document.querySelector(".search-section").classList.toggle("hidden", show);
-  $("settingsFooter").classList.toggle("hidden", show);
+  $("botSearchPanel")?.classList.toggle("hidden", show || !document.getElementById("searchModeBot")?.classList.contains("active"));
   if (show) $("results").classList.add("hidden");
 }
 
@@ -1337,11 +1366,6 @@ document.getElementById('saveFsqKeyBtn')?.addEventListener('click', () => {
   const key = document.getElementById('fsqKeyInput')?.value.trim();
   if (!key) return;
   chrome.storage.local.set({ foursquareApiKey: key });
-});
-
-$("changeKeyBtn").addEventListener("click", () => {
-  $("apiKeyInput").value = API_KEY;
-  showKeySetup(true);
 });
 
 // ── API usage tracking ────────────────────────────────────────────────────────
@@ -1372,42 +1396,6 @@ function checkUsageWarning() {
     }
   });
 }
-
-$("usageStatsBtn").addEventListener("click", () => {
-  chrome.storage.local.get({ apiLog: [], totalCost: 0 }, ({ apiLog, totalCost }) => {
-    alert(`📊 API Usage\n\nTotal calls : ${apiLog.length}\nEst. cost   : $${totalCost.toFixed(4)}\n\nClick "Export Logs" for a full debug report.`);
-  });
-});
-
-$("exportLogsBtn").addEventListener("click", () => {
-  AppLog.info("Export logs requested by user");
-  TechLog._flush(); // flush any pending entries before export
-  TechLog.exportCSV(); // export tech log as CSV
-  chrome.storage.local.get(
-    { appLog: [], apiLog: [], exportLog: [], totalCost: 0 },
-    (data) => {
-      const report = {
-        exportedAt:    new Date().toISOString(),
-        version:       chrome.runtime.getManifest().version,
-        apiUsage: {
-          totalCalls:   data.apiLog.length,
-          estimatedUSD: data.totalCost,
-          calls:        data.apiLog,
-        },
-        appEvents:     data.appLog,
-        exportHistory: data.exportLog,
-      };
-      const json = JSON.stringify(report, null, 2);
-      const slug = new Date().toISOString().slice(0, 19).replace(/[:.]/g, "-");
-      chrome.runtime.sendMessage({
-        type:     "DOWNLOAD",
-        url:      "data:application/json;charset=utf-8," + encodeURIComponent(json),
-        filename: `FoodFluencer/debug_log_${slug}.json`,
-      });
-      setStatus("📋 Debug log exported to Downloads/FoodFluencer/", "success");
-    }
-  );
-});
 
 $("downloadLogBtn").addEventListener("click", () => {
   chrome.storage.local.get({ apiLog: [] }, ({ apiLog }) => {
@@ -1473,7 +1461,7 @@ async function resolvePhotoUri(photoName, maxWidth = 400) {
 
 // ── Render restaurant ─────────────────────────────────────────────────────────
 
-function renderResults(place) {
+function renderResults(place, target = "bot") {
   const allPhotos = (place.photos || [])
     .sort((a, b) => (b.width || 0) - (a.width || 0))
     .map(p => ({ name: p.name }));
@@ -1506,6 +1494,13 @@ function renderResults(place) {
   // Auto-fill caption on fresh search (not restore)
   if ($("caption")) $("caption").value = buildDefaultCaption();
 
+  // Show the preview in whichever section the place was found from.
+  moveResultsTo(target);
+  if (target === "manual") {
+    if (isBotSearchMode()) setSearchMode("manual");
+  } else if (!isBotSearchMode()) {
+    setSearchMode("bot");
+  }
   $("results").classList.remove("hidden");
   saveState();
 }
@@ -1673,7 +1668,7 @@ function getEngagementOpener() {
     `Next time you're in ${cityDisplay}, make sure to visit ${name}! 📍`,
     `Have you tried ${name} yet? This is what food dreams are made of 😍`,
   ];
-  return openers[seed % openers.length];
+  return openers[(seed + captionOpenerOffset) % openers.length];
 }
 
 function buildDefaultCaption() {
@@ -1721,6 +1716,7 @@ function updateCaptionSongLine() {
 
 // Regenerate button
 $("refreshCaptionBtn")?.addEventListener("click", () => {
+  captionOpenerOffset++;
   if ($("caption")) $("caption").value = buildDefaultCaption();
   saveState();
 });
@@ -1766,7 +1762,7 @@ function renderSearchResultsDropdown(places) {
     div.addEventListener("click", () => {
       $("query").value = name;
       hideSearchResultsDropdown();
-      renderResults(place);
+      renderResults(place, "manual");
       AppLog.info("Restaurant selected from search results", { name });
     });
     el.appendChild(div);
@@ -1816,6 +1812,12 @@ $("randomBtn").addEventListener("click", async () => {
     AppLog.error("Random place search failed", { error: err.message, settings: getManualSettings() });
     setStatus(err.message, "error");
   }
+});
+
+document.getElementById("mmPreviewClose")?.addEventListener("click", () => {
+  $("results").classList.add("hidden");
+  currentRestaurant = null;
+  chrome.storage.local.remove("lastState");
 });
 
 // ── Social platform toggles ───────────────────────────────────────────────────
@@ -3038,6 +3040,34 @@ document.getElementById("mmConfigToggle")?.addEventListener("click", () => {
   arrow?.classList.toggle("collapsed", collapsed);
 });
 
+// ── Bot Configuration collapsible wrapper toggle (Auto Bot) ─────────────────────
+[
+  ["abBotConfigToggle", "abBotConfigBody", "abBotConfigArrow"],
+].forEach(([toggleId, bodyId, arrowId]) => {
+  document.getElementById(toggleId)?.addEventListener("click", () => {
+    const body  = document.getElementById(bodyId);
+    const arrow = document.getElementById(arrowId);
+    if (!body) return;
+    const collapsed = body.classList.toggle("collapsed");
+    arrow?.classList.toggle("collapsed", collapsed);
+  });
+});
+
+// ── Manual Post: Manual Search vs Bot Search toggle ──────────────────────────────
+const searchModeManualBtn = document.getElementById("searchModeManual");
+const searchModeBotBtn    = document.getElementById("searchModeBot");
+const manualSearchPanel   = document.getElementById("manualSearchPanel");
+const botSearchPanel      = document.getElementById("botSearchPanel");
+function setSearchMode(mode) {
+  const isBot = mode === "bot";
+  searchModeManualBtn?.classList.toggle("active", !isBot);
+  searchModeBotBtn?.classList.toggle("active", isBot);
+  manualSearchPanel?.classList.toggle("hidden", isBot);
+  botSearchPanel?.classList.toggle("hidden", !isBot);
+}
+searchModeManualBtn?.addEventListener("click", () => setSearchMode("manual"));
+searchModeBotBtn?.addEventListener("click", () => setSearchMode("bot"));
+
 // ── Manual Post: single-select pill groups (Type / Stars / Pics) ────────────────
 ["mmType", "mmStars", "mmPics"].forEach(groupId => {
   const group = document.getElementById(groupId);
@@ -3281,6 +3311,29 @@ document.getElementById("abSchedToggle")?.addEventListener("click", () => {
   arrow?.classList.toggle("collapsed", collapsed);
 });
 
+// ── Collapsible per-bot-type schedule group toggle ────────────────────────────
+function bindScheduleGroupToggle(prefix) {
+  document.getElementById(`${prefix}ScheduleToggle`)?.addEventListener("click", () => {
+    const body  = document.getElementById(`${prefix}ScheduleBody`);
+    const arrow = document.getElementById(`${prefix}ScheduleArrow`);
+    if (!body) return;
+    const collapsed = body.classList.toggle("collapsed");
+    arrow?.classList.toggle("collapsed", collapsed);
+  });
+}
+bindScheduleGroupToggle("ab");
+bindScheduleGroupToggle("rr");
+
+// ── Collapsible Activity Log toggle ───────────────────────────────────────────
+document.getElementById("abLogToggle")?.addEventListener("click", (e) => {
+  if (e.target.closest(".ab-log-controls")) return;
+  const items = document.getElementById("abLogItems");
+  const arrow = document.getElementById("abLogArrow");
+  if (!items) return;
+  const collapsed = items.classList.toggle("collapsed");
+  arrow?.classList.toggle("collapsed", collapsed);
+});
+
 // ── Activate / Deactivate ─────────────────────────────────────────────────────
 document.getElementById("abScheduleBtn")?.addEventListener("click", () => {
   if (autoBotActive) deactivateBot();
@@ -3330,7 +3383,7 @@ function deactivateBot() {
   });
   chrome.storage.local.remove("autoBotPaused");
   hidePausedBanner();
-  chrome.alarms.clearAll();
+  clearAlarmsByPrefix("ffbot-auto-");
   updateBotUI(false);
   // Reset schedule-specific UI
   updateProgress(0, 0);
@@ -3344,6 +3397,32 @@ function deactivateBot() {
   refreshActivityLog();
   AppLog.info("Auto Bot deactivated — schedule cleared, activity log preserved");
   TechLog.info("SCHEDULE", "bot_deactivated", { scheduleCleared: true });
+}
+
+// ── Active Bots overview card: shown whenever any bot status/paused row is visible ──
+function syncActiveBotsWrap() {
+  const wrap = document.getElementById("abActiveBotsWrap");
+  if (!wrap) return;
+  const rows = ["abBotStatus", "abPausedBanner", "rrBotStatus", "rrPausedBanner"]
+    .map(id => document.getElementById(id))
+    .filter(Boolean);
+  const anyVisible = rows.some(el => !el.classList.contains("hidden"));
+  wrap.classList.toggle("hidden", !anyVisible);
+}
+
+// ── Schedule group summary (shown on the collapsed schedule header) ──────────
+function formatFreqSummary(freq) {
+  if (!freq) return "";
+  if (freq.isRandom) return "🎲 Random frequency";
+  return `${freq.count}× / ${freq.period}`;
+}
+
+function updateScheduleGroupSummary(prefix, active) {
+  const el = document.getElementById(`${prefix}ScheduleSummary`);
+  if (!el) return;
+  const settings = prefix === "ab" ? getScheduleSettings() : getRoundupScheduleSettings();
+  const freqTxt = formatFreqSummary(settings.frequency);
+  el.textContent = active ? `🟢 Active · ${freqTxt}` : `⚪ Not scheduled · ${freqTxt}`;
 }
 
 function updateBotUI(active) {
@@ -3372,11 +3451,20 @@ function updateBotUI(active) {
     schedSec?.classList.add("hidden");
     actLog?.classList.remove("prominent");
   }
+  updateScheduleGroupSummary("ab", active);
+  syncActiveBotsWrap();
 }
 
 // ── Chrome Alarms ─────────────────────────────────────────────────────────────
+// Clear only alarms belonging to one campaign (by name prefix) so activating or
+// deactivating one campaign (spotlight vs. roundup) never clobbers the other's.
+async function clearAlarmsByPrefix(prefix) {
+  const all = await chrome.alarms.getAll();
+  await Promise.all(all.filter(a => a.name.startsWith(prefix)).map(a => chrome.alarms.clear(a.name)));
+}
+
 function setupScheduleAlarms(schedule) {
-  chrome.alarms.clearAll(() => {
+  clearAlarmsByPrefix("ffbot-auto-").then(() => {
     const now = Date.now();
     schedule.posts.forEach((post, idx) => {
       const base = new Date(`${post.date}T${post.time}:00`).getTime();
@@ -3585,9 +3673,11 @@ function showPausedBanner(reason) {
   const reasonEl = document.getElementById("abPausedReason");
   if (reasonEl) reasonEl.textContent = reason || "The bot needs your attention.";
   banner?.classList.remove("hidden");
+  syncActiveBotsWrap();
 }
 function hidePausedBanner() {
   document.getElementById("abPausedBanner")?.classList.add("hidden");
+  syncActiveBotsWrap();
 }
 document.getElementById("abPausedResumeBtn")?.addEventListener("click", () => {
   chrome.storage.local.remove("autoBotPaused", () => {
@@ -3668,7 +3758,9 @@ document.getElementById("btnManualMode").addEventListener("click", () => showMod
 document.getElementById("btnAutoMode").addEventListener("click",   () => {
   showMode("auto");
   loadAutoBotConfig();
+  loadRegionRoundupConfig();
   setTimeout(restoreBotActiveState, 80); // after config loads
+  setTimeout(restoreRoundupActiveState, 80);
 });
 document.getElementById("manualBackBtn").addEventListener("click", () => showMode("selector"));
 document.getElementById("autoBackBtn").addEventListener("click",   () => showMode("selector"));
@@ -3817,6 +3909,1145 @@ if (abSlider && abSliderVal) {
   });
 }
 
+// ══════════════════════════════════════════════════════════════════════════════
+// REGION ROUNDUP — "Top N {type}s in {region}" posts (independent campaign)
+// ══════════════════════════════════════════════════════════════════════════════
+
+// ── Single-select region dropdown (one region per roundup, unlike the
+// multi-select chip wrap used by the spotlight Auto Bot) ──────────────────────
+const RR_RANDOM_REGION = "__random__";
+
+function buildRegionSelect(countryCode, selectId = "rrRegion") {
+  const sel = document.getElementById(selectId);
+  if (!sel) return;
+  const regions = REGIONS[countryCode] || [];
+  const prev = sel.value;
+  sel.innerHTML = "";
+
+  const randomOpt = document.createElement("option");
+  randomOpt.value = RR_RANDOM_REGION;
+  randomOpt.textContent = "🎲 Random Region";
+  sel.appendChild(randomOpt);
+
+  regions.forEach(name => {
+    const opt = document.createElement("option");
+    opt.value = name;
+    opt.textContent = name;
+    sel.appendChild(opt);
+  });
+  // Preserve previous selection if it still exists for the new country
+  if (prev === RR_RANDOM_REGION || regions.includes(prev)) sel.value = prev;
+}
+buildRegionSelect("BE");
+document.getElementById("rrCountry")?.addEventListener("change", e => {
+  buildRegionSelect(e.target.value);
+});
+
+// ── Region Roundup search waterfall (popup-side, for previews) ────────────────
+async function searchAutoPlacesCollection(type, country, region, minRatings, minStars, size, ranking) {
+  const typeQuery   = AB_TYPE_QUERY[type] || "restaurant";
+  const countryName = AB_COUNTRY_NAMES[country] || "Belgium";
+  const bounds      = AB_COUNTRY_BOUNDS[country] || AB_COUNTRY_BOUNDS.BE;
+  const locationPart = region ? `${region}, ${countryName}` : `${pickRandomCity(country)}, ${countryName}`;
+  const q = `${typeQuery} in ${locationPart}`;
+
+  trackApiCall("search", q);
+  AppLog.info("Region Roundup search", { type, country, region, query: q, minRatings, minStars, size, ranking });
+
+  const body = {
+    textQuery:           q,
+    maxResultCount:      20,
+    minRating:           minStars,
+    locationRestriction: { rectangle: bounds },
+  };
+
+  const res = await fetch(PLACES_SEARCH, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      "X-Goog-Api-Key": API_KEY,
+      "X-Goog-FieldMask": "places.id,places.displayName,places.formattedAddress,places.rating,places.userRatingCount,places.googleMapsUri,places.photos",
+    },
+    body: JSON.stringify(body),
+  });
+
+  if (!res.ok) {
+    const err = await res.json().catch(() => ({}));
+    const msg = err?.error?.message || `API error ${res.status}`;
+    if (/quota|billing|exceeded|disabled|SERVICE_DISABLED/i.test(msg))
+      throw new Error(`⛔ Google API quota exceeded or billing issue — check your Google Cloud Console. (${msg})`);
+    throw new Error(msg);
+  }
+  const data = await res.json();
+  if (!data.places?.length)
+    throw new Error(`No ${type}s found in "${locationPart}" (try relaxing filters)`);
+
+  const filtered = data.places.filter(p => (p.userRatingCount || 0) >= minRatings);
+  const pool = filtered.length >= size ? filtered : data.places;
+  const sortFn = ranking === "reviews"
+    ? (a,b) => (b.userRatingCount||0) - (a.userRatingCount||0) || (b.rating||0) - (a.rating||0)
+    : (a,b) => (b.rating||0) - (a.rating||0) || (b.userRatingCount||0) - (a.userRatingCount||0);
+  return [...pool].sort(sortFn).slice(0, size);
+}
+
+// ── Region Roundup caption generator (popup-side, mirrors background) ────────
+const RR_TYPE_LABELS = {
+  en: { restaurant: { s: "restaurant", p: "restaurants" }, hotel: { s: "hotel", p: "hotels" }, bar: { s: "bar", p: "bars" } },
+  nl: { restaurant: { s: "restaurant", p: "restaurants" }, hotel: { s: "hotel", p: "hotels" }, bar: { s: "bar", p: "bars" } },
+  fr: { restaurant: { s: "restaurant", p: "restaurants" }, hotel: { s: "hôtel", p: "hôtels" }, bar: { s: "bar", p: "bars" } },
+  de: { restaurant: { s: "Restaurant", p: "Restaurants" }, hotel: { s: "Hotel", p: "Hotels" }, bar: { s: "Bar", p: "Bars" } },
+};
+const RR_HEADER_TEMPLATES = {
+  en: (n, p, region) => `🔝 Top ${n} ${p} in ${region}`,
+  nl: (n, p, region) => `🔝 Top ${n} ${p} in ${region}`,
+  fr: (n, p, region) => `🔝 Top ${n} ${p} à ${region}`,
+  de: (n, p, region) => `🔝 Top ${n} ${p} in ${region}`,
+};
+const RR_INTRO_TEMPLATES = {
+  en: (region) => `Here's our pick of the best spots ${region} has to offer 👇`,
+  nl: (region) => `Dit zijn de beste plekjes die ${region} te bieden heeft 👇`,
+  fr: (region) => `Voici notre sélection des meilleures adresses à ${region} 👇`,
+  de: (region) => `Das sind die besten Adressen, die ${region} zu bieten hat 👇`,
+};
+
+function getAutoCaptionRoundup(places, type, region, language, captionOpts, songInfo) {
+  const lang   = RR_TYPE_LABELS[language] ? language : "en";
+  const labels = RR_TYPE_LABELS[lang][type] || RR_TYPE_LABELS[lang].restaurant;
+  const n      = places.length;
+  const pLabel = n === 1 ? labels.s : labels.p;
+
+  const header = RR_HEADER_TEMPLATES[lang](n, pLabel.charAt(0).toUpperCase() + pLabel.slice(1), region);
+  const intro  = RR_INTRO_TEMPLATES[lang](region);
+
+  const list = places.map((place, i) => {
+    const name = place.displayName?.text || "";
+    let line = `${i + 1}. ${name}`;
+    const bits = [];
+    if (captionOpts.showRatings && place.rating) bits.push(`⭐${place.rating.toFixed(1)}`);
+    if (captionOpts.showReviewCount && place.userRatingCount) bits.push(`(${place.userRatingCount} reviews)`);
+    if (bits.length) line += ` — ${bits.join(" ")}`;
+    return line;
+  });
+
+  const parts = [header, "", intro, "", ...list];
+
+  if (captionOpts.song && songInfo) {
+    parts.push("");
+    parts.push(`🎵 ${songInfo.name} – ${songInfo.artist}`);
+  }
+
+  if (captionOpts.hashtags) {
+    const regionTag = region.replace(/[\s,]+/g, "");
+    const typeTag   = labels.s.charAt(0).toUpperCase() + labels.s.slice(1);
+    parts.push("");
+    parts.push(`#${regionTag} #${typeTag}s #TopList #FoodFluencer`);
+  }
+
+  return parts.join("\n").trim();
+}
+
+// Preview Example Roundup Post — runs a real search and renders the result
+async function previewExampleRoundupPost() {
+  if (!API_KEY) { setStatus("Please save your API key first.", "error"); return; }
+
+  const panel   = document.getElementById("rrPreview");
+  const content = document.getElementById("rrPreviewContent");
+  if (!panel || !content) return;
+
+  const settings = getRegionRoundupSettings();
+  const runId     = `roundup-demo-${Date.now()}`;
+  const runStart  = Date.now();
+  TechLog.info("POST", "run_start", { run_id: runId, run_type: "roundup_demo",
+    type: settings.type, country: settings.country, region: settings.region, size: settings.size, ranking: settings.ranking });
+
+  panel.classList.remove("hidden");
+  content.innerHTML = `<div class="auto-preview-loading">🔍 Searching for top ${settings.size} ${settings.type}s in ${settings.region}…</div>`;
+  panel.scrollIntoView({ behavior: "smooth", block: "nearest" });
+
+  try {
+    const t_search = Date.now();
+    const [places, songInfo] = await Promise.all([
+      searchAutoPlacesCollection(settings.type, settings.country, settings.region,
+                                  settings.minRatings, settings.minStars, settings.size, settings.ranking),
+      getAutoSong(settings.songGenre, settings.country).catch(e => {
+        AppLog.warn("Song fetch failed", e.message);
+        return null;
+      }),
+    ]);
+    TechLog.info("SEARCH", "search_done", { run_id: runId, run_type: "roundup_demo",
+      count: places.length, duration_ms: Date.now()-t_search });
+
+    const caption   = getAutoCaptionRoundup(places, settings.type, settings.region, settings.language, settings.captionOpts, songInfo);
+    const typeLabel = settings.type.charAt(0).toUpperCase() + settings.type.slice(1);
+    const langLabels = { nl:"Dutch", en:"English", fr:"French", de:"German" };
+
+    content.innerHTML = `
+      <div class="auto-preview-meta">
+        <span class="auto-preview-type-badge ${settings.type}">${typeLabel}</span>
+        <span class="auto-preview-region">📍 ${escapeHtml(settings.region)}</span>
+        <span class="auto-preview-lang">🌐 ${langLabels[settings.language] || settings.language}</span>
+      </div>
+      <div class="auto-preview-photos" id="rrPreviewPhotos"></div>
+      ${songInfo ? `
+        <div class="auto-preview-song">
+          <img src="${escapeHtml(songInfo.artwork)}" alt="" />
+          <div class="auto-preview-song-info">
+            <span class="auto-preview-song-name">${escapeHtml(songInfo.name)}</span>
+            <span class="auto-preview-song-artist">${escapeHtml(songInfo.artist)}</span>
+          </div>
+          <span class="auto-preview-genre-badge">${escapeHtml(songInfo.genre)}</span>
+        </div>` : ""}
+      ${caption ? `<div class="auto-preview-caption">${escapeHtml(caption).replace(/\n/g, "<br>")}</div>` : ""}
+      <p class="auto-preview-note">${places.length} entities · ≥${escapeHtml(settings.minRatings)} ratings · ≥${escapeHtml(settings.minStars)}⭐</p>
+    `;
+
+    const photoGrid = document.getElementById("rrPreviewPhotos");
+    if (photoGrid) {
+      places.forEach((place, i) => {
+        const div = document.createElement("div");
+        div.className = "auto-preview-photo";
+        div.innerHTML = `<div class="loading-thumb">…</div>`;
+        photoGrid.appendChild(div);
+        const photo = (place.photos || [])[0];
+        const name  = place.displayName?.text || "";
+        if (photo) {
+          resolvePhotoUri(photo.name, 400).then(uri => {
+            div.innerHTML = `<img src="${uri}" alt="${escapeHtml(name)}" />`;
+          }).catch(() => { div.innerHTML = `<div class="loading-thumb">—</div>`; });
+        } else {
+          div.innerHTML = `<div class="loading-thumb">—</div>`;
+        }
+      });
+    }
+
+    TechLog.info("MEDIA", "photos_done", { run_id: runId, run_type: "roundup_demo",
+      photo_source: "google_places_preview", photo_count: places.length });
+    TechLog.info("POST", "run_complete", { run_id: runId, run_type: "roundup_demo",
+      region: settings.region, status: "rendered", total_duration_ms: Date.now()-runStart });
+    TechLog._flush();
+    AppLog.info("Region Roundup preview rendered", { region: settings.region, count: places.length, lang: settings.language });
+  } catch(err) {
+    TechLog.error("POST", "run_failed", { run_id: runId, run_type: "roundup_demo",
+      error: err.message, total_duration_ms: Date.now()-runStart });
+    TechLog._flush();
+    content.innerHTML = `<div class="auto-preview-error">⚠️ ${err.message}</div>`;
+    AppLog.error("Region Roundup preview failed", err.message);
+  }
+}
+
+// ── Region Roundup config persistence ─────────────────────────────────────────
+function saveRegionRoundupConfig() {
+  const config = {
+    type:      document.querySelector("#rrType .ab-pill.active")?.dataset?.val || "restaurant",
+    country:   document.getElementById("rrCountry")?.value || "BE",
+    region:    document.getElementById("rrRegion")?.value  || "",
+    size:      document.querySelector("#rrSize .ab-pill.active")?.dataset?.val || "5",
+    ranking:   document.querySelector("#rrRanking .ab-pill.active")?.dataset?.val || "rating",
+    minRatings: document.getElementById("rrMinRatings")?.value || "100",
+    minStars:   document.querySelector("#rrMinStars .ab-pill.active")?.dataset?.val || "4",
+    language:   document.getElementById("rrLanguage")?.value || "nl",
+    capRatings:     document.getElementById("rrCapRatings")?.checked     ?? true,
+    capReviewCount: document.getElementById("rrCapReviewCount")?.checked ?? false,
+    capHashtags:    document.getElementById("rrCapHashtags")?.checked    ?? true,
+    freqNum:     document.getElementById("rrFreqNum")?.value    || "1",
+    freqPeriod:  document.getElementById("rrFreqPeriod")?.value || "week",
+    freqRandom:  document.getElementById("rrFreqRand")?.classList.contains("is-active") || false,
+    fromH:       document.getElementById("rrFromH")?.value  || "12",
+    fromM:       document.getElementById("rrFromM")?.value  || "00",
+    fromAP:      document.getElementById("rrFromAP")?.value || "PM",
+    toH:         document.getElementById("rrToH")?.value    || "12",
+    toM:         document.getElementById("rrToM")?.value    || "00",
+    toAP:        document.getElementById("rrToAP")?.value   || "PM",
+    windowRandom: document.getElementById("rrWindowRand")?.classList.contains("is-active") || false,
+    socialIG:  document.getElementById("rrSocialIG")?.classList.contains("active") ?? true,
+    socialFB:  document.getElementById("rrSocialFB")?.classList.contains("active") ?? true,
+    socialTT:  document.getElementById("rrSocialTT")?.classList.contains("active") ?? false,
+  };
+  chrome.storage.local.set({ regionRoundupConfig: config });
+}
+
+const RR_CONFIG_DEFAULTS = {
+  type: "restaurant", country: "BE", region: "Antwerp",
+  size: "5", ranking: "rating", minRatings: "100", minStars: "4",
+  language: "nl", songGenre: "top100",
+  capRatings: true, capReviewCount: false, capHashtags: true, capSong: true,
+  freqNum: "1", freqPeriod: "week", freqRandom: false,
+  fromH: "12", fromM: "00", fromAP: "PM", toH: "12", toM: "00", toAP: "PM",
+  windowRandom: false, socialIG: true, socialFB: true, socialTT: false,
+};
+
+function loadRegionRoundupConfig() {
+  chrome.storage.local.get({ regionRoundupConfig: null }, ({ regionRoundupConfig: raw }) => {
+    const cfg = { ...RR_CONFIG_DEFAULTS, ...(raw || {}) };
+
+    const pill = (groupId, val) =>
+      document.querySelectorAll(`#${groupId} .ab-pill`)
+        .forEach(p => p.classList.toggle("active", p.dataset.val === val));
+    const sel = (id, val) => { const e = document.getElementById(id); if (e && val != null) e.value = val; };
+
+    pill("rrType", cfg.type);
+    sel("rrCountry", cfg.country);
+    buildRegionSelect(cfg.country);
+    if (cfg.region) sel("rrRegion", cfg.region);
+
+    pill("rrSize", cfg.size);
+    pill("rrRanking", cfg.ranking);
+
+    sel("rrMinRatings", cfg.minRatings);
+    const sliderVal = document.getElementById("rrMinRatingsVal");
+    if (sliderVal && cfg.minRatings) sliderVal.textContent = cfg.minRatings;
+
+    pill("rrMinStars", cfg.minStars);
+    sel("rrLanguage", cfg.language);
+
+    const capMap = { rrCapRatings:"capRatings", rrCapReviewCount:"capReviewCount", rrCapHashtags:"capHashtags" };
+    Object.entries(capMap).forEach(([id, key]) => {
+      const e = document.getElementById(id);
+      if (e && cfg[key] !== undefined) e.checked = cfg[key];
+    });
+
+    sel("rrFreqNum",    cfg.freqNum);
+    sel("rrFreqPeriod", cfg.freqPeriod);
+    if (cfg.freqRandom) {
+      document.getElementById("rrFreqRand")?.classList.add("is-active");
+      document.getElementById("rrFreqRow")?.classList.add("is-random");
+      document.getElementById("rrFreqRandHint")?.classList.remove("hidden");
+    }
+
+    sel("rrFromH",  cfg.fromH);  sel("rrFromM",  cfg.fromM);  sel("rrFromAP", cfg.fromAP);
+    sel("rrToH",    cfg.toH);    sel("rrToM",    cfg.toM);    sel("rrToAP",   cfg.toAP);
+    if (cfg.windowRandom) {
+      document.getElementById("rrWindowRand")?.classList.add("is-active");
+      document.getElementById("rrWindowRow")?.classList.add("is-random");
+      document.getElementById("rrWindowRandHint")?.classList.remove("hidden");
+    }
+
+    if (cfg.socialIG !== undefined) document.getElementById("rrSocialIG")?.classList.toggle("active", cfg.socialIG);
+    if (cfg.socialFB !== undefined) document.getElementById("rrSocialFB")?.classList.toggle("active", cfg.socialFB);
+    if (cfg.socialTT !== undefined) document.getElementById("rrSocialTT")?.classList.toggle("active", cfg.socialTT);
+
+    updateRoundupConfigSummary();
+  });
+}
+
+// Debounced save — fires 600ms after last change
+let _rrSaveTimer = null;
+function regionRoundupChanged() {
+  clearTimeout(_rrSaveTimer);
+  _rrSaveTimer = setTimeout(() => { saveRegionRoundupConfig(); updateRoundupConfigSummary(); }, 600);
+}
+
+function initRegionRoundupPersistence() {
+  const ids = ["rrCountry","rrRegion","rrLanguage","rrMinRatings","rrFreqNum","rrFreqPeriod",
+               "rrFromH","rrFromM","rrFromAP","rrToH","rrToM","rrToAP",
+               "rrCapRatings","rrCapReviewCount","rrCapHashtags"];
+  ids.forEach(id => {
+    document.getElementById(id)?.addEventListener("change", regionRoundupChanged);
+    document.getElementById(id)?.addEventListener("input",  regionRoundupChanged);
+  });
+  ["rrType","rrMinStars","rrSize","rrRanking"].forEach(id =>
+    document.getElementById(id)?.addEventListener("click", regionRoundupChanged));
+  ["rrSocialIG","rrSocialFB","rrSocialTT","rrFreqRand","rrWindowRand"]
+    .forEach(id => document.getElementById(id)?.addEventListener("click", regionRoundupChanged));
+}
+initRegionRoundupPersistence();
+
+// Read current Region Roundup form values
+function getRegionRoundupSettings() {
+  const country = document.getElementById("rrCountry")?.value || "BE";
+  const type    = document.querySelector("#rrType .ab-pill.active")?.dataset?.val || "restaurant";
+  let region    = document.getElementById("rrRegion")?.value || "";
+  if (region === RR_RANDOM_REGION) {
+    const regions = REGIONS[country] || [];
+    region = regions.length ? regions[Math.floor(Math.random() * regions.length)] : "";
+  }
+
+  const minRatings = parseInt(document.getElementById("rrMinRatings")?.value || "100", 10);
+  const minStars   = parseFloat(document.querySelector("#rrMinStars .ab-pill.active")?.dataset?.val || "4");
+  const size       = parseInt(document.querySelector("#rrSize .ab-pill.active")?.dataset?.val || "5", 10);
+  const ranking    = document.querySelector("#rrRanking .ab-pill.active")?.dataset?.val || "rating";
+  const language   = document.getElementById("rrLanguage")?.value || "nl";
+  const songGenre  = document.getElementById("rrSongGenre")?.value || "top100";
+
+  const captionOpts = {
+    showRatings:     document.getElementById("rrCapRatings")?.checked     ?? true,
+    showReviewCount: document.getElementById("rrCapReviewCount")?.checked ?? true,
+    hashtags:        document.getElementById("rrCapHashtags")?.checked    ?? false,
+    song:            true,
+  };
+
+  const sched = getRoundupScheduleSettings();
+
+  return {
+    country, type, region, minRatings, minStars, size, ranking,
+    language, songGenre, captionOpts,
+    frequency: sched.frequency,
+    window:    sched.window,
+  };
+}
+
+// Helper: get frequency + window settings from current roundup form state
+function getRoundupScheduleSettings() {
+  return {
+    frequency: {
+      count:    parseInt(document.getElementById("rrFreqNum")?.value    || "1",    10),
+      period:   document.getElementById("rrFreqPeriod")?.value          || "week",
+      isRandom: document.getElementById("rrFreqRand")?.classList.contains("is-active") || false,
+    },
+    window: {
+      fromH:    document.getElementById("rrFromH")?.value  || "12",
+      fromM:    document.getElementById("rrFromM")?.value  || "00",
+      fromAP:   document.getElementById("rrFromAP")?.value || "PM",
+      toH:      document.getElementById("rrToH")?.value    || "12",
+      toM:      document.getElementById("rrToM")?.value    || "00",
+      toAP:     document.getElementById("rrToAP")?.value   || "PM",
+      isRandom: document.getElementById("rrWindowRand")?.classList.contains("is-active") || false,
+    },
+  };
+}
+
+// Generate the Region Roundup posting schedule — independent from the spotlight
+// Auto Bot schedule (own storage key, own platform list, own date/time slots).
+function generateRoundupSchedule(settings) {
+  const { frequency: freq, window: win } = settings;
+  const platforms = [];
+  if (document.getElementById("rrSocialIG")?.classList.contains("active")) platforms.push("instagram");
+  if (document.getElementById("rrSocialFB")?.classList.contains("active")) platforms.push("facebook");
+  if (document.getElementById("rrSocialTT")?.classList.contains("active")) platforms.push("tiktok");
+
+  if (platforms.length === 0) {
+    AppLog.warn("Region Roundup schedule: no platforms selected — schedule not generated");
+    return { generatedAt: new Date().toISOString(), period: freq.period, totalPosts: 0, platforms: [], posts: [] };
+  }
+
+  const winBounds = abGetWindowMinutes(win);
+
+  let totalPosts;
+  if (freq.isRandom) {
+    const maxMap = { day: 2, week: 20, month: 40 };
+    const maxForPeriod = maxMap[freq.period] || 20;
+    totalPosts = Math.floor(Math.random() * maxForPeriod) + 1;
+  } else {
+    totalPosts = Math.max(1, freq.count);
+  }
+
+  const today = new Date();
+  today.setHours(0, 0, 0, 0);
+  const posts = [];
+
+  if (freq.period === "day") {
+    for (let d = 0; d < 7; d++) {
+      const date = new Date(today); date.setDate(today.getDate() + d);
+      const times = abRandomTimesInWindow(totalPosts, winBounds.start, winBounds.end);
+      times.forEach(time => posts.push({
+        date: abFormatDate(date), time, platforms,
+        dayOfWeek: date.toLocaleDateString("en-US", { weekday: "short" }),
+      }));
+    }
+  } else if (freq.period === "week") {
+    const perDay = abDistributePostsAcrossDays(totalPosts, 7, 2);
+    for (let d = 0; d < 7; d++) {
+      if (perDay[d] === 0) continue;
+      const date = new Date(today); date.setDate(today.getDate() + d);
+      const times = abRandomTimesInWindow(perDay[d], winBounds.start, winBounds.end);
+      times.forEach(time => posts.push({
+        date: abFormatDate(date), time, platforms,
+        dayOfWeek: date.toLocaleDateString("en-US", { weekday: "short" }),
+      }));
+    }
+  } else if (freq.period === "month") {
+    const perDay = abDistributePostsAcrossDays(totalPosts, 30, 2);
+    for (let d = 0; d < 30; d++) {
+      if (perDay[d] === 0) continue;
+      const date = new Date(today); date.setDate(today.getDate() + d);
+      const times = abRandomTimesInWindow(perDay[d], winBounds.start, winBounds.end);
+      times.forEach(time => posts.push({
+        date: abFormatDate(date), time, platforms,
+        dayOfWeek: date.toLocaleDateString("en-US", { weekday: "short" }),
+      }));
+    }
+  }
+
+  const now = new Date();
+  posts.sort((a, b) => `${a.date}${a.time}`.localeCompare(`${b.date}${b.time}`));
+  const futurePosts = posts.filter(p => new Date(`${p.date}T${p.time}:00`) > now);
+
+  if (futurePosts.length === 0 && posts.length > 0) {
+    const schedBtn = document.getElementById("rrScheduleBtn");
+    if (schedBtn) {
+      const origText = schedBtn.textContent;
+      schedBtn.textContent = "⚠️ All times already past — schedule a future window";
+      setTimeout(() => { schedBtn.textContent = origText; }, 6000);
+    }
+    AppLog.warn("Region Roundup schedule: all generated posts were in the past — no alarms will fire");
+  }
+
+  const result = {
+    generatedAt: new Date().toISOString(),
+    period: freq.period,
+    frequencyIsRandom: freq.isRandom,
+    windowIsRandom: win.isRandom,
+    totalPosts: futurePosts.length,
+    platforms,
+    posts: futurePosts,
+  };
+
+  chrome.storage.local.set({ autoBotRoundupSchedule: result });
+  AppLog.info("Region Roundup schedule generated", {
+    totalPosts: futurePosts.length, period: freq.period,
+    platforms, windowRandom: win.isRandom,
+  });
+
+  return result;
+}
+
+// ── Chrome Alarms (own namespace — ffbot-roundup-*) ───────────────────────────
+function setupRoundupScheduleAlarms(schedule) {
+  clearAlarmsByPrefix("ffbot-roundup-").then(() => {
+    const now = Date.now();
+    schedule.posts.forEach((post, idx) => {
+      const base = new Date(`${post.date}T${post.time}:00`).getTime();
+      const when = base + Math.floor(Math.random() * 15 * 60 * 1000);
+      if (when > now) chrome.alarms.create(`ffbot-roundup-${idx}`, { when });
+    });
+    AppLog.info(`Set ${schedule.posts.length} roundup alarms`);
+  });
+}
+
+// ══════════════════════════════════════════════════════════════════════════════
+// REGION ROUNDUP ACTIVATION LOGIC
+// ══════════════════════════════════════════════════════════════════════════════
+
+let regionRoundupActive = false;
+
+// ── Collapsible config toggle ─────────────────────────────────────────────────
+document.getElementById("rrConfigToggle")?.addEventListener("click", () => {
+  const body  = document.getElementById("rrConfigBody");
+  const arrow = document.getElementById("rrConfigArrow");
+  if (!body) return;
+  const collapsed = body.classList.toggle("collapsed");
+  arrow?.classList.toggle("collapsed", collapsed);
+});
+
+// ── Collapsible scheduled posts toggle ───────────────────────────────────────
+document.getElementById("rrSchedToggle")?.addEventListener("click", () => {
+  const body  = document.getElementById("rrSchedBody");
+  const arrow = document.getElementById("rrSchedArrow");
+  if (!body) return;
+  const collapsed = body.classList.toggle("collapsed");
+  arrow?.classList.toggle("collapsed", collapsed);
+});
+
+// ── Activate / Deactivate ─────────────────────────────────────────────────────
+document.getElementById("rrScheduleBtn")?.addEventListener("click", () => {
+  if (regionRoundupActive) deactivateRoundup();
+  else                      activateRoundup();
+});
+
+function activateRoundup() {
+  if (!API_KEY) { alert("Please save your Google API key before activating Region Roundup."); return; }
+  if (!document.getElementById("rrRegion")?.value) { alert("Please select a region for Region Roundup."); return; }
+  const platforms = [];
+  if (document.getElementById("rrSocialIG")?.classList.contains("active")) platforms.push("instagram");
+  if (document.getElementById("rrSocialFB")?.classList.contains("active")) platforms.push("facebook");
+  if (document.getElementById("rrSocialTT")?.classList.contains("active")) platforms.push("tiktok");
+  if (!platforms.length) { alert("Please select at least one social media platform."); return; }
+
+  const cfgBody  = document.getElementById("rrConfigBody");
+  const cfgArrow = document.getElementById("rrConfigArrow");
+  cfgBody?.classList.add("collapsed");
+  cfgArrow?.classList.add("collapsed");
+
+  const settings = getRegionRoundupSettings();
+  const schedule = generateRoundupSchedule(settings);
+
+  regionRoundupActive = true;
+  chrome.storage.local.set({ regionRoundupActive: true, autoBotRoundupSchedule: schedule, regionRoundupRunLog: [] });
+  setupRoundupScheduleAlarms(schedule);
+
+  updateRoundupUI(true);
+  renderScheduledRoundupPosts(schedule);
+  updateRoundupProgress(0, schedule.totalPosts);
+  updateNextRoundupPostLabel(schedule);
+  updateRoundupConfigSummary();
+
+  AppLog.info("Region Roundup activated", { totalPosts: schedule.totalPosts, platforms, region: settings.region });
+  TechLog.info("SCHEDULE", "roundup_activated", { totalPosts: schedule.totalPosts, platforms, region: settings.region, period: settings.frequency?.period });
+}
+
+function deactivateRoundup() {
+  regionRoundupActive = false;
+  chrome.storage.local.get({ autoBotRoundupSchedule: null }, ({ autoBotRoundupSchedule: prev }) => {
+    const updates = { regionRoundupActive: false, autoBotRoundupSchedule: null, regionRoundupRunLog: [] };
+    if (prev) updates.regionRoundupLastSchedule = prev;
+    chrome.storage.local.set(updates);
+  });
+  chrome.storage.local.remove("regionRoundupPaused");
+  hideRoundupPausedBanner();
+  clearAlarmsByPrefix("ffbot-roundup-");
+  updateRoundupUI(false);
+  updateRoundupProgress(0, 0);
+  const schedBody  = document.getElementById("rrSchedBody");
+  const schedBadge = document.getElementById("rrSchedCount");
+  const schedTitle = document.querySelector("#rrScheduledSection .ab-collapse-hdr-title");
+  if (schedBody)  schedBody.innerHTML = "";
+  if (schedBadge) schedBadge.textContent = "0";
+  if (schedTitle) schedTitle.textContent = "📅 Scheduled Posts";
+  AppLog.info("Region Roundup deactivated — schedule cleared");
+  TechLog.info("SCHEDULE", "roundup_deactivated", { scheduleCleared: true });
+}
+
+function updateRoundupUI(active) {
+  const btn      = document.getElementById("rrScheduleBtn");
+  const body     = document.getElementById("rrConfigBody");
+  const arrow    = document.getElementById("rrConfigArrow");
+  const status   = document.getElementById("rrBotStatus");
+  const progress = document.getElementById("rrProgressWrap");
+  const schedSec = document.getElementById("rrScheduledSection");
+
+  if (active) {
+    if (btn) { btn.textContent = "⏹ Deactivate Region Roundup"; btn.classList.add("is-active"); }
+    body?.classList.add("collapsed");
+    arrow?.classList.add("collapsed");
+    status?.classList.remove("hidden");
+    progress?.classList.remove("hidden");
+    schedSec?.classList.remove("hidden");
+  } else {
+    if (btn) { btn.textContent = "⏰ Schedule Region Roundup"; btn.classList.remove("is-active"); }
+    body?.classList.remove("collapsed");
+    arrow?.classList.remove("collapsed");
+    status?.classList.add("hidden");
+    progress?.classList.add("hidden");
+    schedSec?.classList.add("hidden");
+  }
+  updateScheduleGroupSummary("rr", active);
+  syncActiveBotsWrap();
+}
+
+// ── Render scheduled roundup posts list ───────────────────────────────────────
+function renderScheduledRoundupPosts(schedule, runLog = []) {
+  const body  = document.getElementById("rrSchedBody");
+  const badge = document.getElementById("rrSchedCount");
+  const title = document.querySelector("#rrScheduledSection .ab-collapse-hdr-title");
+  if (!body) return;
+
+  const postCount = schedule?.posts?.length || 0;
+  if (badge) badge.textContent = postCount;
+
+  if (title && schedule?.generatedAt) {
+    const genTime = new Date(schedule.generatedAt).toLocaleTimeString("en-GB", { hour:"2-digit", minute:"2-digit" });
+    const genDate = new Date(schedule.generatedAt).toLocaleDateString("en-GB", { day:"numeric", month:"short" });
+    title.textContent = `📅 Scheduled Posts — generated ${genDate} at ${genTime}`;
+  }
+
+  body.innerHTML = "";
+
+  if (!postCount) {
+    body.innerHTML = `<div style="padding:12px;text-align:center;font-size:.75rem;color:var(--muted)">No upcoming posts scheduled</div>`;
+    return;
+  }
+
+  const grouped = {};
+  schedule.posts.forEach((post, idx) => {
+    if (!grouped[post.date]) grouped[post.date] = [];
+    grouped[post.date].push({ ...post, idx });
+  });
+
+  Object.entries(grouped).sort(([a],[b]) => a.localeCompare(b)).forEach(([date, posts]) => {
+    const dayEl  = document.createElement("div");
+    dayEl.className = "ab-sched-day-group";
+    const dayObj = new Date(`${date}T00:00:00`);
+    const dayLbl = dayObj.toLocaleDateString("en-GB", { weekday:"long", day:"numeric", month:"short" });
+    dayEl.innerHTML = `<div class="ab-sched-day-label">${dayLbl}</div>`;
+
+    posts.forEach(post => {
+      const plat = post.platforms.map(p => ({ instagram:"📸 IG", facebook:"👥 FB", tiktok:"🎵 TT" }[p] || p)).join("  ");
+
+      const logStatus = runLog.find(e => e.postIndex === post.idx)?.status;
+      const status    = SCHED_STATUS_LABELS[logStatus] ? logStatus : "pending";
+
+      const item = document.createElement("div");
+      item.className = "ab-sched-item";
+      item.id = `rrSchedItem-${post.idx}`;
+      item.innerHTML = `
+        <span class="ab-sched-time">${escapeHtml(post.time)}</span>
+        <span class="ab-sched-platforms">${escapeHtml(plat)}</span>
+        <span class="ab-sched-status ${status}" id="rrSchedStatus-${post.idx}">
+          ${SCHED_STATUS_LABELS[status]}
+        </span>`;
+      dayEl.appendChild(item);
+    });
+    body.appendChild(dayEl);
+  });
+}
+
+function updateScheduledRoundupItemStatus(idx, status) {
+  const el = document.getElementById(`rrSchedStatus-${idx}`);
+  if (!el) return;
+  el.textContent = SCHED_STATUS_LABELS[status] || status;
+  el.className   = `ab-sched-status ${status}`;
+}
+
+// ── Progress ──────────────────────────────────────────────────────────────────
+function updateRoundupProgress(done, total) {
+  const fill  = document.getElementById("rrProgressFill");
+  const label = document.getElementById("rrProgressLabel");
+  const pct   = total > 0 ? Math.round((done / total) * 100) : 0;
+  if (fill)  fill.style.width = `${pct}%`;
+  if (label) label.textContent = `${done} of ${total} posts published`;
+  const txt = document.getElementById("rrBotProgressText");
+  if (txt)   txt.textContent = `${done} / ${total} posts`;
+}
+
+function updateNextRoundupPostLabel(schedule) {
+  const el = document.getElementById("rrBotNextPost");
+  if (!el) return;
+  const now  = new Date();
+  const next = schedule.posts.find(p => new Date(`${p.date}T${p.time}:00`) > now);
+  if (next) {
+    const d = new Date(`${next.date}T${next.time}:00`);
+    el.textContent = `Next: ${d.toLocaleDateString("en-GB", { weekday:"short", day:"numeric", month:"short" })} at ${next.time}`;
+  } else {
+    el.textContent = "All posts complete";
+  }
+}
+
+// ── Config summary (shown when config is collapsed) ───────────────────────────
+function updateRoundupConfigSummary() {
+  const el = document.getElementById("rrConfigSummary");
+  if (!el) return;
+  const type    = document.querySelector("#rrType .ab-pill.active")?.dataset?.val || "restaurant";
+  const size    = document.querySelector("#rrSize .ab-pill.active")?.dataset?.val || "5";
+  const cc      = document.getElementById("rrCountry")?.value || "BE";
+  const country = AB_COUNTRY_NAMES[cc] || cc;
+  const regionVal = document.getElementById("rrRegion")?.value || "—";
+  const region  = regionVal === RR_RANDOM_REGION ? "🎲 Random region" : regionVal;
+  el.textContent = `Top ${size} ${type}s · ${region}, ${country}`;
+}
+
+// ── Paused banner ──────────────────────────────────────────────────────────────
+function showRoundupPausedBanner(reason) {
+  const banner   = document.getElementById("rrPausedBanner");
+  const reasonEl = document.getElementById("rrPausedReason");
+  if (reasonEl) reasonEl.textContent = reason || "Region Roundup needs your attention.";
+  banner?.classList.remove("hidden");
+  syncActiveBotsWrap();
+}
+function hideRoundupPausedBanner() {
+  document.getElementById("rrPausedBanner")?.classList.add("hidden");
+  syncActiveBotsWrap();
+}
+document.getElementById("rrPausedResumeBtn")?.addEventListener("click", () => {
+  chrome.storage.local.remove("regionRoundupPaused", () => {
+    hideRoundupPausedBanner();
+    chrome.storage.local.get({ autoBotRoundupSchedule: null }, ({ autoBotRoundupSchedule }) => {
+      if (!autoBotRoundupSchedule) return;
+      setupRoundupScheduleAlarms(autoBotRoundupSchedule);
+      AppLog.info("Region Roundup resumed by user");
+      TechLog.info("SCHEDULE", "roundup_resumed", {});
+    });
+  });
+});
+
+// Listen for status messages from background
+chrome.runtime.onMessage.addListener((msg) => {
+  if (msg.type === "ROUNDUP_PAUSED") {
+    showRoundupPausedBanner(msg.reason);
+  }
+  if (msg.type === "ROUNDUP_TRIGGERED") {
+    updateScheduledRoundupItemStatus(msg.logEntry.postIndex, "triggered");
+    chrome.storage.local.get({ regionRoundupRunLog:[], autoBotRoundupSchedule:null }, ({ regionRoundupRunLog, autoBotRoundupSchedule }) => {
+      const done = regionRoundupRunLog.filter(e => e.status === "done").length;
+      updateRoundupProgress(done, autoBotRoundupSchedule?.totalPosts || 0);
+    });
+  }
+  if (msg.type === "ROUNDUP_STATUS_UPDATE") {
+    updateScheduledRoundupItemStatus(msg.postIndex, msg.status);
+    chrome.storage.local.get({ regionRoundupRunLog:[], autoBotRoundupSchedule:null }, ({ regionRoundupRunLog, autoBotRoundupSchedule }) => {
+      refreshActivityLog(); // roundup posts also feed the shared activity log
+      const done = regionRoundupRunLog.filter(e => e.status === "done").length;
+      updateRoundupProgress(done, autoBotRoundupSchedule?.totalPosts || 0);
+      if (autoBotRoundupSchedule) updateNextRoundupPostLabel(autoBotRoundupSchedule);
+    });
+  }
+});
+
+// Restore active state whenever Auto Bot mode is opened
+function restoreRoundupActiveState() {
+  chrome.storage.local.get({ regionRoundupActive:false, autoBotRoundupSchedule:null, regionRoundupRunLog:[], regionRoundupPaused:null },
+    ({ regionRoundupActive: wasActive, autoBotRoundupSchedule: schedule, regionRoundupRunLog: runLog, regionRoundupPaused }) => {
+      regionRoundupActive = wasActive;
+      if (wasActive && schedule) {
+        updateRoundupUI(true);
+        renderScheduledRoundupPosts(schedule, runLog);
+        const done = runLog.filter(e => e.status === "done").length;
+        updateRoundupProgress(done, schedule.totalPosts);
+        updateNextRoundupPostLabel(schedule);
+        updateRoundupConfigSummary();
+      } else {
+        updateRoundupUI(false);
+      }
+      if (regionRoundupPaused) showRoundupPausedBanner(regionRoundupPaused.reason);
+      else hideRoundupPausedBanner();
+    }
+  );
+}
+
+// ── Pill groups (Type / Min stars / Size / Ranking) ───────────────────────────
+["rrType", "rrMinStars", "rrSize", "rrRanking"].forEach(groupId => {
+  const group = document.getElementById(groupId);
+  if (!group) return;
+  group.addEventListener("click", e => {
+    const pill = e.target.closest(".ab-pill");
+    if (!pill) return;
+    group.querySelectorAll(".ab-pill").forEach(p => p.classList.remove("active"));
+    pill.classList.add("active");
+  });
+});
+
+// ── Social media toggles ───────────────────────────────────────────────────────
+["rrSocialIG", "rrSocialFB", "rrSocialTT"].forEach(id => {
+  document.getElementById(id)?.addEventListener("click", function() {
+    this.classList.toggle("active");
+  });
+});
+
+// ── Schedule: populate hour selects ───────────────────────────────────────────
+buildHourSelect("rrFromH", 12);
+buildHourSelect("rrToH",   12);
+
+// ── Random button toggles (greys out the field row) ───────────────────────────
+[
+  { btnId: "rrFreqRand",   rowId: "rrFreqRow",   hintId: "rrFreqRandHint"   },
+  { btnId: "rrWindowRand", rowId: "rrWindowRow", hintId: "rrWindowRandHint" },
+].forEach(({ btnId, rowId, hintId }) => {
+  const btn  = document.getElementById(btnId);
+  const row  = document.getElementById(rowId);
+  const hint = document.getElementById(hintId);
+  if (!btn || !row) return;
+  btn.addEventListener("click", () => {
+    const active = btn.classList.toggle("is-active");
+    row.classList.toggle("is-random", active);
+    btn.textContent = active ? "🎲 Random ✓" : "🎲 Random";
+    if (hint) hint.classList.toggle("hidden", !active);
+  });
+});
+
+// ── Preview Example Roundup Post button ───────────────────────────────────────
+document.getElementById("rrPreviewBtn")?.addEventListener("click", previewExampleRoundupPost);
+document.getElementById("rrPreviewClose")?.addEventListener("click", () => {
+  document.getElementById("rrPreview")?.classList.add("hidden");
+});
+
+// ── Ratings slider live value ─────────────────────────────────────────────────
+const rrSlider = document.getElementById("rrMinRatings");
+const rrSliderVal = document.getElementById("rrMinRatingsVal");
+if (rrSlider && rrSliderVal) {
+  rrSlider.addEventListener("input", () => {
+    rrSliderVal.textContent = Number(rrSlider.value).toLocaleString();
+  });
+}
+
+// ══════════════════════════════════════════════════════════════════════════════
+// MANUAL POST — REGION ROUNDUP (one-off "Top N" generate & post)
+// ══════════════════════════════════════════════════════════════════════════════
+
+let currentRoundup = null; // { places, photoDataUrls, caption, type, region, size }
+
+buildRegionSelect("BE", "mrRegion");
+document.getElementById("mrCountry")?.addEventListener("change", e => {
+  buildRegionSelect(e.target.value, "mrRegion");
+});
+
+// ── Collapsible config toggle ─────────────────────────────────────────────────
+document.getElementById("mrConfigToggle")?.addEventListener("click", () => {
+  const body  = document.getElementById("mrConfigBody");
+  const arrow = document.getElementById("mrConfigArrow");
+  if (!body) return;
+  const collapsed = body.classList.toggle("collapsed");
+  arrow?.classList.toggle("collapsed", collapsed);
+});
+
+// ── Pill groups (Type / Min stars / Size / Ranking) ───────────────────────────
+["mrType", "mrMinStars", "mrSize", "mrRanking"].forEach(groupId => {
+  const group = document.getElementById(groupId);
+  if (!group) return;
+  group.addEventListener("click", e => {
+    const pill = e.target.closest(".ab-pill");
+    if (!pill) return;
+    group.querySelectorAll(".ab-pill").forEach(p => p.classList.remove("active"));
+    pill.classList.add("active");
+  });
+});
+
+// ── Social media toggles ───────────────────────────────────────────────────────
+["mrSocialIG", "mrSocialFB", "mrSocialTT"].forEach(id => {
+  document.getElementById(id)?.addEventListener("click", function() {
+    this.classList.toggle("active");
+  });
+});
+
+// ── Ratings slider live value ─────────────────────────────────────────────────
+const mrSlider    = document.getElementById("mrMinRatings");
+const mrSliderVal = document.getElementById("mrMinRatingsVal");
+if (mrSlider && mrSliderVal) {
+  mrSlider.addEventListener("input", () => {
+    mrSliderVal.textContent = Number(mrSlider.value).toLocaleString();
+  });
+}
+
+// ── Read current Manual Roundup form values ───────────────────────────────────
+function getManualRoundupSettings() {
+  const country = document.getElementById("mrCountry")?.value || "BE";
+  let region    = document.getElementById("mrRegion")?.value || "";
+  if (region === RR_RANDOM_REGION) {
+    const regions = REGIONS[country] || [];
+    region = regions.length ? regions[Math.floor(Math.random() * regions.length)] : "";
+  }
+
+  return {
+    type:     document.querySelector("#mrType .ab-pill.active")?.dataset?.val || "restaurant",
+    country,
+    region,
+    size:     parseInt(document.querySelector("#mrSize .ab-pill.active")?.dataset?.val || "5", 10),
+    ranking:  document.querySelector("#mrRanking .ab-pill.active")?.dataset?.val || "rating",
+    minRatings: parseInt(document.getElementById("mrMinRatings")?.value || "100", 10),
+    minStars:   parseFloat(document.querySelector("#mrMinStars .ab-pill.active")?.dataset?.val || "4"),
+    language:   document.getElementById("mrLanguage")?.value || "nl",
+    captionOpts: {
+      showRatings:     document.getElementById("mrCapRatings")?.checked     ?? true,
+      showReviewCount: document.getElementById("mrCapReviewCount")?.checked ?? true,
+      hashtags:        document.getElementById("mrCapHashtags")?.checked    ?? false,
+      song: false,
+    },
+  };
+}
+
+// ── Generate Top N List ────────────────────────────────────────────────────────
+document.getElementById("mrGenerateBtn")?.addEventListener("click", generateManualRoundup);
+
+async function generateManualRoundup() {
+  if (!API_KEY) { setStatus("Please save your API key first.", "error"); return; }
+
+  const settings = getManualRoundupSettings();
+  if (!settings.region) { setStatus("Please select a region for the roundup.", "error"); return; }
+
+  const panel   = document.getElementById("mrPreview");
+  const content = document.getElementById("mrPreviewContent");
+  if (!panel || !content) return;
+
+  const genBtn = document.getElementById("mrGenerateBtn");
+  if (genBtn) genBtn.disabled = true;
+
+  panel.classList.remove("hidden");
+  content.innerHTML = `<div class="auto-preview-loading">🔍 Searching for top ${settings.size} ${settings.type}s in ${settings.region}…</div>`;
+  panel.scrollIntoView({ behavior: "smooth", block: "nearest" });
+
+  const runId    = `manual-roundup-${Date.now()}`;
+  const runStart = Date.now();
+  TechLog.info("POST", "run_start", { run_id: runId, run_type: "manual_roundup",
+    type: settings.type, country: settings.country, region: settings.region, size: settings.size, ranking: settings.ranking });
+
+  try {
+    const t_search = Date.now();
+    const places = await searchAutoPlacesCollection(settings.type, settings.country, settings.region,
+      settings.minRatings, settings.minStars, settings.size, settings.ranking);
+    TechLog.info("SEARCH", "search_done", { run_id: runId, run_type: "manual_roundup",
+      count: places.length, duration_ms: Date.now()-t_search });
+
+    setStatus(`Preparing ${places.length} cover photos…`);
+    const photoDataUrls = [];
+    for (const place of places) {
+      const photo = (place.photos || [])[0];
+      if (!photo) continue;
+      try {
+        const uri = await resolvePhotoUri(photo.name, 1440);
+        photoDataUrls.push(await photoToDataUrl(uri));
+      } catch (e) {
+        AppLog.error("Roundup photo fetch failed", { place: place.displayName?.text, error: String(e) });
+      }
+    }
+
+    const caption  = getAutoCaptionRoundup(places, settings.type, settings.region, settings.language, settings.captionOpts, null);
+    const typeLabel  = settings.type.charAt(0).toUpperCase() + settings.type.slice(1);
+    const langLabels = { nl:"Dutch", en:"English", fr:"French", de:"German" };
+
+    currentRoundup = { places, photoDataUrls, caption, type: settings.type, region: settings.region };
+
+    content.innerHTML = `
+      <div class="auto-preview-meta">
+        <span class="auto-preview-type-badge ${settings.type}">${typeLabel}</span>
+        <span class="auto-preview-region">📍 ${escapeHtml(settings.region)}</span>
+        <span class="auto-preview-lang">🌐 ${langLabels[settings.language] || settings.language}</span>
+      </div>
+      <div class="auto-preview-photos" id="mrPreviewPhotos"></div>
+      ${caption ? `<div class="auto-preview-caption">${escapeHtml(caption).replace(/\n/g, "<br>")}</div>` : ""}
+      <p class="auto-preview-note">${places.length} entities · ≥${escapeHtml(settings.minRatings)} ratings · ≥${escapeHtml(settings.minStars)}⭐</p>
+    `;
+
+    const photoGrid = document.getElementById("mrPreviewPhotos");
+    if (photoGrid) {
+      photoDataUrls.forEach((dataUrl, i) => {
+        const div = document.createElement("div");
+        div.className = "auto-preview-photo";
+        div.innerHTML = `<img src="${dataUrl}" alt="${escapeHtml(places[i]?.displayName?.text || "")}" />`;
+        photoGrid.appendChild(div);
+      });
+    }
+
+    TechLog.info("MEDIA", "photos_done", { run_id: runId, run_type: "manual_roundup",
+      photo_source: "google_places_manual", photo_count: photoDataUrls.length });
+    TechLog.info("POST", "run_complete", { run_id: runId, run_type: "manual_roundup",
+      region: settings.region, status: "rendered", total_duration_ms: Date.now()-runStart });
+    TechLog._flush();
+    AppLog.info("Manual Region Roundup generated", { region: settings.region, count: places.length });
+    setStatus("✅ Roundup ready — choose platforms and post!", "success");
+  } catch (err) {
+    TechLog.error("POST", "run_failed", { run_id: runId, run_type: "manual_roundup",
+      error: err.message, total_duration_ms: Date.now()-runStart });
+    TechLog._flush();
+    content.innerHTML = `<div class="auto-preview-error">⚠️ ${err.message}</div>`;
+    AppLog.error("Manual Region Roundup failed", err.message);
+    currentRoundup = null;
+  } finally {
+    if (genBtn) genBtn.disabled = false;
+  }
+}
+
+document.getElementById("mrPreviewClose")?.addEventListener("click", () => {
+  document.getElementById("mrPreview")?.classList.add("hidden");
+  currentRoundup = null;
+});
+
+// ── Post Roundup Now ───────────────────────────────────────────────────────────
+document.getElementById("mrPostBtn")?.addEventListener("click", postManualRoundup);
+
+async function postManualRoundup() {
+  if (!currentRoundup || !currentRoundup.photoDataUrls.length) {
+    setStatus("⚠️ Generate a roundup first.", "error");
+    return;
+  }
+
+  const platforms = [];
+  if (document.getElementById("mrSocialIG")?.classList.contains("active")) platforms.push("instagram");
+  if (document.getElementById("mrSocialFB")?.classList.contains("active")) platforms.push("facebook");
+  if (document.getElementById("mrSocialTT")?.classList.contains("active")) platforms.push("tiktok");
+
+  if (!platforms.length) {
+    setStatus("⚠️ Select at least one social media platform to post.", "error");
+    return;
+  }
+
+  const { photoDataUrls, caption, type, region, places } = currentRoundup;
+  const typeLabel = type.charAt(0).toUpperCase() + type.slice(1);
+  const header    = `Top ${places.length} ${typeLabel}s in ${region}`;
+
+  const runId    = `manual-roundup-post-${Date.now()}`;
+  const runStart = Date.now();
+  TechLog.info("POST", "run_start", { run_id: runId, run_type: "manual_roundup_post",
+    region, type, platforms, photo_count: photoDataUrls.length });
+
+  const postBtn = document.getElementById("mrPostBtn");
+  if (postBtn) postBtn.disabled = true;
+
+  for (const platform of platforms) {
+    const t_plat = Date.now();
+    TechLog.info("POST", "platform_start", { run_id: runId, run_type: "manual_roundup_post", platform });
+    setStatus(`Opening ${platform}…`);
+    chrome.runtime.sendMessage({
+      type: "OPEN_SOCIAL", platform, photoDataUrls, caption, songName: "",
+      location: region, restaurantName: header, tiktokAudioDataUrl: null,
+    });
+    await new Promise(r => setTimeout(r, 900));
+    TechLog.info("POST", "platform_opened", { run_id: runId, run_type: "manual_roundup_post",
+      platform, duration_ms: Date.now()-t_plat });
+  }
+
+  TechLog.info("POST", "run_complete", { run_id: runId, run_type: "manual_roundup_post",
+    region, type, platforms, photo_count: photoDataUrls.length, total_duration_ms: Date.now()-runStart });
+  TechLog._flush();
+  AppLog.info("Manual Region Roundup posted", { region, type, platforms, photo_count: photoDataUrls.length });
+  setStatus(`✅ Opening ${platforms.join(", ")} — ${photoDataUrls.length} photos & caption ready!`, "success");
+
+  if (postBtn) postBtn.disabled = false;
+}
+
+// ── Export Roundup (photos + caption to Downloads) ────────────────────────────
+document.getElementById("mrExportBtn")?.addEventListener("click", exportManualRoundup);
+
+async function exportManualRoundup() {
+  if (!currentRoundup || !currentRoundup.photoDataUrls.length) {
+    setStatus("⚠️ Generate a roundup first.", "error");
+    return;
+  }
+
+  const { photoDataUrls, caption, type, region, places } = currentRoundup;
+  const timestamp = new Date().toISOString().replace(/[:.]/g, "-").slice(0, 19);
+  const slug = `${type}-roundup-${region}`.toLowerCase()
+    .replace(/[^a-z0-9]+/g, "-").replace(/^-+|-+$/g, "") || "roundup";
+  const folder = `FoodFluencer/${slug}_${timestamp}`;
+
+  const runId    = `manual-roundup-export-${Date.now()}`;
+  const runStart = Date.now();
+  TechLog.info("EXPORT", "run_start", { run_id: runId, run_type: "manual_roundup_export",
+    region, type, photo_count: photoDataUrls.length });
+
+  const exportBtn = document.getElementById("mrExportBtn");
+  const postBtn   = document.getElementById("mrPostBtn");
+  if (exportBtn) exportBtn.disabled = true;
+  if (postBtn)   postBtn.disabled   = true;
+
+  let saved = 0;
+  for (let i = 0; i < photoDataUrls.length; i++) {
+    setStatus(`Exporting photo ${i + 1}/${photoDataUrls.length}…`);
+    try {
+      await new Promise(resolve => {
+        chrome.runtime.sendMessage({
+          type:     "DOWNLOAD",
+          url:      photoDataUrls[i],
+          filename: `${folder}/photo_${i + 1}.jpg`,
+        }, resolve);
+      });
+      saved++;
+    } catch (e) {
+      AppLog.error("Roundup photo export failed", { index: i, error: String(e) });
+    }
+  }
+
+  if (caption) {
+    await new Promise(resolve => {
+      chrome.runtime.sendMessage({
+        type:     "DOWNLOAD",
+        url:      `data:text/plain;charset=utf-8,${encodeURIComponent(caption)}`,
+        filename: `${folder}/caption.txt`,
+      }, resolve);
+    });
+  }
+
+  chrome.storage.local.get({ exportLog: [] }, ({ exportLog }) => {
+    exportLog.push({
+      timestamp, name: `Top ${places.length} ${type}s in ${region}`, address: region,
+      photos: saved, song: null, platforms: [], caption,
+    });
+    chrome.storage.local.set({ exportLog });
+  });
+
+  TechLog.info("EXPORT", "run_complete", { run_id: runId, run_type: "manual_roundup_export",
+    region, type, photo_count: saved, total_duration_ms: Date.now()-runStart });
+  TechLog._flush();
+
+  if (saved > 0) {
+    AppLog.info(`Exported roundup: ${saved}/${photoDataUrls.length} photos`, { region, type });
+    setStatus(`✅ Exported ${saved} photo${saved === 1 ? "" : "s"} & caption to Downloads/${folder}/`, "success");
+  } else {
+    AppLog.error("Roundup export failed — no photos saved");
+    setStatus("⚠️ Could not export any photos.", "error");
+  }
+
+  if (exportBtn) exportBtn.disabled = false;
+  if (postBtn)   postBtn.disabled   = false;
+}
+
 // Boot
 checkUsageWarning();
 
@@ -3840,5 +5071,22 @@ if (typeof module !== 'undefined' && module.exports) {
     AB_COUNTRY_BOUNDS,
     AB_TYPE_QUERY,
     getCurrentRestaurant: () => currentRestaurant,
+    // Region Roundup
+    REGIONS,
+    buildRegionSelect,
+    searchAutoPlacesCollection,
+    getAutoCaptionRoundup,
+    getRegionRoundupSettings,
+    loadRegionRoundupConfig,
+    saveRegionRoundupConfig,
+    generateRoundupSchedule,
+    getRoundupScheduleSettings,
+    RR_CONFIG_DEFAULTS,
+    // Manual Post Region Roundup
+    getManualRoundupSettings,
+    generateManualRoundup,
+    postManualRoundup,
+    exportManualRoundup,
+    getCurrentRoundup: () => currentRoundup,
   };
 }

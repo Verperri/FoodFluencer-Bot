@@ -201,6 +201,17 @@ h1 { font-size: 0.95rem; font-weight: 700; line-height: 1.2; }
 
 /* ── Results wrapper ─────────────────────────────────────────────────────── */
 .results-section { display: flex; flex-direction: column; gap: 9px; }
+.results-section.auto-preview-panel { gap: 0; margin-top: 12px; }
+
+/* ── Anchor placeholders used to relocate #results between Manual/Bot
+   search panels: they stay in the DOM but must not occupy layout space
+   (e.g. contribute to a flex parent's `gap`) when empty. ── */
+#resultsAnchorManual,
+#resultsAnchorBot { display: contents; }
+.results-section.auto-preview-panel > *:not(.auto-preview-hdr) { margin-left: 12px; margin-right: 12px; }
+.results-section.auto-preview-panel > .restaurant-card { margin-top: 10px; }
+.results-section.auto-preview-panel > .export-section { margin-bottom: 10px; }
+.results-section.auto-preview-panel > .divider { margin: 9px 12px; }
 
 /* ── Search results dropdown ─────────────────────────────────────────────── */
 .search-results-dropdown {
@@ -295,11 +306,6 @@ h1 { font-size: 0.95rem; font-weight: 700; line-height: 1.2; }
 .status--success { border-color: var(--success); color: var(--success); }
 .status--error   { border-color: var(--error);   color: var(--error);   }
 .status--loading { color: var(--muted); }
-
-/* ── Settings footer ─────────────────────────────────────────────────────── */
-.settings-footer {
-  display: flex; gap: 6px; padding-top: 8px; border-top: 1px solid var(--border);
-}
 
 /* ══════════════════════════════════════════════════════════════════
    MODE SELECTOR
@@ -589,7 +595,19 @@ h1 { font-size: 0.95rem; font-weight: 700; line-height: 1.2; }
 }
 .auto-preview-hdr-title { font-size: .78rem; font-weight: 700; color: var(--accent); }
 
-#autoPreviewContent { padding: 10px 12px; display: flex; flex-direction: column; gap: 8px; }
+#autoPreviewContent,
+#mrPreviewContent,
+#rrPreviewContent { padding: 10px 12px; display: flex; flex-direction: column; gap: 10px; }
+
+/* ── Region Roundup preview panels (Manual Post / Auto Bot) ──
+   Give the panel's other direct children (social platforms, export row)
+   the same horizontal breathing room as the generated content above. ── */
+#mrPreview > .ab-group,
+#mrPreview > .export-row,
+#rrPreview > .ab-group {
+  margin: 10px 12px;
+}
+#mrPreview > .export-row { margin-top: 4px; margin-bottom: 12px; }
 
 .auto-preview-meta {
   display: flex; align-items: center; gap: 6px; flex-wrap: wrap;
@@ -613,7 +631,7 @@ h1 { font-size: 0.95rem; font-weight: 700; line-height: 1.2; }
 .auto-preview-rating { font-size: .72rem; color: #b45309; }
 
 .auto-preview-photos {
-  display: grid; grid-template-columns: repeat(5, 1fr); gap: 4px;
+  display: grid; grid-template-columns: repeat(5, 1fr); gap: 6px;
 }
 .auto-preview-photo img,
 .auto-preview-photo .loading-thumb {
@@ -668,12 +686,21 @@ h1 { font-size: 0.95rem; font-weight: 700; line-height: 1.2; }
   text-align: center; padding: 12px; color: var(--error); font-size: .78rem;
 }
 
-/* ── Bot status bar ── */
-.ab-bot-status {
-  display: flex; align-items: center; gap: 10px;
-  background: #f0fdf4; border: 1.5px solid #22c55e;
+/* ── Active Bots overview card ── */
+.ab-active-bots {
+  display: flex; flex-direction: column; gap: 6px;
+  background: var(--surface); border: 1.5px solid #22c55e;
   border-radius: var(--radius); padding: 10px 13px;
   margin-bottom: 4px;
+}
+.ab-active-bots-hdr {
+  font-size: .78rem; font-weight: 700; color: #15803d;
+}
+
+/* ── Bot status row (inside Active Bots card) ── */
+.ab-bot-row {
+  display: flex; align-items: center; gap: 10px;
+  padding: 6px 0; border-top: 1px solid #dcfce7;
 }
 .ab-bot-dot {
   width: 10px; height: 10px; border-radius: 50%;
@@ -685,22 +712,23 @@ h1 { font-size: 0.95rem; font-weight: 700; line-height: 1.2; }
   0%,100% { box-shadow: 0 0 0 3px rgba(34,197,94,.25); }
   50%      { box-shadow: 0 0 0 6px rgba(34,197,94,.10); }
 }
-.ab-bot-status-info { flex: 1; min-width: 0; }
-.ab-bot-status-title { font-size: .78rem; font-weight: 700; color: #15803d; display: block; }
-.ab-bot-status-next  { font-size: .7rem;  color: #166534; }
-.ab-bot-status-progress { font-size: .72rem; font-weight: 600; color: #15803d; white-space: nowrap; }
+.ab-bot-row-info { flex: 1; min-width: 0; display: flex; flex-direction: column; }
+.ab-bot-row-title { font-size: .76rem; font-weight: 700; color: #15803d; }
+.ab-bot-row-next  { font-size: .68rem;  color: #166534; }
+.ab-bot-row-progress {
+  font-size: .68rem; font-weight: 700; color: #15803d; white-space: nowrap;
+  background: #dcfce7; border-radius: 10px; padding: 2px 8px;
+}
 
-/* ── Paused banner ── */
-.ab-paused-banner {
+/* ── Paused row (inside Active Bots card) ── */
+.ab-paused-row {
   display: flex; align-items: center; gap: 10px;
-  background: #fef2f2; border: 1.5px solid #ef4444;
-  border-radius: var(--radius); padding: 10px 13px;
-  margin-bottom: 4px;
+  padding: 6px 0; border-top: 1px solid #fee2e2;
 }
 .ab-paused-icon { font-size: 1.1rem; flex-shrink: 0; }
 .ab-paused-info { flex: 1; min-width: 0; display: flex; flex-direction: column; }
-.ab-paused-title  { font-size: .78rem; font-weight: 700; color: #b91c1c; }
-.ab-paused-reason { font-size: .7rem;  color: #991b1b; }
+.ab-paused-title  { font-size: .76rem; font-weight: 700; color: #b91c1c; }
+.ab-paused-reason { font-size: .68rem;  color: #991b1b; }
 .ab-paused-resume { flex-shrink: 0; font-size: .72rem; padding: 5px 10px; }
 
 /* ── Config collapse toggle header ── */
@@ -718,10 +746,79 @@ h1 { font-size: 0.95rem; font-weight: 700; line-height: 1.2; }
 
 #abConfigBody.collapsed { display: none; }
 
+/* ── Bot Configuration wrapper (top-level, contains subsections) ── */
+.bot-config-wrap {
+  display: flex; flex-direction: column; gap: 12px;
+}
+.bot-config-hdr {
+  background: var(--surface); border: 1.5px solid var(--accent);
+}
+.bot-config-hdr .ab-collapse-hdr-title { font-size: .85rem; }
+#abBotConfigBody {
+  display: flex; flex-direction: column; gap: 14px; padding-top: 2px;
+}
+#abBotConfigBody.collapsed { display: none; }
+
+/* ── Bot Configuration subsection (Singular Horeca Post / Region Round-Up Post) ── */
+.bot-subsection {
+  display: flex; flex-direction: column; gap: 14px;
+  border: 1px solid var(--border); border-radius: var(--radius);
+  padding: 10px; background: var(--surface);
+}
+.bot-subsection .ab-collapse-hdr { background: var(--bg); }
+.bot-subsection #mmConfigBody, .bot-subsection #mrConfigBody,
+.bot-subsection #abConfigBody, .bot-subsection #rrConfigBody { margin-top: 0; }
+
+/* ── Static (non-clickable) collapse-style header, used for the combined
+   Scheduling & Activation subsection ── */
+.ab-collapse-hdr--static { cursor: default; }
+.ab-collapse-hdr--static:hover { background: var(--bg); }
+
+/* ── Per-bot-type schedule group inside Scheduling & Activation ── */
+.ab-schedule-group {
+  display: flex; flex-direction: column; gap: 0;
+  border: 1px solid var(--border); border-radius: var(--radius);
+  padding: 0; background: var(--bg); overflow: hidden;
+}
+.ab-schedule-group-hdr { border: none; border-radius: 0; background: var(--surface); }
+.ab-schedule-body {
+  display: flex; flex-direction: column; gap: 14px;
+  padding: 10px;
+}
+.ab-schedule-body.collapsed { display: none; }
+
+/* ── Manual Post: search-mode toggle ── */
+.search-mode-toggle {
+  display: flex; gap: 8px; margin-bottom: 4px;
+}
+.search-mode-btn {
+  flex: 1; padding: 9px 10px; border-radius: var(--radius);
+  border: 1.5px solid var(--border); background: var(--bg);
+  color: var(--muted); font-size: .8rem; font-weight: 700;
+  cursor: pointer; transition: all .15s; text-align: center;
+}
+.search-mode-btn:hover { border-color: #aaa; color: var(--text); }
+.search-mode-btn.active {
+  background: var(--accent); border-color: var(--accent); color: #fff;
+}
+
+/* ── Manual Search panel: a bit more breathing room ── */
+.search-section { margin-top: 10px; padding-bottom: 6px; }
+.search-section .input-row { gap: 8px; }
+.search-section .input-row input { padding: 9px 11px; }
+
 /* ── Manual Post search filters (independent of Auto Bot config) ── */
 .mm-filters { display: flex; flex-direction: column; gap: 0; }
 #mmConfigBody { display: flex; flex-direction: column; gap: 14px; padding-top: 6px; margin-top: 8px; }
 #mmConfigBody.collapsed { display: none; }
+
+/* ── Manual "Region Roundup" (one-off Top N generate & post) ── */
+#mrConfigBody { display: flex; flex-direction: column; gap: 14px; padding-top: 6px; }
+#mrConfigBody.collapsed { display: none; }
+
+/* ── Auto Bot "Region Roundup" subsection ── */
+#rrConfigBody { display: flex; flex-direction: column; gap: 14px; padding-top: 6px; }
+#rrConfigBody.collapsed { display: none; }
 
 /* Schedule button active (Deactivate) */
 .btn--schedule.is-active {
@@ -790,10 +887,11 @@ h1 { font-size: 0.95rem; font-weight: 700; line-height: 1.2; }
   margin-top: 4px;
 }
 .ab-log-header {
-  display: flex; align-items: center; justify-content: space-between;
+  display: flex; align-items: center; justify-content: space-between; gap: 8px;
   padding: 9px 12px; border-bottom: 1px solid var(--border);
-  background: var(--bg);
+  background: var(--bg); cursor: pointer; user-select: none;
 }
+.ab-log-header:hover { background: #f0f0f0; }
 .ab-log-title { font-size: .78rem; font-weight: 700; color: var(--text); }
 
 /* Controls row (filter + reset) */
@@ -833,7 +931,8 @@ h1 { font-size: 0.95rem; font-weight: 700; line-height: 1.2; }
 .ab-filter-opt--active {
   color: var(--accent); font-weight: 700; background: #fff8f6;
 }
-.ab-log-items { padding: 4px 0; }
+.ab-log-items { padding: 4px 0; border-top: 1px solid var(--border); }
+.ab-log-items.collapsed { display: none; }
 .ab-log-item {
   display: flex; align-items: center; justify-content: space-between;
   padding: 7px 12px; border-bottom: 1px solid var(--border);
@@ -851,7 +950,6 @@ h1 { font-size: 0.95rem; font-weight: 700; line-height: 1.2; }
 .ab-log-total {
   display: flex; align-items: center; justify-content: space-between;
   padding: 8px 12px; background: var(--bg);
-  border-top: 1px solid var(--border);
   font-size: .75rem; color: var(--muted);
 }
 .ab-log-total-val {

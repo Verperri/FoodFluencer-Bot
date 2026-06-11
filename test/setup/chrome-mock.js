@@ -138,6 +138,7 @@ global.chrome = {
     onAlarm: listenerSet(),
     create: jest.fn(),
     clear: jest.fn(),
+    getAll: jest.fn(() => Promise.resolve([])),
   },
   storage: {
     local: {
