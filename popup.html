@@ -466,6 +466,14 @@
         <button class="btn-settings" id="settingsBtnAuto" title="Settings">⚙</button>
       </div>
 
+      <!-- ── Quick navigation: jump to a section without hunting through collapsed menus ── -->
+      <div class="ab-quicknav" id="abQuickNav">
+        <button class="ab-quicknav-btn" data-target="abConfigToggle" data-body="abConfigBody" data-arrow="abConfigArrow">🍽️ Singular</button>
+        <button class="ab-quicknav-btn" data-target="rrConfigToggle" data-body="rrConfigBody" data-arrow="rrConfigArrow">🔝 Round-Up</button>
+        <button class="ab-quicknav-btn" data-target="abSchedulingHdr">⏰ Schedule</button>
+        <button class="ab-quicknav-btn" data-target="abActivityLog" data-body="abLogItems" data-arrow="abLogArrow">📊 Activity</button>
+      </div>
+
       <!-- ── Active Bots overview (visible only when ≥1 bot is active/paused) ── -->
       <div id="abActiveBotsWrap" class="ab-active-bots hidden">
         <div class="ab-active-bots-hdr">🟢 Active Bots</div>
@@ -512,6 +520,18 @@
       </div>
 
       <div class="autobot-body">
+
+        <!-- ── Combined schedule overview (all active bot types together) ── -->
+        <div id="combinedScheduleSection" class="ab-scheduled-section hidden">
+          <div class="ab-collapse-hdr" id="combinedSchedToggle">
+            <span class="ab-collapse-hdr-title">📅 All Scheduled Posts</span>
+            <span class="ab-sched-badge" id="combinedSchedCount">0</span>
+            <span class="ab-collapse-arrow" id="combinedSchedArrow">▼</span>
+          </div>
+          <div id="combinedSchedBody" class="ab-sched-body">
+            <!-- rendered by JS -->
+          </div>
+        </div>
 
         <!-- ── Bot Configuration wrapper ─────────────────────────── -->
         <div class="bot-config-wrap" id="abBotConfigWrap">
@@ -788,7 +808,7 @@
           <!-- ── Subsection: Scheduling & Activation (both bot types) ─ -->
           <div class="bot-subsection">
 
-            <div class="ab-collapse-hdr bot-config-hdr ab-collapse-hdr--static">
+            <div class="ab-collapse-hdr bot-config-hdr ab-collapse-hdr--static" id="abSchedulingHdr">
               <span class="ab-collapse-hdr-title">⏰ Scheduling &amp; Activation</span>
             </div>
             <p class="autobot-intro">Configure each bot type's schedule independently below, then activate. Both schedules run concurrently and their posts appear in the matching "Scheduled" section.</p>

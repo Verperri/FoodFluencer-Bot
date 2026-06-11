@@ -1321,23 +1321,26 @@ function restoreState(saved) {
 // ── Init ──────────────────────────────────────────────────────────────────────
 
 chrome.storage.local.get(
-  { googleApiKey: "", lastState: null, autoBotActive: false },
-  ({ googleApiKey, lastState, autoBotActive: botActive }) => {
+  { googleApiKey: "", lastState: null, autoBotActive: false, regionRoundupActive: false },
+  ({ googleApiKey, lastState, autoBotActive: botActive, regionRoundupActive: roundupActive }) => {
     API_KEY = googleApiKey;
 
-    if (botActive) {
-      // Bot is running — skip mode selector, go directly to Auto Bot panel
-      TechLog.info("NAV", "auto_navigate", { reason: "bot_active" });
+    if (botActive || roundupActive) {
+      // A bot is running — skip mode selector, go directly to Auto Bot panel
+      TechLog.info("NAV", "auto_navigate", { reason: botActive ? "bot_active" : "roundup_active" });
       showMode("auto");
       setTimeout(() => {
         loadAutoBotConfig();
+        loadRegionRoundupConfig();
         setTimeout(restoreBotActiveState, 80);
+        setTimeout(restoreRoundupActiveState, 80);
       }, 50);
     } else {
       showKeySetup(!API_KEY);
       checkUsageWarning();
-      loadAutoBotConfig();   // populate Auto Bot filter settings
-      loadManualConfig();    // populate independent Manual Post filter settings
+      loadAutoBotConfig();        // populate Auto Bot filter settings
+      loadRegionRoundupConfig();  // populate Region Round-Up filter settings
+      loadManualConfig();         // populate independent Manual Post filter settings
       if (API_KEY && lastState) restoreState(lastState);
     }
   }
@@ -3053,6 +3056,32 @@ document.getElementById("mmConfigToggle")?.addEventListener("click", () => {
   });
 });
 
+// ── Auto Bot quick navigation: expand the target section then scroll to it ───────
+document.querySelectorAll(".ab-quicknav-btn").forEach(btn => {
+  btn.addEventListener("click", () => {
+    // Make sure the Bot Configuration wrapper itself is expanded.
+    const wrapBody  = document.getElementById("abBotConfigBody");
+    const wrapArrow = document.getElementById("abBotConfigArrow");
+    if (wrapBody?.classList.contains("collapsed")) {
+      wrapBody.classList.remove("collapsed");
+      wrapArrow?.classList.remove("collapsed");
+    }
+
+    // Expand the section's own collapsible body, if it has one.
+    const bodyId  = btn.dataset.body;
+    const arrowId = btn.dataset.arrow;
+    if (bodyId) {
+      const body = document.getElementById(bodyId);
+      if (body?.classList.contains("collapsed")) {
+        body.classList.remove("collapsed");
+        document.getElementById(arrowId)?.classList.remove("collapsed");
+      }
+    }
+
+    document.getElementById(btn.dataset.target)?.scrollIntoView({ behavior: "smooth", block: "start" });
+  });
+});
+
 // ── Manual Post: Manual Search vs Bot Search toggle ──────────────────────────────
 const searchModeManualBtn = document.getElementById("searchModeManual");
 const searchModeBotBtn    = document.getElementById("searchModeBot");
@@ -3363,6 +3392,7 @@ function activateBot() {
 
   updateBotUI(true);
   renderScheduledPosts(schedule);
+  renderCombinedSchedule();
   refreshActivityLog();
   updateProgress(0, schedule.totalPosts);
   updateNextPostLabel(schedule);
@@ -3393,6 +3423,7 @@ function deactivateBot() {
   if (schedBody)  schedBody.innerHTML = "";
   if (schedBadge) schedBadge.textContent = "0";
   if (schedTitle) schedTitle.textContent = "📅 Scheduled Posts";
+  renderCombinedSchedule();
   // Refresh activity log from persistent store (unchanged)
   refreshActivityLog();
   AppLog.info("Auto Bot deactivated — schedule cleared, activity log preserved");
@@ -3549,6 +3580,7 @@ function renderScheduledPosts(schedule, runLog = []) {
 }
 
 function updateScheduledItemStatus(idx, status) {
+  updateCombinedScheduleItemStatus("singular", idx, status);
   const el = document.getElementById(`abSchedStatus-${idx}`);
   if (!el) return;
   el.textContent = SCHED_STATUS_LABELS[status] || status;
@@ -3734,6 +3766,7 @@ function restoreBotActiveState() {
       }
       if (autoBotPaused) showPausedBanner(autoBotPaused.reason);
       else hidePausedBanner();
+      renderCombinedSchedule();
     }
   );
 }
@@ -3765,10 +3798,10 @@ document.getElementById("btnAutoMode").addEventListener("click",   () => {
 document.getElementById("manualBackBtn").addEventListener("click", () => showMode("selector"));
 document.getElementById("autoBackBtn").addEventListener("click",   () => showMode("selector"));
 
-// Restore last mode on open — respect autoBotActive so it doesn't override auto-navigate
-chrome.storage.local.get({ lastMode: "selector", autoBotActive: false }, ({ lastMode, autoBotActive: botActive }) => {
-  // If bot is active, the main init already navigated to auto mode — don't override it
-  if (!botActive) showMode("selector");
+// Restore last mode on open — respect active bots so it doesn't override auto-navigate
+chrome.storage.local.get({ lastMode: "selector", autoBotActive: false, regionRoundupActive: false }, ({ lastMode, autoBotActive: botActive, regionRoundupActive: roundupActive }) => {
+  // If a bot is active, the main init already navigated to auto mode — don't override it
+  if (!botActive && !roundupActive) showMode("selector");
 });
 
 // ── Auto Bot UI logic ─────────────────────────────────────────────────────────
@@ -4147,8 +4180,8 @@ function saveRegionRoundupConfig() {
     minStars:   document.querySelector("#rrMinStars .ab-pill.active")?.dataset?.val || "4",
     language:   document.getElementById("rrLanguage")?.value || "nl",
     capRatings:     document.getElementById("rrCapRatings")?.checked     ?? true,
-    capReviewCount: document.getElementById("rrCapReviewCount")?.checked ?? false,
-    capHashtags:    document.getElementById("rrCapHashtags")?.checked    ?? true,
+    capReviewCount: document.getElementById("rrCapReviewCount")?.checked ?? true,
+    capHashtags:    document.getElementById("rrCapHashtags")?.checked    ?? false,
     freqNum:     document.getElementById("rrFreqNum")?.value    || "1",
     freqPeriod:  document.getElementById("rrFreqPeriod")?.value || "week",
     freqRandom:  document.getElementById("rrFreqRand")?.classList.contains("is-active") || false,
@@ -4170,7 +4203,7 @@ const RR_CONFIG_DEFAULTS = {
   type: "restaurant", country: "BE", region: "Antwerp",
   size: "5", ranking: "rating", minRatings: "100", minStars: "4",
   language: "nl", songGenre: "top100",
-  capRatings: true, capReviewCount: false, capHashtags: true, capSong: true,
+  capRatings: true, capReviewCount: true, capHashtags: false, capSong: true,
   freqNum: "1", freqPeriod: "week", freqRandom: false,
   fromH: "12", fromM: "00", fromAP: "PM", toH: "12", toM: "00", toAP: "PM",
   windowRandom: false, socialIG: true, socialFB: true, socialTT: false,
@@ -4467,6 +4500,7 @@ function activateRoundup() {
 
   updateRoundupUI(true);
   renderScheduledRoundupPosts(schedule);
+  renderCombinedSchedule();
   updateRoundupProgress(0, schedule.totalPosts);
   updateNextRoundupPostLabel(schedule);
   updateRoundupConfigSummary();
@@ -4493,6 +4527,7 @@ function deactivateRoundup() {
   if (schedBody)  schedBody.innerHTML = "";
   if (schedBadge) schedBadge.textContent = "0";
   if (schedTitle) schedTitle.textContent = "📅 Scheduled Posts";
+  renderCombinedSchedule();
   AppLog.info("Region Roundup deactivated — schedule cleared");
   TechLog.info("SCHEDULE", "roundup_deactivated", { scheduleCleared: true });
 }
@@ -4582,6 +4617,7 @@ function renderScheduledRoundupPosts(schedule, runLog = []) {
 }
 
 function updateScheduledRoundupItemStatus(idx, status) {
+  updateCombinedScheduleItemStatus("roundup", idx, status);
   const el = document.getElementById(`rrSchedStatus-${idx}`);
   if (!el) return;
   el.textContent = SCHED_STATUS_LABELS[status] || status;
@@ -4610,6 +4646,103 @@ function updateNextRoundupPostLabel(schedule) {
   } else {
     el.textContent = "All posts complete";
   }
+}
+
+// ══════════════════════════════════════════════════════════════════════════════
+// COMBINED SCHEDULE OVERVIEW — merges Singular Horeca + Region Round-Up posts
+// into one chronological list so both schedules can be reviewed at a glance.
+// ══════════════════════════════════════════════════════════════════════════════
+
+const COMBINED_SOURCE_LABELS = { singular: "🍽️ Singular", roundup: "🔝 Round-Up" };
+
+document.getElementById("combinedSchedToggle")?.addEventListener("click", () => {
+  const body  = document.getElementById("combinedSchedBody");
+  const arrow = document.getElementById("combinedSchedArrow");
+  if (!body) return;
+  const collapsed = body.classList.toggle("collapsed");
+  arrow?.classList.toggle("collapsed", collapsed);
+});
+
+function renderCombinedSchedule() {
+  const section = document.getElementById("combinedScheduleSection");
+  const body    = document.getElementById("combinedSchedBody");
+  const badge   = document.getElementById("combinedSchedCount");
+  if (!section || !body) return;
+
+  if (!autoBotActive && !regionRoundupActive) {
+    section.classList.add("hidden");
+    return;
+  }
+
+  chrome.storage.local.get(
+    { autoBotSchedule: null, autoBotRunLog: [], autoBotRoundupSchedule: null, regionRoundupRunLog: [] },
+    ({ autoBotSchedule, autoBotRunLog, autoBotRoundupSchedule, regionRoundupRunLog }) => {
+      const merged = [];
+
+      if (autoBotActive && autoBotSchedule?.posts?.length) {
+        autoBotSchedule.posts.forEach((post, idx) => {
+          const logStatus = autoBotRunLog.find(e => e.postIndex === idx)?.status;
+          merged.push({ ...post, idx, source: "singular", status: SCHED_STATUS_LABELS[logStatus] ? logStatus : "pending" });
+        });
+      }
+      if (regionRoundupActive && autoBotRoundupSchedule?.posts?.length) {
+        autoBotRoundupSchedule.posts.forEach((post, idx) => {
+          const logStatus = regionRoundupRunLog.find(e => e.postIndex === idx)?.status;
+          merged.push({ ...post, idx, source: "roundup", status: SCHED_STATUS_LABELS[logStatus] ? logStatus : "pending" });
+        });
+      }
+
+      section.classList.remove("hidden");
+      if (badge) badge.textContent = merged.length;
+
+      body.innerHTML = "";
+      if (!merged.length) {
+        body.innerHTML = `<div style="padding:12px;text-align:center;font-size:.75rem;color:var(--muted)">No upcoming posts scheduled</div>`;
+        return;
+      }
+
+      // Group by date, sorted chronologically (date, then time, then source)
+      const grouped = {};
+      merged.forEach(post => {
+        if (!grouped[post.date]) grouped[post.date] = [];
+        grouped[post.date].push(post);
+      });
+
+      Object.entries(grouped).sort(([a], [b]) => a.localeCompare(b)).forEach(([date, posts]) => {
+        posts.sort((a, b) => a.time.localeCompare(b.time));
+
+        const dayEl  = document.createElement("div");
+        dayEl.className = "ab-sched-day-group";
+        const dayObj = new Date(`${date}T00:00:00`);
+        const dayLbl = dayObj.toLocaleDateString("en-GB", { weekday: "long", day: "numeric", month: "short" });
+        dayEl.innerHTML = `<div class="ab-sched-day-label">${dayLbl}</div>`;
+
+        posts.forEach(post => {
+          const plat = post.platforms.map(p => ({ instagram: "📸 IG", facebook: "👥 FB", tiktok: "🎵 TT" }[p] || p)).join("  ");
+
+          const item = document.createElement("div");
+          item.className = "ab-sched-item";
+          item.id = `combinedSchedItem-${post.source}-${post.idx}`;
+          item.innerHTML = `
+            <span class="ab-sched-time">${escapeHtml(post.time)}</span>
+            <span class="ab-sched-source">${COMBINED_SOURCE_LABELS[post.source]}</span>
+            <span class="ab-sched-platforms">${escapeHtml(plat)}</span>
+            <span class="ab-sched-status ${post.status}" id="combinedSchedStatus-${post.source}-${post.idx}">
+              ${SCHED_STATUS_LABELS[post.status]}
+            </span>`;
+          dayEl.appendChild(item);
+        });
+        body.appendChild(dayEl);
+      });
+    }
+  );
+}
+
+function updateCombinedScheduleItemStatus(source, idx, status) {
+  const el = document.getElementById(`combinedSchedStatus-${source}-${idx}`);
+  if (!el) return;
+  el.textContent = SCHED_STATUS_LABELS[status] || status;
+  el.className   = `ab-sched-status ${status}`;
 }
 
 // ── Config summary (shown when config is collapsed) ───────────────────────────
@@ -4689,6 +4822,7 @@ function restoreRoundupActiveState() {
       }
       if (regionRoundupPaused) showRoundupPausedBanner(regionRoundupPaused.reason);
       else hideRoundupPausedBanner();
+      renderCombinedSchedule();
     }
   );
 }

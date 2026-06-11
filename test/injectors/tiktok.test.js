@@ -124,6 +124,21 @@ beforeEach(() => {
     }
     return true;
   });
+
+  // Simulates the background-side relay for requestBackground(). The CDP
+  // file-injection strategy isn't reachable in this jsdom environment (no
+  // chrome.debugger), so respond as background.js would if the debugger
+  // permission/attach failed — letting the injector fall through to its
+  // DataTransfer strategy, just as it would in a real browser without CDP.
+  document.addEventListener('__ffbot_event', (e) => {
+    const { requestId, type } = e.detail || {};
+    if (!requestId) return;
+    if (type === 'INJECT_FILE_CDP') {
+      document.dispatchEvent(new CustomEvent(`__ffbot_response_${requestId}`, {
+        detail: { ok: false, error: 'chrome.debugger unavailable in test environment' },
+      }));
+    }
+  });
 });
 afterEach(() => {
   jest.useRealTimers();
@@ -165,7 +180,7 @@ describe('TikTok injector — step 2 & 3: inject the video and confirm TikTok ac
     buildFixture();
 
     injectTikTok(photoDataUrls(1), 'caption', null, null, { restaurantName: 'Chez Test', autoPost: false });
-    await runTimersInSteps(20000);
+    await runTimersInSteps(25000);
 
     const input = document.querySelector('input[type="file"]');
     expect(input.files).toHaveLength(1);
