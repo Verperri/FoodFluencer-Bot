@@ -64,7 +64,17 @@ async function recordFailure(postIndex, platform, result) {
   return entry;
 }
 
-// Pauses the auto-bot: clears all pending alarms and stores the reason so the
+// Clears only the alarms belonging to one campaign (identified by its alarm
+// name prefix) — leaves the other campaign's alarms untouched. Each campaign
+// (single-spotlight "ffbot-auto-" vs region-roundup "ffbot-roundup-") runs on
+// its own independent schedule, so pausing/deactivating one must not wipe the
+// other's pending alarms.
+async function clearAlarmsByPrefix(prefix) {
+  const all = await chrome.alarms.getAll();
+  await Promise.all(all.filter(a => a.name.startsWith(prefix)).map(a => chrome.alarms.clear(a.name)));
+}
+
+// Pauses a campaign: clears its own pending alarms and stores the reason so the
 // popup can surface it and offer a "Resume" action once the user has dealt
 // with whatever needs manual attention.
 async function pauseAutoBot({ category, platform, postIndex }) {
@@ -73,11 +83,26 @@ async function pauseAutoBot({ category, platform, postIndex }) {
   await chrome.storage.local.set({
     autoBotPaused: { reason, category, platform, postIndex, ts: new Date().toISOString() },
   });
-  await chrome.alarms.clearAll();
+  await clearAlarmsByPrefix('ffbot-auto-');
   bgLog('error', `Auto Bot paused — ${reason}`);
   TechLog.error('POST', 'auto_bot_paused', { category, platform, postIndex, reason });
   TechLog._flush();
   chrome.runtime.sendMessage({ type: 'AUTO_BOT_PAUSED', reason, category, platform }).catch(() => {});
+}
+
+// Pauses the Region Roundup campaign — mirrors pauseAutoBot but only clears
+// "ffbot-roundup-" alarms, leaving the spotlight campaign's schedule intact.
+async function pauseRegionRoundup({ category, platform, postIndex }) {
+  const reason = (PAUSE_REASONS[category] || `${platform} reported an issue that needs manual attention.`)
+    .replace('{platform}', platform);
+  await chrome.storage.local.set({
+    regionRoundupPaused: { reason, category, platform, postIndex, ts: new Date().toISOString() },
+  });
+  await clearAlarmsByPrefix('ffbot-roundup-');
+  bgLog('error', `Region Roundup paused — ${reason}`);
+  TechLog.error('POST', 'roundup_paused', { category, platform, postIndex, reason });
+  TechLog._flush();
+  chrome.runtime.sendMessage({ type: 'ROUNDUP_PAUSED', reason, category, platform }).catch(() => {});
 }
 
 // ── First-install flag ────────────────────────────────────────────────────────
@@ -93,6 +118,34 @@ chrome.runtime.onInstalled.addListener((details) => {
 // Logs the trigger and notifies the popup. Actual posting will be added in V1.5.
 
 chrome.alarms.onAlarm.addListener((alarm) => {
+  if (alarm.name.startsWith("ffbot-roundup-")) {
+    const postIndex = parseInt(alarm.name.replace("ffbot-roundup-", ""), 10);
+
+    chrome.storage.local.get(["regionRoundupActive", "autoBotRoundupSchedule", "regionRoundupRunLog", "regionRoundupPaused"], (data) => {
+      if (!data.regionRoundupActive) return;
+      if (data.regionRoundupPaused) return;
+
+      const post = data.autoBotRoundupSchedule?.posts?.[postIndex];
+      if (!post) return;
+
+      const logEntry = {
+        id: `roundup-${Date.now()}`, ts: new Date().toISOString(),
+        postIndex, date: post.date, time: post.time, platforms: post.platforms,
+        status: "triggered",
+      };
+      const runLog = [...(data.regionRoundupRunLog || []), logEntry];
+      chrome.storage.local.set({ regionRoundupRunLog: runLog });
+
+      chrome.runtime.sendMessage({ type: "ROUNDUP_TRIGGERED", logEntry }).catch(() => {});
+      bgLog("info", `Region Roundup alarm triggered: post ${postIndex}`, {
+        date: post.date, time: post.time, platforms: post.platforms,
+      });
+
+      autoPostRoundupNow(postIndex);
+    });
+    return;
+  }
+
   if (!alarm.name.startsWith("ffbot-auto-")) return;
 
   const postIndex = parseInt(alarm.name.replace("ffbot-auto-", ""), 10);
@@ -364,6 +417,168 @@ async function searchAutoPlaceBG(config, apiKey) {
     userRatingCount:  0,
     photos:           [],
   };
+}
+
+// ── Region Roundup discovery waterfall ─────────────────────────────────────────
+// Like searchAutoPlaceBG, but instead of picking ONE random winner, returns the
+// top `config.size` candidates ranked by `config.ranking` ("rating" or
+// "reviews"), for a "Top N in <region>" roundup post. Same 3-source waterfall
+// + city fallback as the single-entity search.
+function _rankPlaces(places, ranking) {
+  const sorted = [...places];
+  if (ranking === "reviews") {
+    sorted.sort((a,b) => (b.userRatingCount||0) - (a.userRatingCount||0) || (b.rating||0) - (a.rating||0));
+  } else {
+    sorted.sort((a,b) => (b.rating||0) - (a.rating||0) || (b.userRatingCount||0) - (a.userRatingCount||0));
+  }
+  return sorted;
+}
+
+async function searchAutoPlacesCollectionBG(config, apiKey) {
+  const typeQ      = AB_TYPE_QUERY_BG[config.type] || "restaurant";
+  const country    = AB_COUNTRY_NAMES_BG[config.country] || "Belgium";
+  const isRandomRegion = !config.region || config.region === "__random__";
+  const city       = isRandomRegion ? pickRandomCity(config.country) : config.region;
+  const minStars   = parseFloat(config.minStars   || "4");
+  const minRatings = parseInt (config.minRatings  || "100", 10);
+  const size       = Math.max(1, parseInt(config.size || "5", 10));
+  const ranking    = config.ranking === "reviews" ? "reviews" : "rating";
+
+  bgLog('info', `RoundupSearch: looking for top ${size} ${typeQ}s in ${city}, ${country}`);
+  TechLog.info('SEARCH', 'roundup_search_start', { type: typeQ, city, country, size, ranking, source: 'scrape' });
+
+  // ── 1. Google Maps search HTML ─────────────────────────────────────────────
+  try {
+    const query = `${typeQ} in ${city} ${country}`;
+    const html  = await Promise.race([
+      fetch(`https://www.google.com/maps/search/${encodeURIComponent(query)}`,
+        { headers: { 'User-Agent': SCRAPE_UA, 'Accept-Language': 'en-US,en;q=0.9' } })
+        .then(r => { if (!r.ok) throw new Error(`HTTP ${r.status}`); return r.text(); }),
+      new Promise((_, rej) => setTimeout(() => rej(new Error('timeout')), 10000)),
+    ]);
+
+    const names     = [...html.matchAll(/"displayName":\{"text":"([^"]{3,80})"/g)].map(m => m[1]);
+    const addrs     = [...html.matchAll(/"formattedAddress":"([^"]{10,150})"/g)].map(m => m[1]);
+    const ratings   = [...html.matchAll(/"rating":([\d.]+)/g)].map(m => parseFloat(m[1]));
+    const revCounts = [...html.matchAll(/"userRatingCount":(\d+)/g)].map(m => parseInt(m[1], 10));
+
+    if (names.length) {
+      const candidates = names.map((name, i) => ({
+        displayName:      { text: name },
+        formattedAddress: addrs[i]     || `${city}, ${country}`,
+        rating:           ratings[i]   || 0,
+        userRatingCount:  revCounts[i] || 0,
+        photos: [],
+      }));
+      const filtered = candidates.filter(p => p.rating >= minStars && p.userRatingCount >= minRatings);
+      const pool     = filtered.length >= size ? filtered : candidates;
+      const top      = _rankPlaces(pool, ranking).slice(0, size);
+      bgLog('info', `RoundupSearch[Maps]: ${candidates.length} found, ${filtered.length} quality — picked top ${top.length}`);
+      TechLog.info('SEARCH', 'roundup_search_done', {
+        source: 'maps_scrape', total: candidates.length, quality: filtered.length, picked: top.length,
+      });
+      return { places: top, source: 'maps_scrape', region: city };
+    }
+    bgLog('warn', 'RoundupSearch[Maps]: no parseable businesses in HTML — trying Yelp');
+  } catch(e) {
+    bgLog('warn', `RoundupSearch[Maps] failed: ${e.message} — trying Yelp`);
+    TechLog.warn('SEARCH', 'roundup_search_error', { source: 'maps_scrape', error: e.message });
+  }
+
+  // ── 2. Yelp search page ────────────────────────────────────────────────────
+  try {
+    const html = await Promise.race([
+      fetch(
+        `https://www.yelp.com/search?find_desc=${encodeURIComponent(typeQ)}&find_loc=${encodeURIComponent(`${city}, ${country}`)}`,
+        { headers: { 'User-Agent': SCRAPE_UA, 'Accept-Language': 'en-US,en;q=0.9' } })
+        .then(r => { if (!r.ok) throw new Error(`HTTP ${r.status}`); return r.text(); }),
+      new Promise((_, rej) => setTimeout(() => rej(new Error('timeout')), 10000)),
+    ]);
+
+    if (/datadome|are you a robot/i.test(html)) throw new Error('DataDome block');
+
+    const slugs = [...new Set(
+      [...html.matchAll(/href="\/biz\/([a-z0-9][a-z0-9-]{3,60})(?:[?"#][^"]*)?"/g)].map(m => m[1])
+    )];
+
+    if (slugs.length) {
+      const toName = slug => slug
+        .replace(/-\d+$/, '')
+        .split('-')
+        .map(w => w.charAt(0).toUpperCase() + w.slice(1))
+        .join(' ');
+
+      const candidates = slugs.slice(0, Math.max(size, 12)).map(slug => ({
+        displayName:      { text: toName(slug) },
+        formattedAddress: `${city}, ${country}`,
+        rating:           0,
+        userRatingCount:  0,
+        photos:           [],
+      }));
+      const top = candidates.slice(0, size);
+      bgLog('info', `RoundupSearch[Yelp]: ${candidates.length} slugs — picked top ${top.length}`);
+      TechLog.info('SEARCH', 'roundup_search_done', {
+        source: 'yelp_scrape', total: candidates.length, picked: top.length,
+      });
+      return { places: top, source: 'yelp_scrape', region: city };
+    }
+    bgLog('warn', 'RoundupSearch[Yelp]: no slugs found');
+  } catch(e) {
+    bgLog('warn', `RoundupSearch[Yelp] failed: ${e.message}`);
+    TechLog.warn('SEARCH', 'roundup_search_error', { source: 'yelp_scrape', error: e.message });
+  }
+
+  // ── 3. Google Places API ──────────────────────────────────────────────────
+  if (apiKey) {
+    try {
+      bgLog('info', `RoundupSearch[Places API] fallback for ${typeQ} in ${city}`);
+      const bounds  = AB_BOUNDS_BG[config.country] || AB_BOUNDS_BG.BE;
+      const locPart = `${city}, ${country}`;
+      const res = await Promise.race([
+        fetch(AB_PLACES_SEARCH, {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            'X-Goog-Api-Key': apiKey,
+            'X-Goog-FieldMask': 'places.displayName,places.formattedAddress,places.rating,places.userRatingCount,places.photos',
+          },
+          body: JSON.stringify({
+            textQuery: `${typeQ} in ${locPart}`,
+            maxResultCount: 20,
+            minRating: minStars,
+            locationRestriction: { rectangle: bounds },
+          }),
+        }).then(r => { if (!r.ok) throw new Error(`HTTP ${r.status}`); return r.json(); }),
+        new Promise((_, rej) => setTimeout(() => rej(new Error('timeout')), 10000)),
+      ]);
+
+      if (res.places?.length) {
+        const filtered = res.places.filter(p => (p.userRatingCount || 0) >= minRatings);
+        const pool  = filtered.length >= size ? filtered : res.places;
+        const top   = _rankPlaces(pool, ranking).slice(0, size);
+        bgLog('info', `RoundupSearch[Places API]: ${res.places.length} found, ${filtered.length} quality — picked top ${top.length}`);
+        TechLog.info('SEARCH', 'roundup_search_done', {
+          source: 'places_api', total: res.places.length, quality: filtered.length, picked: top.length,
+        });
+        return { places: top, source: 'places_api', region: city };
+      }
+    } catch(e) {
+      bgLog('warn', `RoundupSearch[Places API] failed: ${e.message}`);
+      TechLog.warn('SEARCH', 'roundup_search_error', { source: 'places_api', error: e.message });
+    }
+  }
+
+  // ── 4. City fallback ───────────────────────────────────────────────────────
+  bgLog('warn', `RoundupSearch: all sources failed — using city fallback (${city})`);
+  TechLog.warn('SEARCH', 'roundup_search_fallback', { city, type: typeQ });
+  const fallback = Array.from({ length: size }, (_, i) => ({
+    displayName:      { text: `${typeQ} ${city} #${i+1}` },
+    formattedAddress: `${city}, ${country}`,
+    rating:           0,
+    userRatingCount:  0,
+    photos:           [],
+  }));
+  return { places: fallback, source: 'city_fallback', region: city };
 }
 
 async function resolvePhotoUriBG(photoName, maxWidth, apiKey) {
@@ -1426,6 +1641,68 @@ function getAutoCaptionBG(name, address, type, language, captionOpts, songInfo, 
   return parts.join("\n").trim();
 }
 
+// ── Region Roundup caption builder ─────────────────────────────────────────────
+// Builds a "Top N {type}s in {region}" caption with a numbered, ranked list of
+// entities (one cover photo each), optional ratings/review counts, an optional
+// song line, and region/type hashtags.
+const RR_TYPE_LABELS_BG = {
+  en: { restaurant: { s: "restaurant", p: "restaurants" }, hotel: { s: "hotel", p: "hotels" }, bar: { s: "bar", p: "bars" } },
+  nl: { restaurant: { s: "restaurant", p: "restaurants" }, hotel: { s: "hotel", p: "hotels" }, bar: { s: "bar", p: "bars" } },
+  fr: { restaurant: { s: "restaurant", p: "restaurants" }, hotel: { s: "hôtel", p: "hôtels" }, bar: { s: "bar", p: "bars" } },
+  de: { restaurant: { s: "Restaurant", p: "Restaurants" }, hotel: { s: "Hotel", p: "Hotels" }, bar: { s: "Bar", p: "Bars" } },
+};
+
+const RR_HEADER_TEMPLATES_BG = {
+  en: (n, p, region) => `🔝 Top ${n} ${p} in ${region}`,
+  nl: (n, p, region) => `🔝 Top ${n} ${p} in ${region}`,
+  fr: (n, p, region) => `🔝 Top ${n} ${p} à ${region}`,
+  de: (n, p, region) => `🔝 Top ${n} ${p} in ${region}`,
+};
+
+const RR_INTRO_TEMPLATES_BG = {
+  en: (region) => `Here's our pick of the best spots ${region} has to offer 👇`,
+  nl: (region) => `Dit zijn de beste plekjes die ${region} te bieden heeft 👇`,
+  fr: (region) => `Voici notre sélection des meilleures adresses à ${region} 👇`,
+  de: (region) => `Das sind die besten Adressen, die ${region} zu bieten hat 👇`,
+};
+
+function getAutoCaptionRoundupBG(places, type, region, language, captionOpts, songInfo) {
+  const lang   = RR_TYPE_LABELS_BG[language] ? language : "en";
+  const labels = RR_TYPE_LABELS_BG[lang][type] || RR_TYPE_LABELS_BG[lang].restaurant;
+  const n      = places.length;
+  const pLabel = n === 1 ? labels.s : labels.p;
+
+  const header = RR_HEADER_TEMPLATES_BG[lang](n, pLabel.charAt(0).toUpperCase() + pLabel.slice(1), region);
+  const intro  = RR_INTRO_TEMPLATES_BG[lang](region);
+
+  const list = places.map((place, i) => {
+    const name = place.displayName?.text || place.name || "";
+    let line = `${i + 1}. ${name}`;
+    const bits = [];
+    if (captionOpts.showRatings && place.rating) bits.push(`⭐${place.rating.toFixed(1)}`);
+    if (captionOpts.showReviewCount && place.userRatingCount) bits.push(`(${place.userRatingCount} reviews)`);
+    if (bits.length) line += ` — ${bits.join(" ")}`;
+    return line;
+  });
+
+  const parts = [header, "", intro, "", ...list];
+
+  if (captionOpts.song && songInfo) {
+    parts.push("");
+    parts.push(`🎵 ${songInfo.name} – ${songInfo.artist}`);
+  }
+
+  if (captionOpts.hashtags) {
+    const regionTag = region.replace(/[\s,]+/g, "");
+    const typeTag   = labels.s.charAt(0).toUpperCase() + labels.s.slice(1);
+    const extras    = pickExtraHashtags(2).map(h => `#${h}`).join(" ");
+    parts.push("");
+    parts.push(`#${regionTag} #${typeTag}s #TopList #FoodFluencer ${extras}`);
+  }
+
+  return parts.join("\n").trim();
+}
+
 // platforms param: pass explicitly from autoPostNow so we don't depend on
 // re-reading the schedule (which may have changed since the run started).
 async function updateRunLogStatus(postIndex, status, platforms = null) {
@@ -1463,6 +1740,45 @@ async function updateRunLogStatus(postIndex, status, platforms = null) {
   }
 
   chrome.runtime.sendMessage({ type:"AUTO_BOT_STATUS_UPDATE", postIndex, status }).catch(() => {});
+}
+
+// platforms param: pass explicitly from autoPostRoundupNow so we don't depend on
+// re-reading the schedule (which may have changed since the run started).
+async function updateRoundupRunLogStatus(postIndex, status, platforms = null) {
+  // 1. Update the per-schedule run log
+  const d = await chrome.storage.local.get({ regionRoundupRunLog:[], autoBotRoundupSchedule:null });
+  const log = d.regionRoundupRunLog;
+  const entry = log.find(e => e.postIndex === postIndex);
+  if (entry) entry.status = status; else log.push({ postIndex, status, ts:new Date().toISOString() });
+  await chrome.storage.local.set({ regionRoundupRunLog: log });
+
+  // 2. On completion, append to the persistent activityLog (survives deactivation)
+  if (status === "done") {
+    const resolvedPlatforms = platforms
+      || d.autoBotRoundupSchedule?.posts?.[postIndex]?.platforms
+      || [];
+
+    if (resolvedPlatforms.length) {
+      const newEntries = resolvedPlatforms.map(platform => ({
+        id:       `al-${Date.now()}-${platform}`,
+        ts:       new Date().toISOString(),
+        platform, postIndex, status: "done",
+        roundup:  true,
+      }));
+      const al = await chrome.storage.local.get({ activityLog:[] });
+      await chrome.storage.local.set({
+        activityLog: [...al.activityLog, ...newEntries].slice(-2000),
+      });
+      TechLog.info("LOG", "roundup_activity_log_written", { postIndex, platforms: resolvedPlatforms });
+      TechLog._flush();
+    } else {
+      TechLog.warn("LOG", "roundup_activity_log_skipped", { postIndex,
+        reason: "no platforms resolved — schedule may have been regenerated" });
+      TechLog._flush();
+    }
+  }
+
+  chrome.runtime.sendMessage({ type:"ROUNDUP_STATUS_UPDATE", postIndex, status }).catch(() => {});
 }
 
 // ── MV3 service-worker keepalive ──────────────────────────────────────────────
@@ -1634,6 +1950,166 @@ async function autoPostNow(postIndex) {
     TechLog._flush();
     bgLog("error", `Auto Bot post ${postIndex} failed`, err.message);
     await updateRunLogStatus(postIndex, "failed");
+  } finally {
+    stopKeepAlive();
+  }
+}
+
+// ── Region Roundup posting function ───────────────────────────────────────────
+async function autoPostRoundupNow(postIndex) {
+  const data = await chrome.storage.local.get(["regionRoundupActive","autoBotRoundupSchedule","regionRoundupConfig","regionRoundupPaused"]);
+  if (!data.regionRoundupActive) return;
+  if (data.regionRoundupPaused) return; // campaign is paused pending manual attention
+
+  const post   = data.autoBotRoundupSchedule?.posts?.[postIndex];
+  const config = data.regionRoundupConfig;
+  if (!post || !config) return;
+
+  const apiKey = await getApiKey();
+  const { foursquareApiKey = null } = await chrome.storage.local.get({ foursquareApiKey: null });
+
+  await updateRoundupRunLogStatus(postIndex, "triggered");
+
+  const runId    = `roundup-${postIndex}-${Date.now()}`;
+  const runStart = Date.now();
+  TechLog.info("POST", "run_start", { run_id: runId, run_type: "roundup", postIndex, platforms: post.platforms });
+
+  startKeepAlive();
+  try {
+    // 1 ── Find ranked entities ────────────────────────────────────────────────
+    const t_search = Date.now();
+    const configuredRegion = (config.region && config.region !== "__random__") ? config.region : "";
+    TechLog.info("SEARCH", "search_start", { run_id: runId, run_type: "roundup",
+      type: config.type, country: config.country, region: configuredRegion || "random", size: config.size, ranking: config.ranking });
+    bgLog("info", `Region Roundup post ${postIndex}: searching top ${config.size||"5"} ${config.type||"restaurant"}s in ${configuredRegion || "a random region"}…`);
+
+    const { places, source: searchSource, region } = await searchAutoPlacesCollectionBG(config, apiKey);
+    TechLog.info("SEARCH", "search_done", { run_id: runId, run_type: "roundup",
+      count: places.length, source: searchSource, duration_ms: Date.now()-t_search });
+    bgLog("info", `Region Roundup: found ${places.length} entities (source: ${searchSource})`);
+
+    if (places.length === 0) {
+      bgLog("warn", `Region Roundup post ${postIndex}: no entities found — skipping post`);
+      TechLog.warn("POST", "post_skipped_no_entities", { run_id: runId, postIndex, total_duration_ms: Date.now()-runStart });
+      TechLog._flush();
+      await updateRoundupRunLogStatus(postIndex, "failed", post.platforms);
+      return;
+    }
+
+    // 2 ── Resolve one cover photo per entity ─────────────────────────────────
+    const t_photos = Date.now();
+    TechLog.info("MEDIA", "photos_start", { run_id: runId, run_type: "roundup", count: places.length });
+
+    const photoDataUrls = [];
+    const keptPlaces    = [];
+    for (const place of places) {
+      const name      = place.displayName?.text || "";
+      const address   = place.formattedAddress  || "";
+      const allPhotos = (place.photos||[]).sort((a,b)=>(b.width||0)-(a.width||0));
+      const photoResult = await fetchPhotosWaterfall(name, address, config.type||"restaurant", 1, apiKey, allPhotos, foursquareApiKey);
+      if (photoResult.dataUrls.length > 0) {
+        photoDataUrls.push(photoResult.dataUrls[0]);
+        keptPlaces.push(place);
+      } else {
+        bgLog("warn", `Region Roundup: no photo found for "${name}" — dropping from list`);
+      }
+    }
+
+    if (photoDataUrls.length === 0) {
+      bgLog("warn", `Region Roundup post ${postIndex}: no photos found for any entity — skipping post`);
+      TechLog.warn("POST", "post_skipped_no_photos", { run_id: runId, postIndex, total_duration_ms: Date.now()-runStart });
+      TechLog._flush();
+      await updateRoundupRunLogStatus(postIndex, "failed", post.platforms);
+      return;
+    }
+
+    TechLog.info("MEDIA", "photos_done", { run_id: runId, run_type: "roundup",
+      photo_count: photoDataUrls.length, entity_count: keptPlaces.length, duration_ms: Date.now()-t_photos });
+
+    // 3 ── Pick a song ────────────────────────────────────────────────────────
+    const t_song = Date.now();
+    const songInfo = await getAutoSongBG(config.songGenre||"top100", config.country||"BE").catch(() => null);
+    TechLog.info("SONG", songInfo ? "song_found" : "song_skipped", { run_id: runId, run_type: "roundup",
+      song: songInfo?.name, artist: songInfo?.artist, duration_ms: Date.now()-t_song });
+
+    // 4 ── Build caption ──────────────────────────────────────────────────────
+    const captionOpts = {
+      showRatings:     config.capRatings ?? true,
+      showReviewCount: config.capReviewCount ?? false,
+      hashtags:        config.capHashtags ?? true,
+      song:            config.capSong ?? true,
+    };
+    const caption = getAutoCaptionRoundupBG(keptPlaces, config.type||"restaurant", region,
+                                             config.language||"nl", captionOpts, songInfo);
+    const header  = caption.split("\n")[0];
+    TechLog.info("CAPTION", "caption_built", { run_id: runId, run_type: "roundup",
+      language: config.language, length: caption.length });
+
+    // 5 ── Fetch audio for TikTok ─────────────────────────────────────────────
+    let tiktokAudioDataUrl = null;
+    if (post.platforms.includes("tiktok") && songInfo?.previewUrl) {
+      const t_audio = Date.now();
+      tiktokAudioDataUrl = await fetchAsDataUrl(songInfo.previewUrl).catch(e => {
+        TechLog.warn("MEDIA", "audio_fetch_failed", { run_id: runId, run_type: "roundup", error: e.message }); return null;
+      });
+      if (tiktokAudioDataUrl) TechLog.info("MEDIA", "audio_fetch_done", { run_id: runId, run_type: "roundup",
+        sizeKB: Math.round(tiktokAudioDataUrl.length*0.75/1024), duration_ms: Date.now()-t_audio });
+    }
+
+    // 6 ── Post to each platform ──────────────────────────────────────────────
+    let anyFailed = false, anyUnconfirmed = false;
+    for (const platform of post.platforms) {
+      const t_platform = Date.now();
+      TechLog.info("POST", "platform_start", { run_id: runId, run_type: "roundup",
+        platform, step: post.platforms.indexOf(platform)+1, total_platforms: post.platforms.length });
+      bgLog("info", `Region Roundup: posting to ${platform}…`);
+
+      const result = await handleSocialPost({
+        platform, photoDataUrls, caption,
+        songName:           songInfo?.name || "",
+        location:           region,
+        restaurantName:     header,
+        tiktokAudioDataUrl: platform === "tiktok" ? tiktokAudioDataUrl : null,
+        autoPost:           true,
+      });
+
+      if (result?.failed) {
+        anyFailed = true;
+        TechLog.error("POST", "platform_failed", { run_id: runId, run_type: "roundup",
+          platform, error: result.error, category: result.category, duration_ms: Date.now()-t_platform });
+        bgLog("error", `Region Roundup: ${platform} failed — ${result.error}`);
+        await recordFailure(postIndex, platform, result);
+        if (PAUSE_CATEGORIES.has(result.category)) {
+          await pauseRegionRoundup({ category: result.category, platform, postIndex });
+          break; // stop posting to further platforms — campaign is paused
+        }
+      } else if (result?.confirmed === false) {
+        anyUnconfirmed = true;
+        TechLog.warn("POST", "platform_unconfirmed", { run_id: runId, run_type: "roundup",
+          platform, duration_ms: Date.now()-t_platform });
+        bgLog("warn", `Region Roundup: ${platform} unconfirmed — no completion signal received`);
+      } else {
+        TechLog.info("POST", "platform_success", { run_id: runId, run_type: "roundup",
+          platform, duration_ms: Date.now()-t_platform });
+      }
+      if (post.platforms.indexOf(platform) < post.platforms.length - 1)
+        await sleep(4000);
+    }
+
+    const finalStatus       = anyFailed ? "failed" : (anyUnconfirmed ? "unconfirmed" : "done");
+    const total_duration_ms = Date.now()-runStart;
+    await updateRoundupRunLogStatus(postIndex, finalStatus, post.platforms);
+    TechLog.info("POST", "run_complete", { run_id: runId, run_type: "roundup",
+      postIndex, region, platforms: post.platforms, status: finalStatus, total_duration_ms });
+    TechLog._flush();
+    bgLog("info", `Region Roundup post ${postIndex} ${finalStatus} (${total_duration_ms}ms)`, { region });
+
+  } catch(err) {
+    TechLog.error("POST", "run_failed", { run_id: runId, run_type: "roundup",
+      postIndex, error: err.message, total_duration_ms: Date.now()-runStart });
+    TechLog._flush();
+    bgLog("error", `Region Roundup post ${postIndex} failed`, err.message);
+    await updateRoundupRunLogStatus(postIndex, "failed");
   } finally {
     stopKeepAlive();
   }
@@ -5027,6 +5503,7 @@ if (typeof module !== 'undefined' && module.exports) {
   module.exports = {
     injectFacebook, injectInstagram, injectTikTok, INJECTORS,
     sendTelemetry, getInstallId, TechLog, computeAppealMetrics, scoreImageQuality,
+    searchAutoPlacesCollectionBG, getAutoCaptionRoundupBG,
   };
 }
 
