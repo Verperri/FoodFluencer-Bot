@@ -686,6 +686,25 @@ h1 { font-size: 0.95rem; font-weight: 700; line-height: 1.2; }
   text-align: center; padding: 12px; color: var(--error); font-size: .78rem;
 }
 
+/* ── Auto Bot quick navigation (jump to a section) ── */
+.ab-quicknav {
+  display: flex; gap: 4px; flex-wrap: nowrap;
+  position: sticky; top: 0; z-index: 5;
+  background: var(--bg); padding: 6px 0; margin: -2px 0 2px;
+  border-bottom: 1px solid var(--border);
+}
+.ab-quicknav-btn {
+  flex: 1 1 0; min-width: 0; white-space: nowrap;
+  overflow: hidden; text-overflow: ellipsis;
+  background: var(--surface); border: 1.5px solid var(--border);
+  color: var(--text); border-radius: 20px; cursor: pointer;
+  font-size: .68rem; font-weight: 600; padding: 6px 4px;
+  text-align: center;
+  transition: all .15s;
+}
+.ab-quicknav-btn:hover { border-color: var(--accent); color: var(--accent); }
+.ab-quicknav-btn:active { transform: scale(.97); }
+
 /* ── Active Bots overview card ── */
 .ab-active-bots {
   display: flex; flex-direction: column; gap: 6px;
@@ -873,6 +892,13 @@ h1 { font-size: 0.95rem; font-weight: 700; line-height: 1.2; }
 .ab-sched-status.triggered{ background: #eff6ff; color: #1d4ed8; }
 .ab-sched-status.failed   { background: #fef2f2; color: #991b1b; }
 .ab-sched-status.unconfirmed { background: #fefce8; color: #a16207; }
+
+/* ── Source badge (combined schedule overview) ── */
+.ab-sched-source {
+  font-size: .65rem; font-weight: 700; white-space: nowrap;
+  background: var(--bg); border: 1px solid var(--border);
+  border-radius: 10px; padding: 2px 7px; color: var(--muted);
+}
 
 /* Activity log prominent mode */
 .ab-activity-log.prominent {

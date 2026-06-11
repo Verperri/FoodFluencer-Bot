@@ -2183,7 +2183,104 @@ function bgLog(level, message, data) {
 
 // ── Message router ────────────────────────────────────────────────────────────
 
+// Tracks the last time *any* TIKTOK_* progress signal was received per tab,
+// plus the most recent TIKTOK_STEP — used by handleSocialPost's stall
+// detector to tell "the injector is still working" from "nothing has
+// happened in N seconds" (the silent-hang failure mode), independent of
+// whether the page actually reloaded.
+const tiktokLastActivity = new Map(); // tabId -> timestamp
+const tiktokLastStep     = new Map(); // tabId -> { step, detail }
+
+// Temp files written to disk so chrome.debugger's CDP DOM.setFileInputFiles
+// (which requires a real filesystem path, not a Blob) can select them as a
+// "trusted" file input. Cleaned up once the post finishes (see cleanup() in
+// handleSocialPost) — kept until then in case the platform reads the file lazily.
+const cdpTempDownloads = new Map(); // tabId -> [downloadId, ...]
+function cleanupCdpTempDownloads(tabId) {
+  const ids = cdpTempDownloads.get(tabId);
+  if (!ids) return;
+  cdpTempDownloads.delete(tabId);
+  for (const id of ids) {
+    chrome.downloads.removeFile(id).catch(() => {});
+    chrome.downloads.erase({ id }).catch(() => {});
+  }
+}
+
+// CDP-based "trusted" file selection — used to work around platforms (e.g.
+// TikTok as of 2026-06-11) that silently reject synthetic DataTransfer
+// change/input events on input[type=file]. DOM.setFileInputFiles requires
+// an on-disk path, so the data URL is first written via chrome.downloads,
+// then attached via chrome.debugger to set it as a "trusted" selection.
+// Shared by the INJECT_FILE_CDP message handler (called from MAIN-world
+// injectors via requestBackground) and the silent diagnostic test, which
+// runs in background.js already and can call this directly.
+async function injectFileViaCDP(tabId, dataUrl, fileName, selector) {
+  let downloadId = null;
+  let attached = false;
+  try {
+    downloadId = await new Promise((resolve, reject) => {
+      chrome.downloads.download(
+        { url: dataUrl, filename: `ffbot-tmp/${fileName}`, conflictAction: "uniquify" },
+        id => chrome.runtime.lastError ? reject(new Error(chrome.runtime.lastError.message)) : resolve(id)
+      );
+    });
+
+    const filePath = await new Promise((resolve, reject) => {
+      let settled = false;
+      const onChanged = delta => {
+        if (settled || delta.id !== downloadId || !delta.state) return;
+        chrome.downloads.search({ id: downloadId }, items => finish(items[0]));
+      };
+      function finish(item) {
+        if (settled || !item) return;
+        if (item.state === 'complete' && item.filename) {
+          settled = true;
+          chrome.downloads.onChanged.removeListener(onChanged);
+          resolve(item.filename);
+        } else if (item.state === 'interrupted') {
+          settled = true;
+          chrome.downloads.onChanged.removeListener(onChanged);
+          reject(new Error('download interrupted: ' + (item.error || 'unknown')));
+        }
+      }
+      chrome.downloads.onChanged.addListener(onChanged);
+      chrome.downloads.search({ id: downloadId }, items => finish(items[0]));
+      setTimeout(() => {
+        if (settled) return;
+        settled = true;
+        chrome.downloads.onChanged.removeListener(onChanged);
+        reject(new Error('download timed out'));
+      }, 15000);
+    });
+
+    await chrome.debugger.attach({ tabId }, '1.3');
+    attached = true;
+    const { root } = await chrome.debugger.sendCommand({ tabId }, 'DOM.getDocument', { depth: -1, pierce: true });
+    const { nodeId } = await chrome.debugger.sendCommand({ tabId }, 'DOM.querySelector', { nodeId: root.nodeId, selector });
+    if (!nodeId) throw new Error(`selector not found in page: ${selector}`);
+    await chrome.debugger.sendCommand({ tabId }, 'DOM.setFileInputFiles', { files: [filePath], nodeId });
+
+    const list = cdpTempDownloads.get(tabId) || [];
+    list.push(downloadId);
+    cdpTempDownloads.set(tabId, list);
+
+    return { ok: true };
+  } catch (e) {
+    if (downloadId != null) {
+      chrome.downloads.removeFile(downloadId).catch(() => {});
+      chrome.downloads.erase({ id: downloadId }).catch(() => {});
+    }
+    return { ok: false, error: e.message };
+  } finally {
+    if (attached) chrome.debugger.detach({ tabId }).catch(() => {});
+  }
+}
+
 chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
+  if (typeof msg.type === 'string' && msg.type.startsWith('TIKTOK_') && _sender.tab?.id != null) {
+    tiktokLastActivity.set(_sender.tab.id, Date.now());
+    if (msg.type === 'TIKTOK_STEP') tiktokLastStep.set(_sender.tab.id, { step: msg.step, detail: msg.detail });
+  }
   if (msg.type === "TIKTOK_VIDEO_SPECS") {
     TechLog.info("POST", "tiktok_video_injected", { sizeMB: msg.sizeMB, mimeType: msg.mimeType, hasAudio: msg.hasAudio });
     return;
@@ -2234,6 +2331,15 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
       { url: msg.url, filename: msg.filename, conflictAction: "uniquify" },
       id => sendResponse({ id })
     );
+    return true;
+  }
+  // CDP-based "trusted" file selection — used to work around platforms (e.g.
+  // TikTok as of 2026-06-11) that silently reject synthetic DataTransfer
+  // change/input events on input[type=file]. See injectFileViaCDP() above.
+  if (msg.type === "INJECT_FILE_CDP") {
+    const tabId = _sender.tab?.id;
+    if (tabId == null) { sendResponse({ ok: false, error: 'no sender tab' }); return true; }
+    injectFileViaCDP(tabId, msg.dataUrl, msg.fileName, msg.selector).then(sendResponse);
     return true;
   }
   if (msg.type === "OPEN_SOCIAL") {
@@ -2830,13 +2936,15 @@ async function testSilentTikTok() {
   // Steps 9-11 — Caption/location fields and the Post button only appear AFTER a
   // video has been selected, so a static page check (like the one above) can never
   // find them. To genuinely test these, attach a tiny (~1 s, blank-frame) generated
-  // test clip — proving the upload mechanism really accepts a file — then check the
-  // screen it reveals. The Post button is located and verified, but NEVER clicked;
-  // the tab is destroyed at the end (see "Clean up"), abandoning the upload exactly
-  // as closing the browser mid-upload normally would — nothing is ever posted.
+  // test clip — using the SAME CDP-first/DataTransfer-fallback strategy as the real
+  // injectFileWithFallback() — proving the upload mechanism really accepts a file,
+  // then check the screen it reveals. The Post button is located and verified, but
+  // NEVER clicked; the tab is destroyed at the end (see "Clean up"), abandoning the
+  // upload exactly as closing the browser mid-upload normally would — nothing is
+  // ever posted.
   const uploadReady = after.hasFileInput && after.fileInputActive && after.dataTransferWorks;
-  let ttFlow = { videoAttached: false, captionFieldFound: false, locationFieldFound: false,
-    postBtnFound: false, postBtnEnabled: false, error: null };
+  let ttFlow = { videoAttached: false, injectMethod: null, captionFieldFound: false,
+    locationFieldFound: false, postBtnFound: false, postBtnEnabled: false, error: null };
   try {
     await pushStep({ step: 9, ts: ts(), label: 'Video upload…' });
 
@@ -2850,94 +2958,146 @@ async function testSilentTikTok() {
     await chrome.windows.update(winId, { state: 'minimized' });
     await new Promise(r => setTimeout(r, 300));
 
-    async function runFlow() {
+    // Generate a tiny blank test clip (~0.9 s) in the page, returned as a data URL
+    // so background.js can hand it to injectFileViaCDP (CDP requires an on-disk path).
+    async function genClip() {
       return chrome.scripting.executeScript({
-      target: { tabId }, world: 'MAIN',
-      args: [testCaption, testLocation],
-      func: async (caption, location) => {
-        // Jittered (±35%) so action pacing doesn't look machine-uniform
-        const sleep = ms => new Promise(r => setTimeout(r, Math.round(ms + (Math.random() * 2 - 1) * ms * 0.35)));
-        const out = { videoAttached: false, captionFieldFound: false, locationFieldFound: false,
-          postBtnFound: false, postBtnEnabled: false, error: null };
-        async function waitFor(fn, timeout=45000, interval=400) {
-          const t0 = Date.now();
-          while (Date.now()-t0 < timeout) { const v = fn(); if (v) return v; await sleep(interval); }
-          return null;
-        }
-        try {
-          // Generate a tiny blank test clip (~0.9 s) — real video data, nothing reused
-          const canvas = document.createElement('canvas');
-          canvas.width = 576; canvas.height = 1024;
-          const ctx = canvas.getContext('2d');
-          ctx.fillStyle = '#000'; ctx.fillRect(0, 0, canvas.width, canvas.height);
-          const stream = canvas.captureStream(15);
-          const mime = ['video/mp4;codecs=avc1', 'video/mp4', 'video/webm;codecs=vp9', 'video/webm']
-            .find(t => window.MediaRecorder && MediaRecorder.isTypeSupported(t)) || 'video/webm';
-          const rec = new MediaRecorder(stream, { mimeType: mime });
-          const chunks = [];
-          rec.ondataavailable = e => { if (e.data.size) chunks.push(e.data); };
-          const stopped = new Promise(res => rec.onstop = res);
-          rec.start();
-          await sleep(900);
-          rec.stop();
-          await stopped;
-          stream.getTracks().forEach(t => t.stop());
-          const blob = new Blob(chunks, { type: mime });
-          const ext  = mime.includes('mp4') ? 'mp4' : 'webm';
-          const file = new File([blob], `ffbot-diagnostic-test.${ext}`, { type: mime });
-
-          const fileInput = document.querySelector('input[type="file"]');
-          if (!fileInput) throw new Error('Upload input not found');
-          const dt = new DataTransfer();
-          dt.items.add(file);
-          // Bypass React's shadow value via the native setter, and fire both
-          // `change` AND `input` — same `setFilesOnInput` pattern as production.
-          const setter = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'files')?.set;
-          if (setter) setter.call(fileInput, dt.files); else fileInput.files = dt.files;
-          fileInput.dispatchEvent(new Event('change', { bubbles: true }));
-          fileInput.dispatchEvent(new Event('input',  { bubbles: true }));
-          out.videoAttached = true;
-
-          // Wait for TikTok to process the clip and reveal the caption/location/Post UI
-          const captionField = await waitFor(() => document.querySelector('.public-DraftEditor-content,[data-placeholder*="caption" i],[data-placeholder*="description" i]'));
-          if (captionField) {
-            out.captionFieldFound = true;
-            captionField.focus();
-            document.execCommand('insertText', false, caption);
-            captionField.dispatchEvent(new Event('input', { bubbles: true }));
-          }
-          const locationField = document.querySelector('[placeholder*="location" i],[aria-label*="location" i] input,input[name*="location" i]');
-          if (locationField) {
-            out.locationFieldFound = true;
-            locationField.focus();
-            locationField.value = location;
-            locationField.dispatchEvent(new Event('input', { bubbles: true }));
-          }
-
-          // Locate the Post button — verify it's visible & clickable, but NEVER click it.
-          // TikTok keeps it disabled until the clip finishes server-side processing,
-          // which can take well past the moment it first appears in the DOM — so
-          // poll for *enabled*, not just *present* (up to ~30s), before judging it.
-          function findPostBtn() {
-            return document.querySelector('[data-e2e="btn-post"]')
-                || document.querySelector('button[type="submit"]:not([disabled])')
-                || [...document.querySelectorAll('button,[role="button"]')].find(el => /^post$/i.test((el.innerText||'').trim()));
-          }
-          function isEnabled(btn) {
-            const style = window.getComputedStyle(btn);
-            return style.visibility !== 'hidden' && style.display !== 'none'
-              && btn.getAttribute('aria-disabled') !== 'true' && !btn.disabled;
-          }
-          const postBtn = await waitFor(findPostBtn, 10000);
-          if (postBtn) {
-            out.postBtnFound = true;
-            out.postBtnEnabled = isEnabled(postBtn)
-              || !!(await waitFor(() => { const b = findPostBtn(); return b && isEnabled(b) ? b : null; }, 30000, 500));
-          }
-        } catch(e) { out.error = e.message; }
-        return out;
-      },
+        target: { tabId }, world: 'MAIN',
+        func: async () => {
+          const sleep = ms => new Promise(r => setTimeout(r, ms));
+          try {
+            const canvas = document.createElement('canvas');
+            canvas.width = 576; canvas.height = 1024;
+            const ctx = canvas.getContext('2d');
+            ctx.fillStyle = '#000'; ctx.fillRect(0, 0, canvas.width, canvas.height);
+            const stream = canvas.captureStream(15);
+            const mime = ['video/mp4;codecs=avc1', 'video/mp4', 'video/webm;codecs=vp9', 'video/webm']
+              .find(t => window.MediaRecorder && MediaRecorder.isTypeSupported(t)) || 'video/webm';
+            const rec = new MediaRecorder(stream, { mimeType: mime });
+            const chunks = [];
+            rec.ondataavailable = e => { if (e.data.size) chunks.push(e.data); };
+            const stopped = new Promise(res => rec.onstop = res);
+            rec.start();
+            await sleep(900);
+            rec.stop();
+            await stopped;
+            stream.getTracks().forEach(t => t.stop());
+            const blob = new Blob(chunks, { type: mime });
+            const ext  = mime.includes('mp4') ? 'mp4' : 'webm';
+            const dataUrl = await new Promise((resolve, reject) => {
+              const reader = new FileReader();
+              reader.onload = () => resolve(reader.result);
+              reader.onerror = () => reject(reader.error || new Error('FileReader failed'));
+              reader.readAsDataURL(blob);
+            });
+            return { ok: true, dataUrl, mime, fileName: `ffbot-diagnostic-test.${ext}` };
+          } catch (e) { return { ok: false, error: e.message }; }
+        },
       });
+    }
+
+    // Inject the clip + verify acceptance + fill caption/location + check the Post
+    // button. Mirrors injectFileWithFallback()'s verify(): UI-acceptance signals
+    // (description box appears, or the upload input/zone is gone) plus a
+    // visible-error check — NOT input.files.length, which TikTok resets to 0 on
+    // success too. If `usedCdp` is false, falls back to the legacy DataTransfer
+    // technique using a File reconstructed from the data URL.
+    async function verifyAndFinish(usedCdp, dataUrl, mime, fileName, caption, location) {
+      return chrome.scripting.executeScript({
+        target: { tabId }, world: 'MAIN',
+        args: [usedCdp, dataUrl, mime, fileName, caption, location],
+        func: async (usedCdp, dataUrl, mime, fileName, caption, location) => {
+          const sleep = ms => new Promise(r => setTimeout(r, Math.round(ms + (Math.random() * 2 - 1) * ms * 0.35)));
+          const ERR_RE = /over.*\d+.?min|minute.*limit|size.*too.*large|too.*large.*file|size.*exceed|exceed.*size|not.*support.*format|unsupport|invalid.*file.*format|upload.*fail|failed.*upload/i;
+          const out = { videoAttached: false, injectMethod: usedCdp ? 'cdp' : null,
+            captionFieldFound: false, locationFieldFound: false,
+            postBtnFound: false, postBtnEnabled: false, error: null };
+          async function waitFor(fn, timeout=45000, interval=400) {
+            const t0 = Date.now();
+            while (Date.now()-t0 < timeout) { const v = fn(); if (v) return v; await sleep(interval); }
+            return null;
+          }
+          async function accepted() {
+            await sleep(2500);
+            const text = document.body.innerText || '';
+            if (ERR_RE.test(text)) return false;
+            if (document.querySelector('[class*="DraftEditor"],[data-placeholder*="description" i],[data-placeholder*="caption" i]')) return true;
+            return !document.querySelector('input[type="file"]');
+          }
+          try {
+            if (usedCdp) {
+              out.videoAttached = await accepted();
+              if (!out.videoAttached) out.injectMethod = null;
+            }
+            if (!out.videoAttached) {
+              const fileInput = document.querySelector('input[type="file"]');
+              if (!fileInput) throw new Error('Upload input not found');
+              const blob = await (await fetch(dataUrl)).blob();
+              const file = new File([blob], fileName, { type: mime });
+              const dt = new DataTransfer();
+              dt.items.add(file);
+              const setter = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'files')?.set;
+              if (setter) setter.call(fileInput, dt.files); else fileInput.files = dt.files;
+              fileInput.dispatchEvent(new Event('change', { bubbles: true }));
+              fileInput.dispatchEvent(new Event('input',  { bubbles: true }));
+              out.videoAttached = await accepted();
+              out.injectMethod = out.videoAttached ? 'datatransfer' : null;
+            }
+            if (!out.videoAttached) throw new Error(usedCdp
+              ? 'CDP injection succeeded but TikTok rejected the file (and DataTransfer fallback was also rejected)'
+              : 'TikTok rejected the file via both CDP and DataTransfer strategies');
+
+            // Wait for TikTok to process the clip and reveal the caption/location/Post UI
+            const captionField = await waitFor(() => document.querySelector('.public-DraftEditor-content,[data-placeholder*="caption" i],[data-placeholder*="description" i]'));
+            if (captionField) {
+              out.captionFieldFound = true;
+              captionField.focus();
+              document.execCommand('insertText', false, caption);
+              captionField.dispatchEvent(new Event('input', { bubbles: true }));
+            }
+            const locationField = document.querySelector('[placeholder*="location" i],[aria-label*="location" i] input,input[name*="location" i]');
+            if (locationField) {
+              out.locationFieldFound = true;
+              locationField.focus();
+              locationField.value = location;
+              locationField.dispatchEvent(new Event('input', { bubbles: true }));
+            }
+
+            // Locate the Post button — verify it's visible & clickable, but NEVER click it.
+            // TikTok keeps it disabled until the clip finishes server-side processing,
+            // which can take well past the moment it first appears in the DOM — so
+            // poll for *enabled*, not just *present* (up to ~30s), before judging it.
+            function findPostBtn() {
+              return document.querySelector('[data-e2e="btn-post"]')
+                  || document.querySelector('button[type="submit"]:not([disabled])')
+                  || [...document.querySelectorAll('button,[role="button"]')].find(el => /^post$/i.test((el.innerText||'').trim()));
+            }
+            function isEnabled(btn) {
+              const style = window.getComputedStyle(btn);
+              return style.visibility !== 'hidden' && style.display !== 'none'
+                && btn.getAttribute('aria-disabled') !== 'true' && !btn.disabled;
+            }
+            const postBtn = await waitFor(findPostBtn, 10000);
+            if (postBtn) {
+              out.postBtnFound = true;
+              out.postBtnEnabled = isEnabled(postBtn)
+                || !!(await waitFor(() => { const b = findPostBtn(); return b && isEnabled(b) ? b : null; }, 30000, 500));
+            }
+          } catch(e) { out.error = e.message; }
+          return out;
+        },
+      });
+    }
+
+    async function runFlow() {
+      const clipRes = await genClip();
+      const clip = clipRes[0]?.result;
+      if (!clip?.ok) return [{ result: { ...ttFlow, error: clip?.error || 'clip generation failed' } }];
+
+      // Strategy 1: chrome.debugger CDP DOM.setFileInputFiles (same primitive used
+      // by injectFileWithFallback / the INJECT_FILE_CDP message handler).
+      const cdpRes = await injectFileViaCDP(tabId, clip.dataUrl, clip.fileName, 'input[type="file"]');
+      return verifyAndFinish(cdpRes.ok, clip.dataUrl, clip.mime, clip.fileName, testCaption, testLocation);
     }
 
     let flowRes;
@@ -2959,11 +3119,13 @@ async function testSilentTikTok() {
     ttFlow = flowRes[0]?.result || ttFlow;
   } catch(e) {
     ttFlow.error = e.message;
+  } finally {
+    cleanupCdpTempDownloads(tabId);
   }
 
   await pushStep({ step: 9, ts: ts(), label: 'Video upload', detail: ttFlow.error && !ttFlow.videoAttached
       ? `Could not attach a test clip — ${ttFlow.error}`
-      : (ttFlow.videoAttached ? 'Test clip generated and accepted by the upload mechanism' : 'Upload could not be started'),
+      : (ttFlow.videoAttached ? `Test clip generated and accepted via ${ttFlow.injectMethod === 'cdp' ? 'CDP trusted file selection' : 'DataTransfer fallback'}` : 'Upload could not be started'),
     ok: ttFlow.videoAttached });
 
   await pushStep({ step: 10, ts: ts(), label: 'Caption & location',
@@ -2980,13 +3142,51 @@ async function testSilentTikTok() {
   // Step 12 — Verdict
   const verdict = after.loginRequired
     ? 'NOT READY — TikTok login required before silent posting'
+    : ttFlow.videoAttached
+    ? `FEASIBLE — file upload accepted via ${ttFlow.injectMethod === 'cdp' ? 'CDP trusted file selection' : 'DataTransfer fallback'}`
     : uploadReady
-    ? 'FEASIBLE — file input found & active after focus trick; DataTransfer works'
+    ? 'PARTIAL — file input found & active, but the test upload was rejected by both CDP and DataTransfer strategies'
     : after.hasFileInput
     ? 'PARTIAL — file input found but may need more init time (increase focus duration)'
     : 'UNCERTAIN — upload zone not found; page may still be loading or login required';
 
   await pushStep({ step: 12, ts: ts(), label: 'Final result', detail: verdict });
+
+  // Step 13 — Failsafe: reload/crash detection signal. handleSocialPost's
+  // stall detector resolves early if 45s pass with no TIKTOK_STEP activity;
+  // when it fires, it probes this same `__ffbotRelayActive` flag to tell a
+  // full page reload/crash (flag gone — fresh isolated-world context) apart
+  // from a silent in-page hang (flag still present). This step confirms the
+  // flag does correctly disappear after a real reload.
+  await pushStep({ step: 13, ts: ts(), label: 'Reload-detection failsafe…' });
+  let failsafe = { relayActiveBefore: false, relayActiveAfter: true, error: null };
+  try {
+    await chrome.scripting.executeScript({
+      target: { tabId }, world: 'ISOLATED',
+      func: () => { window.__ffbotRelayActive = true; },
+    });
+    const before = await chrome.scripting.executeScript({
+      target: { tabId }, func: () => !!window.__ffbotRelayActive,
+    });
+    failsafe.relayActiveBefore = !!before[0]?.result;
+
+    await chrome.tabs.reload(tabId);
+    await waitForTabComplete(tabId, 15000);
+    await new Promise(r => setTimeout(r, 1000));
+
+    const after = await chrome.scripting.executeScript({
+      target: { tabId }, func: () => !!window.__ffbotRelayActive,
+    });
+    failsafe.relayActiveAfter = !!after[0]?.result;
+  } catch(e) {
+    failsafe.error = e.message;
+  }
+  const failsafeOk = failsafe.relayActiveBefore && !failsafe.relayActiveAfter;
+  await pushStep({ step: 13, ts: ts(), label: 'Reload-detection failsafe',
+    detail: failsafe.error ? `Could not run check — ${failsafe.error}`
+      : failsafeOk ? 'Page reload correctly clears the relay flag — context-loss detection will trigger as expected'
+      : 'Relay flag still present after reload — context-loss detection may not trigger',
+    ok: failsafeOk });
 
   // Clean up
   chrome.tabs.remove(tabId).catch(() => {});
@@ -3079,8 +3279,19 @@ async function handleSocialPost(opts, _attempt = 1) {
           chrome.runtime.sendMessage({ type:'PLATFORM_POST_COMPLETE', ...(e.detail||{}) }));
         document.addEventListener('__ffbot_failed', e =>
           chrome.runtime.sendMessage({ type:'PLATFORM_POST_FAILED',   ...(e.detail||{}) }));
-        document.addEventListener('__ffbot_event', e =>
-          chrome.runtime.sendMessage(e.detail || {}));
+        // Generic MAIN-world -> background request/response bridge: if the
+        // event detail carries a requestId, the background's response is
+        // relayed back as a custom event the MAIN-world script can await.
+        document.addEventListener('__ffbot_event', e => {
+          const detail = e.detail || {};
+          if (detail.requestId) {
+            chrome.runtime.sendMessage(detail, response => {
+              document.dispatchEvent(new CustomEvent('__ffbot_response_' + detail.requestId, { detail: response }));
+            });
+          } else {
+            chrome.runtime.sendMessage(detail);
+          }
+        });
       },
       world: "ISOLATED",
     });
@@ -3134,9 +3345,41 @@ async function handleSocialPost(opts, _attempt = 1) {
     // TikTok gets a longer window: video encode + upload can far exceed 60 s.
     if (autoPost) {
       const confirmTimeoutMs = platform === 'tiktok' ? 240000 : 90000;
+      // Failsafe: if TikTok's page reloads/crashes mid-post, the relay
+      // listeners (and the injector's MAIN-world execution) are silently
+      // destroyed — no PLATFORM_POST_COMPLETE/FAILED signal will ever arrive,
+      // so without this check we'd wait out the full 240s with zero
+      // diagnostic info (see tech_log_2026-06-11: silence after
+      // "find_post_button" for ~3min). A heartbeat probes the relay flag
+      // every 20s; loss of the flag (fresh isolated-world context = a full
+      // navigation/reload) resolves early as unconfirmed, with the cause
+      // logged for diagnosis.
+      const postStart = Date.now();
+      // Stall threshold: a healthy run logs a TIKTOK_STEP at least every few
+      // seconds. If 45s pass with zero TIKTOK_* activity (and no completion),
+      // the injector has either hung silently or its context was destroyed —
+      // either way waiting out the remaining timeout teaches us nothing.
+      const STALL_MS = 45000;
+      tiktokLastActivity.set(tab.id, postStart);
+      tiktokLastStep.delete(tab.id);
+      let heartbeatTimer = null;
       const result = await new Promise(resolve => {
         const timeout = setTimeout(() => { cleanup(); resolve({ failed: false, confirmed: false }); }, confirmTimeoutMs);
-        function cleanup() { clearTimeout(timeout); chrome.runtime.onMessage.removeListener(listener); }
+        function cleanup() {
+          clearTimeout(timeout);
+          if (heartbeatTimer) clearInterval(heartbeatTimer);
+          chrome.runtime.onMessage.removeListener(listener);
+          chrome.tabs.onUpdated.removeListener(navListener);
+          tiktokLastActivity.delete(tab.id);
+          tiktokLastStep.delete(tab.id);
+          cleanupCdpTempDownloads(tab.id);
+        }
+        function navListener(tabId, info) {
+          if (tabId !== tab.id || info.status !== 'loading') return;
+          TechLog.warn('POST', 'tiktok_page_reloaded', { platform, winId, tabId: tab.id, elapsedMs: Date.now() - postStart });
+          TechLog._flush();
+          bgLog('warn', `${platform}: page reloaded/navigated mid-post — injected script context destroyed`);
+        }
         function listener(msg, sender) {
           if (sender.tab?.id !== tab.id) return;
           // TikTok signals "safe to minimise" once checkUpload succeeds:
@@ -3149,9 +3392,41 @@ async function handleSocialPost(opts, _attempt = 1) {
           if (msg.type === "PLATFORM_POST_FAILED")   { cleanup(); resolve({ failed: true, confirmed: false, error: msg.error, pageSnippet: msg.pageSnippet, url: msg.url }); }
         }
         chrome.runtime.onMessage.addListener(listener);
+        if (platform === 'tiktok') {
+          chrome.tabs.onUpdated.addListener(navListener);
+          heartbeatTimer = setInterval(async () => {
+            const lastActivity = tiktokLastActivity.get(tab.id) || postStart;
+            const idleMs = Date.now() - lastActivity;
+            if (idleMs < STALL_MS) return;
+
+            // Stalled — probe the relay flag to distinguish a full page
+            // reload/crash (flag gone, fresh isolated-world context) from a
+            // silent in-page hang (flag still present, injector just stopped
+            // making progress). Either way, bail out now with diagnostics
+            // instead of waiting out the rest of confirmTimeoutMs.
+            let relayActive = null;
+            try {
+              const r = await chrome.scripting.executeScript({ target: { tabId: tab.id }, func: () => !!window.__ffbotRelayActive });
+              relayActive = !!r[0]?.result;
+            } catch (e) {
+              relayActive = false; // tab gone entirely
+            }
+            const lastStep = tiktokLastStep.get(tab.id) || null;
+            TechLog.warn('POST', 'tiktok_progress_stalled', {
+              platform, winId, tabId: tab.id, elapsedMs: Date.now() - postStart, idleMs,
+              relayActive, lastStep: lastStep?.step || null, lastStepDetail: lastStep?.detail || null,
+            });
+            TechLog._flush();
+            bgLog('warn', `${platform}: no progress for ${(idleMs/1000).toFixed(0)}s (relayActive=${relayActive}, lastStep=${lastStep?.step || 'none'}) — resolving as unconfirmed early`);
+            cleanup();
+            resolve({ failed: false, confirmed: false, contextLost: true, stalled: true, lastStep: lastStep?.step || null });
+          }, 15000);
+        }
       });
       if (!result.failed && !result.confirmed)
-        bgLog('warn', `${platform}: no completion signal within ${confirmTimeoutMs/1000}s — post unconfirmed`);
+        bgLog('warn', result.contextLost
+          ? `${platform}: post stalled mid-run (last step: ${result.lastStep || 'none'}) — unconfirmed after ${((Date.now()-postStart)/1000).toFixed(0)}s (was ${confirmTimeoutMs/1000}s)`
+          : `${platform}: no completion signal within ${confirmTimeoutMs/1000}s — post unconfirmed`);
       // Close the whole window (not just the tab) so no minimised window lingers
       setTimeout(() => chrome.windows.remove(winId).catch(() => {}), 3000);
 
@@ -4919,11 +5194,90 @@ function injectTikTok(photoDataUrls, caption, songName, location, opts) {
   }
 
   // ── Inject file ───────────────────────────────────────────────────────────
+  // Legacy technique: synthetic DataTransfer + dispatched change/input events.
+  // As of 2026-06-11 TikTok silently clears input.files moments after this
+  // runs (isTrusted:false events are detected and rejected) — kept as a
+  // fallback strategy in case CDP injection is unavailable or TikTok reverts.
   function injectFile(input, file) {
     const dt = new DataTransfer(); dt.items.add(file);
     const setter = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'files')?.set;
     if (setter) setter.call(input, dt.files); else input.files = dt.files;
     ['change','input'].forEach(ev => input.dispatchEvent(new Event(ev, { bubbles: true })));
+  }
+
+  // ── MAIN-world -> background request/response bridge ────────────────────
+  // Dispatches an __ffbot_event with a requestId and awaits the matching
+  // __ffbot_response_<requestId> custom event (relayed via the ISOLATED-world
+  // ffbotRelay, which forwards to background.js and posts the response back).
+  function requestBackground(detail, timeoutMs = 20000) {
+    return new Promise(resolve => {
+      const requestId = `${Date.now()}_${Math.random().toString(36).slice(2)}`;
+      const responseEvent = '__ffbot_response_' + requestId;
+      const timer = setTimeout(() => {
+        document.removeEventListener(responseEvent, onResponse);
+        resolve({ ok: false, error: 'timeout waiting for background response' });
+      }, timeoutMs);
+      function onResponse(e) {
+        clearTimeout(timer);
+        document.removeEventListener(responseEvent, onResponse);
+        resolve(e.detail || { ok: false, error: 'empty response' });
+      }
+      document.addEventListener(responseEvent, onResponse);
+      document.dispatchEvent(new CustomEvent('__ffbot_event', { detail: { ...detail, requestId } }));
+    });
+  }
+
+  // ── File injection with fallback strategies ─────────────────────────────
+  // Tries each strategy in order, verifying TikTok actually accepted the
+  // file before proceeding. NOTE: checking input.files.length alone is NOT
+  // a reliable signal — a successful CDP injection also ends with
+  // input.files reset to 0 once TikTok consumes it and swaps the upload
+  // zone for the Details/caption editor. So "accepted" is instead detected
+  // via the same UI signals checkUpload() looks for (description box
+  // appears, or the upload zone/input is gone), with a visible-error check
+  // for genuine rejections. Falls through to the next strategy on failure,
+  // logging each attempt via TIKTOK_STEP for diagnostics.
+  async function injectFileWithFallback(input, file) {
+    async function verify() {
+      await sleep(2500);
+      const text = document.body.innerText || '';
+      if (ERR_RE.test(text)) return false;
+      if (document.querySelector('[class*="DraftEditor"],[data-placeholder*="description" i],[data-placeholder*="caption" i]')) return true;
+      if (!document.querySelector('input[type="file"]')) return true;
+      return input.files.length > 0;
+    }
+
+    // Strategy 1: chrome.debugger CDP DOM.setFileInputFiles — sets a
+    // "trusted" file selection via a real on-disk file, bypassing
+    // anti-automation checks on synthetic DataTransfer events.
+    step('inject_file_cdp_attempt');
+    try {
+      const dataUrl = await new Promise((resolve, reject) => {
+        const reader = new FileReader();
+        reader.onload = () => resolve(reader.result);
+        reader.onerror = () => reject(reader.error || new Error('FileReader failed'));
+        reader.readAsDataURL(file);
+      });
+      const response = await requestBackground({
+        type: 'INJECT_FILE_CDP', dataUrl, fileName: file.name, selector: 'input[type="file"]',
+      }, 30000);
+      if (response.ok) {
+        if (await verify()) { step('inject_file_cdp_ok'); return 'cdp'; }
+        step('inject_file_cdp_not_retained', 'files cleared after CDP injection');
+      } else {
+        step('inject_file_cdp_failed', response.error || 'unknown error');
+      }
+    } catch (e) {
+      step('inject_file_cdp_error', e.message);
+    }
+
+    // Strategy 2: legacy synthetic DataTransfer — kept as a fallback.
+    step('inject_file_datatransfer_attempt');
+    injectFile(input, file);
+    if (await verify()) { step('inject_file_datatransfer_ok'); return 'datatransfer'; }
+    step('inject_file_datatransfer_not_retained', 'files cleared after DataTransfer injection');
+
+    return null;
   }
 
   // ── Upload detection — captures full error text for logging ──────────────
@@ -5009,7 +5363,14 @@ function injectTikTok(photoDataUrls, caption, songName, location, opts) {
     step('inject_file', `${sizeMB}MB ${videoFile.type}`);
     // Log video specs before injection so we have this in TechLog for debugging
     document.dispatchEvent(new CustomEvent('__ffbot_event', { detail:{ type:'TIKTOK_VIDEO_SPECS', sizeMB, mimeType:videoFile.type, hasAudio }}));
-    injectFile(fileInput, videoFile);
+    const injectMethod = await injectFileWithFallback(fileInput, videoFile);
+    if (!injectMethod) {
+      banner(2, '⚠️ TikTok rejected the file selection. Check the page for details.', 'warn');
+      step('inject_file_failed', 'all strategies exhausted');
+      document.dispatchEvent(new CustomEvent('__ffbot_failed', { detail:{ platform:'tiktok', error:'File injection rejected by all strategies', ...capturePageContext() }}));
+      return;
+    }
+    dbg(`File injected via ${injectMethod}`);
 
     // ── Step 3: Wait for TikTok to process ──────────────────────────────
     banner(3, 'Processing video…');

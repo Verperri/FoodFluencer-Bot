@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "FoodFluencer Bot",
-  "version": "3.0.0",
+  "version": "3.0.3",
   "description": "Find and export top restaurant photos in Belgium. Auto-post to Instagram, Facebook & TikTok.",
   "action": {
     "default_popup": "popup.html",
@@ -21,7 +21,8 @@
     "windows",
     "scripting",
     "clipboardWrite",
-    "alarms"
+    "alarms",
+    "debugger"
   ],
   "host_permissions": [
     "https://places.googleapis.com/*",
@@ -34,7 +35,8 @@
     "https://duckduckgo.com/*",
     "https://external-content.duckduckgo.com/*",
     "https://*.yelp.com/*",
-    "https://*.yelpcdn.com/*"
+    "https://*.yelpcdn.com/*",
+    "https://*.tripadvisor.com/*"
   ],
   "icons": {
     "16":  "icons/icon16.png",
