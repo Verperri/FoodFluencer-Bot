@@ -252,6 +252,88 @@ async function getApiKey() {
   return new Promise(res => chrome.storage.local.get({ googleApiKey:"" }, d => res(d.googleApiKey)));
 }
 
+// ── Foursquare / OpenStreetMap entity-discovery sources ─────────────────────
+// Slotted into the discovery waterfall between the free scrape sources and the
+// (quota-consuming) Google Places API — same priority order as the photo
+// waterfall's Foursquare/Google Places steps, and mirrors the manual-search
+// waterfall in popup.js (Google → Foursquare → OpenStreetMap).
+const FSQ_CATEGORY_BG = { restaurant: "13065", bar: "13003", hotel: "19014" };
+const OSM_TAG_BG = {
+  restaurant: '"amenity"="restaurant"',
+  bar:        '"amenity"~"^(bar|pub)$"',
+  hotel:      '"tourism"="hotel"',
+};
+
+// Returns candidates from Foursquare Places Search, rating rescaled from
+// FSQ's 0-10 scale to Google's 0-5 scale so existing minStars filters apply.
+async function fetchFoursquareCandidatesBG(type, city, country, foursquareApiKey) {
+  const category = FSQ_CATEGORY_BG[type] || FSQ_CATEGORY_BG.restaurant;
+  const near = `${city}, ${country}`;
+  const res = await Promise.race([
+    fetch(`https://api.foursquare.com/v3/places/search?near=${encodeURIComponent(near)}&categories=${category}&sort=RATING&limit=20`, {
+      headers: { Authorization: foursquareApiKey, Accept: 'application/json' },
+    }).then(r => { if (!r.ok) throw new Error(`HTTP ${r.status}`); return r.json(); }),
+    new Promise((_, rej) => setTimeout(() => rej(new Error('timeout')), 10000)),
+  ]);
+  const results = res.results || [];
+  return results.map(v => ({
+    displayName:      { text: v.name || "Unknown" },
+    formattedAddress: v.location?.formatted_address || `${city}, ${country}`,
+    rating:           typeof v.rating === "number" ? v.rating / 2 : 0,
+    userRatingCount:  v.stats?.total_ratings || 0,
+    photos:           [],
+    _fsq:             true,
+  }));
+}
+
+function formatOSMAddressBG(tags = {}, fallbackCity, country) {
+  const parts = [];
+  if (tags['addr:street']) {
+    parts.push(tags['addr:housenumber'] ? `${tags['addr:street']} ${tags['addr:housenumber']}` : tags['addr:street']);
+  }
+  const city = tags['addr:city'] || fallbackCity;
+  const cityLine = `${tags['addr:postcode'] || ''} ${city || ''}`.trim();
+  if (cityLine) parts.push(cityLine);
+  parts.push(country);
+  return parts.filter(Boolean).join(', ');
+}
+
+// Returns candidates via OpenStreetMap — geocodes the city with Nominatim,
+// then queries Overpass for nearby POIs of the right type. Free, keyless.
+// OSM has no ratings, so rating/userRatingCount are always 0.
+async function fetchOSMCandidatesBG(type, city, country) {
+  const geoRes = await Promise.race([
+    fetch(`https://nominatim.openstreetmap.org/search?q=${encodeURIComponent(`${city}, ${country}`)}&format=jsonv2&limit=1`,
+      { headers: { Accept: 'application/json' } })
+      .then(r => { if (!r.ok) throw new Error(`HTTP ${r.status}`); return r.json(); }),
+    new Promise((_, rej) => setTimeout(() => rej(new Error('timeout')), 10000)),
+  ]);
+  const geo = geoRes[0];
+  if (!geo) return [];
+
+  const tag = OSM_TAG_BG[type] || OSM_TAG_BG.restaurant;
+  const query = `[out:json][timeout:25];nwr[${tag}](around:5000,${geo.lat},${geo.lon});out center 50;`;
+  const data = await Promise.race([
+    fetch('https://overpass-api.de/api/interpreter', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+      body: 'data=' + encodeURIComponent(query),
+    }).then(r => { if (!r.ok) throw new Error(`HTTP ${r.status}`); return r.json(); }),
+    new Promise((_, rej) => setTimeout(() => rej(new Error('timeout')), 20000)),
+  ]);
+
+  return (data.elements || [])
+    .filter(e => e.tags?.name)
+    .map(e => ({
+      displayName:      { text: e.tags.name },
+      formattedAddress: formatOSMAddressBG(e.tags, city, country),
+      rating:           0,
+      userRatingCount:  0,
+      photos:           [],
+      _osm:             true,
+    }));
+}
+
 // ── Business discovery waterfall ──────────────────────────────────────────────
 // Tries sources in priority order, stopping as soon as one yields a result.
 //
@@ -264,7 +346,7 @@ async function getApiKey() {
 //     delivers the richest structured data including photo references.
 //  4. City fallback             — always available; returns a synthetic place so
 //     the photo waterfall can still run and find real images.
-async function searchAutoPlaceBG(config, apiKey) {
+async function searchAutoPlaceBG(config, apiKey, foursquareApiKey) {
   const typeQ      = AB_TYPE_QUERY_BG[config.type] || "restaurant";
   const country    = AB_COUNTRY_NAMES_BG[config.country] || "Belgium";
   const city       = config.region || pickRandomCity(config.country);
@@ -360,6 +442,42 @@ async function searchAutoPlaceBG(config, apiKey) {
     TechLog.warn('SEARCH', 'auto_search_error', { source: 'yelp_scrape', error: e.message });
   }
 
+  // ── 2.5 Foursquare API ──────────────────────────────────────────────────────
+  if (foursquareApiKey) {
+    try {
+      const candidates = await fetchFoursquareCandidatesBG(typeQ, city, country, foursquareApiKey);
+      if (candidates.length) {
+        const filtered = candidates.filter(p => p.rating >= minStars && (p.userRatingCount || 0) >= minRatings);
+        const pool = filtered.length ? filtered : candidates;
+        const pick = pool[Math.floor(Math.random() * pool.length)];
+        bgLog('info', `AutoSearch[Foursquare]: ${candidates.length} found, ${filtered.length} quality — picked "${pick.displayName.text}"`);
+        TechLog.info('SEARCH', 'auto_search_done', {
+          source: 'foursquare', total: candidates.length, quality: filtered.length, picked: pick.displayName.text,
+        });
+        return pick;
+      }
+    } catch(e) {
+      bgLog('warn', `AutoSearch[Foursquare] failed: ${e.message}`);
+      TechLog.warn('SEARCH', 'auto_search_error', { source: 'foursquare', error: e.message });
+    }
+  }
+
+  // ── 2.8 OpenStreetMap ──────────────────────────────────────────────────────
+  try {
+    const candidates = await fetchOSMCandidatesBG(typeQ, city, country);
+    if (candidates.length) {
+      const pick = candidates[Math.floor(Math.random() * candidates.length)];
+      bgLog('info', `AutoSearch[OSM]: ${candidates.length} found — picked "${pick.displayName.text}"`);
+      TechLog.info('SEARCH', 'auto_search_done', {
+        source: 'openstreetmap', total: candidates.length, picked: pick.displayName.text,
+      });
+      return pick;
+    }
+  } catch(e) {
+    bgLog('warn', `AutoSearch[OSM] failed: ${e.message}`);
+    TechLog.warn('SEARCH', 'auto_search_error', { source: 'openstreetmap', error: e.message });
+  }
+
   // ── 3. Google Places API ──────────────────────────────────────────────────
   // Only attempted when an API key is configured. Skipped entirely otherwise
   // so no quota is consumed for users without a key.
@@ -434,7 +552,7 @@ function _rankPlaces(places, ranking) {
   return sorted;
 }
 
-async function searchAutoPlacesCollectionBG(config, apiKey) {
+async function searchAutoPlacesCollectionBG(config, apiKey, foursquareApiKey) {
   const typeQ      = AB_TYPE_QUERY_BG[config.type] || "restaurant";
   const country    = AB_COUNTRY_NAMES_BG[config.country] || "Belgium";
   const isRandomRegion = !config.region || config.region === "__random__";
@@ -526,6 +644,42 @@ async function searchAutoPlacesCollectionBG(config, apiKey) {
   } catch(e) {
     bgLog('warn', `RoundupSearch[Yelp] failed: ${e.message}`);
     TechLog.warn('SEARCH', 'roundup_search_error', { source: 'yelp_scrape', error: e.message });
+  }
+
+  // ── 2.5 Foursquare API ──────────────────────────────────────────────────────
+  if (foursquareApiKey) {
+    try {
+      const candidates = await fetchFoursquareCandidatesBG(typeQ, city, country, foursquareApiKey);
+      if (candidates.length) {
+        const filtered = candidates.filter(p => p.rating >= minStars && (p.userRatingCount || 0) >= minRatings);
+        const pool = filtered.length >= size ? filtered : candidates;
+        const top  = _rankPlaces(pool, ranking).slice(0, size);
+        bgLog('info', `RoundupSearch[Foursquare]: ${candidates.length} found, ${filtered.length} quality — picked top ${top.length}`);
+        TechLog.info('SEARCH', 'roundup_search_done', {
+          source: 'foursquare', total: candidates.length, quality: filtered.length, picked: top.length,
+        });
+        return { places: top, source: 'foursquare', region: city };
+      }
+    } catch(e) {
+      bgLog('warn', `RoundupSearch[Foursquare] failed: ${e.message}`);
+      TechLog.warn('SEARCH', 'roundup_search_error', { source: 'foursquare', error: e.message });
+    }
+  }
+
+  // ── 2.8 OpenStreetMap ──────────────────────────────────────────────────────
+  try {
+    const candidates = await fetchOSMCandidatesBG(typeQ, city, country);
+    if (candidates.length) {
+      const top = _rankPlaces(candidates, ranking).slice(0, size);
+      bgLog('info', `RoundupSearch[OSM]: ${candidates.length} found — picked top ${top.length}`);
+      TechLog.info('SEARCH', 'roundup_search_done', {
+        source: 'openstreetmap', total: candidates.length, picked: top.length,
+      });
+      return { places: top, source: 'openstreetmap', region: city };
+    }
+  } catch(e) {
+    bgLog('warn', `RoundupSearch[OSM] failed: ${e.message}`);
+    TechLog.warn('SEARCH', 'roundup_search_error', { source: 'openstreetmap', error: e.message });
   }
 
   // ── 3. Google Places API ──────────────────────────────────────────────────
@@ -627,6 +781,32 @@ async function fetchAsDataUrl(url, signal) {
   return `data:${blob.type || "image/jpeg"};base64,${btoa(parts.join(''))}`;
 }
 
+// Re-encode a data URL so its long side is at most `maxDim` px (JPEG q0.85).
+// Platforms render at ~1080px, so shipping 1920–2560px originals through
+// messaging, storage, and injection wastes 4-6× the bytes for no visible gain.
+// Never upscales; returns the input unchanged on any failure.
+const MAX_POST_DIM = 1280;
+async function downscaleDataUrl(dataUrl, maxDim = MAX_POST_DIM) {
+  try {
+    const blob = await fetch(dataUrl).then(r => r.blob());
+    const bmp  = await createImageBitmap(blob);
+    const scale = maxDim / Math.max(bmp.width, bmp.height);
+    if (scale >= 1) { bmp.close(); return dataUrl; }
+    const W = Math.round(bmp.width * scale), H = Math.round(bmp.height * scale);
+    const canvas = new OffscreenCanvas(W, H);
+    canvas.getContext('2d').drawImage(bmp, 0, 0, W, H);
+    bmp.close();
+    const out   = await canvas.convertToBlob({ type: 'image/jpeg', quality: 0.85 });
+    const bytes2 = new Uint8Array(await out.arrayBuffer());
+    const parts2 = [];
+    for (let i = 0; i < bytes2.length; i += 8192)
+      parts2.push(String.fromCharCode(...bytes2.slice(i, i + 8192)));
+    return `data:image/jpeg;base64,${btoa(parts2.join(''))}`;
+  } catch (_) {
+    return dataUrl;
+  }
+}
+
 // ═══════════════════════════════════════════════════════════════════════════════
 // Image Quality Scorer — canvas-based, zero-cost, runs in the service worker
 //
@@ -720,6 +900,39 @@ function computeAppealMetrics(data, gray, W, H) {
   return { colorfulness, warmth, centerFocus, appeal };
 }
 
+// ── Perceptual hash (8×8 average-hash over a square luminance grid) ──────────
+// Catches the same photo republished at a different size/compression (venue
+// site vs. Facebook vs. aggregators) — byte comparison can't. Returns a 64-char
+// binary string, or null for degenerate inputs (a hash of all-same bits would
+// "match" everything and wrongly reject the whole candidate pool).
+function computePhash(gray, size) {
+  const AH = 8;
+  const cellMeans = new Float64Array(AH * AH);
+  for (let cy = 0; cy < AH; cy++) {
+    // Integer cell bounds — size/AH may be fractional (e.g. 150/8), and a
+    // fractional array index reads `undefined`, poisoning the mean with NaN.
+    const y0 = Math.floor(cy * size / AH), y1 = Math.floor((cy + 1) * size / AH);
+    for (let cx = 0; cx < AH; cx++) {
+      const x0 = Math.floor(cx * size / AH), x1 = Math.floor((cx + 1) * size / AH);
+      let s = 0, n = 0;
+      for (let y = y0; y < y1; y++)
+        for (let x = x0; x < x1; x++) { s += gray[y * size + x]; n++; }
+      cellMeans[cy * AH + cx] = n ? s / n : 0;
+    }
+  }
+  const cellAvg = cellMeans.reduce((a, b) => a + b, 0) / cellMeans.length;
+  const phash = [...cellMeans].map(m => (m >= cellAvg ? '1' : '0')).join('');
+  if (!Number.isFinite(cellAvg) || !phash.includes('1') || !phash.includes('0')) return null;
+  return phash;
+}
+
+// Hamming distance between two equal-length binary phash strings.
+function phashDistance(a, b) {
+  let d = 0;
+  for (let i = 0; i < a.length; i++) if (a[i] !== b[i]) d++;
+  return d;
+}
+
 async function scoreImageQuality(dataUrl) {
   try {
     const SIZE = 150;
@@ -805,8 +1018,11 @@ async function scoreImageQuality(dataUrl) {
     const qualityScore = Math.min(50, blurScore * 0.15) + Math.min(50, contrast);
     const rankScore = qualityScore * 0.5 + appeal * 0.5;
 
+    // Perceptual hash for near-duplicate detection (see computePhash).
+    const phash = computePhash(gray, SIZE);
+
     return { blur: blurScore, brightness, contrast, saturation,
-             colorfulness, warmth, centerFocus, appeal, rankScore,
+             colorfulness, warmth, centerFocus, appeal, rankScore, phash,
              width: srcW, height: srcH,
              passed: reasons.length === 0, reasons };
   } catch (e) {
@@ -815,7 +1031,7 @@ async function scoreImageQuality(dataUrl) {
     bgLog('warn', `PhotoQuality: scoring error — letting photo through (${e.message})`);
     return { blur: 999, brightness: 128, contrast: 50, saturation: 50,
              colorfulness: 0, warmth: 0, centerFocus: 1, appeal: 50, rankScore: 50,
-             width: 0, height: 0, passed: true, reasons: [] };
+             phash: null, width: 0, height: 0, passed: true, reasons: [] };
   }
 }
 
@@ -831,7 +1047,7 @@ async function scoreImageQuality(dataUrl) {
 // ═══════════════════════════════════════════════════════════════════════════════
 
 const SCRAPE_UA  = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36';
-const CITY_FROM_ADDRESS_RE_BG = /\d{4}\s+([A-Za-zÀ-ÿ\s-]+),/;
+const CITY_FROM_ADDRESS_RE_BG = /\d{4}\s+([A-Za-zÀ-ÿ\s-]+?)(?:,|$)/;
 const SCRAPE_MIN = 3;   // minimum usable photos before accepting a source
 
 function raceTimeout(promise, ms) {
@@ -867,6 +1083,13 @@ async function scrapeGoogleMapsPhotos(businessName, city) {
     for (const m of html.matchAll(/https:\/\/lh3\.googleusercontent\.com\/gps-cs-s\/([A-Za-z0-9_\-]{20,})/g))
       urls.add(`https://lh3.googleusercontent.com/gps-cs-s/${m[1]}=s2048`);
 
+    // Pattern D: lh3-6.ggpht.com — newer CDN host Google has shifted photo
+    // serving to; same path/ID shapes as googleusercontent.com.
+    for (const m of html.matchAll(/https:\/\/lh[3-6]\.ggpht\.com\/p\/([A-Za-z0-9_\-]{20,})/g))
+      urls.add(`https://lh3.ggpht.com/p/${m[1]}=s2048`);
+    for (const m of html.matchAll(/https:\/\/lh[3-6]\.ggpht\.com\/gps-cs-s\/([A-Za-z0-9_\-]{20,})/g))
+      urls.add(`https://lh3.ggpht.com/gps-cs-s/${m[1]}=s2048`);
+
     const result = [...urls].slice(0, 12);
     bgLog('info', `PhotoScrape[GoogleMaps] found ${result.length} URLs`);
     TechLog.info('PHOTO', 'google_maps_scrape', { business: businessName, city, count: result.length });
@@ -883,53 +1106,88 @@ async function scrapeGoogleMapsPhotos(businessName, city) {
 // Filters out stock-photo sites and extreme aspect ratios.
 // Returns DDG proxy thumbnail URLs (external-content.duckduckgo.com) which
 // are always fetchable without additional CORS issues.
+// Raw DDG image search (vqd-token flow). Returns the parsed results array;
+// throws on any step failing. Shared by scrapeDDGPhotos and
+// scrapeVenueOwnedPhotos.
+async function ddgImageSearch(query) {
+  // Step 1: obtain vqd session token
+  const initRes = await fetch('https://duckduckgo.com/', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/x-www-form-urlencoded', 'User-Agent': SCRAPE_UA },
+    body: new URLSearchParams({ q: query }).toString(),
+  });
+  if (!initRes.ok) throw new Error(`vqd fetch HTTP ${initRes.status}`);
+  const initHtml = await initRes.text();
+
+  const vqd = (initHtml.match(/vqd=['"]?([\d-]+)['"]?/) || initHtml.match(/vqd=([\d-]+)/) || [])[1];
+  if (!vqd) throw new Error('vqd token not found');
+
+  // Step 2: image search endpoint
+  const params = new URLSearchParams({ q: query, o: 'json', l: 'us-en', vqd, f: ',,,,,', p: '-1', s: '0' });
+  const imgRes = await fetch(`https://duckduckgo.com/i.js?${params}`, {
+    headers: {
+      'User-Agent': SCRAPE_UA,
+      'Referer': 'https://duckduckgo.com/',
+      'Accept': 'application/json, text/javascript, */*; q=0.01',
+      'x-requested-with': 'XMLHttpRequest',
+    },
+  });
+  if (!imgRes.ok) throw new Error(`i.js HTTP ${imgRes.status}`);
+  return (await imgRes.json()).results || [];
+}
+
+// Wrap an image URL in DuckDuckGo's image proxy — already covered by
+// host_permissions, serves the original undownscaled file, and sidesteps
+// per-domain CORS/host-permission requirements for arbitrary image hosts.
+const ddgProxyUrl = u => `https://external-content.duckduckgo.com/iu/?u=${encodeURIComponent(u)}&f=1`;
+
 async function scrapeDDGPhotos(businessName, city, entityType) {
   const query = `"${businessName}" ${city} ${entityType} food interior atmosphere`;
   bgLog('info', 'PhotoScrape[DDG] start', { query });
   try {
-    // Step 1: obtain vqd session token
-    const initRes = await fetch('https://duckduckgo.com/', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/x-www-form-urlencoded', 'User-Agent': SCRAPE_UA },
-      body: new URLSearchParams({ q: query }).toString(),
-    });
-    if (!initRes.ok) throw new Error(`vqd fetch HTTP ${initRes.status}`);
-    const initHtml = await initRes.text();
-
-    const vqd = (initHtml.match(/vqd=['"]?([\d-]+)['"]?/) || initHtml.match(/vqd=([\d-]+)/) || [])[1];
-    if (!vqd) throw new Error('vqd token not found');
-
-    // Step 2: image search endpoint
-    const params = new URLSearchParams({ q: query, o: 'json', l: 'us-en', vqd, f: ',,,,,', p: '-1', s: '0' });
-    const imgRes = await fetch(`https://duckduckgo.com/i.js?${params}`, {
-      headers: {
-        'User-Agent': SCRAPE_UA,
-        'Referer': 'https://duckduckgo.com/',
-        'Accept': 'application/json, text/javascript, */*; q=0.01',
-        'x-requested-with': 'XMLHttpRequest',
-      },
-    });
-    if (!imgRes.ok) throw new Error(`i.js HTTP ${imgRes.status}`);
-    const data = await imgRes.json();
+    const results = await ddgImageSearch(query);
 
     const STOCK_RE = /shutterstock|getty|istock|alamy|dreamstime|depositphotos|fotolia|123rf|bigstock/i;
-    const filtered = (data.results || [])
-      .filter(r => r.width >= 800 && r.height >= 600)
-      .filter(r => !STOCK_RE.test(r.url || ''))
+    // Logos, menus, and map screenshots pass the technical quality gate but make
+    // poor post photos — drop them when the result metadata gives them away.
+    const JUNK_RE  = /\b(logo|menu|menukaart|plattegrond|map)\b/i;
+    const filtered = results
+      .filter(r => Math.min(r.width || 0, r.height || 0) >= MIN_SOURCE_DIM)
+      .filter(r => !STOCK_RE.test(`${r.url || ''} ${r.title || ''}`))
+      .filter(r => !JUNK_RE.test(r.title || ''))
       .filter(r => (r.width / r.height) < 3 && (r.height / r.width) < 3);
 
-    // Use DDG proxy thumbnail — always fetchable (external-content.duckduckgo.com
-    // is in host_permissions), avoids arbitrary-domain CORS.
-    // KNOWN LIMITATION: these proxy thumbnails are low-res (~200px), so they are
-    // now rejected by the MIN_SOURCE_DIM resolution gate in scoreImageQuality and
-    // contribute little — the waterfall falls through to the high-res Google Maps
-    // scrape (=s2048) and Google Places API (2048px). To restore DDG as a high-res
-    // source, switch to `r.image` and add `https://*/*` to host_permissions.
-    const urls = filtered.map(r => r.thumbnail || r.image).filter(Boolean).slice(0, 12);
+    // Relevance: DDG is a web-wide image search, so results are not guaranteed
+    // to show THIS venue. Count how many business-name words appear in the
+    // result's page URL + title; venue-confirmed results are fetched first.
+    // City tokens count too — they separate the right venue from same-named
+    // restaurants in other cities (chains, common Italian names, etc.).
+    const nameTokens = `${businessName} ${city}`.toLowerCase().split(/\s+/).filter(t => t.length >= 3);
+    const relevance = r => {
+      const hay = `${r.url || ''} ${r.title || ''}`.toLowerCase();
+      return nameTokens.filter(t => hay.includes(t)).length;
+    };
+    // Order: most name-token matches first, then larger source images first,
+    // so the pool fills with venue-confirmed, highest-resolution candidates.
+    filtered.sort((a, b) =>
+      (relevance(b) - relevance(a)) ||
+      ((b.width * b.height) - (a.width * a.height))
+    );
 
-    bgLog('info', `PhotoScrape[DDG] ${filtered.length} quality results from ${(data.results||[]).length} total`);
+    // Fetch the full-resolution `r.image` through DuckDuckGo's image proxy
+    // (external-content.duckduckgo.com/iu/?u=...), which is already covered by
+    // host_permissions and returns the original, undownscaled file — unlike
+    // `r.thumbnail` (served from tse*.mm.bing.net at ~200px, which always failed
+    // the MIN_SOURCE_DIM resolution gate).
+    const urls = filtered
+      .map(r => r.image)
+      .filter(Boolean)
+      .map(ddgProxyUrl)
+      .slice(0, 18);
+
+    bgLog('info', `PhotoScrape[DDG] ${filtered.length} quality results from ${results.length} total`);
     TechLog.info('PHOTO', 'ddg_scrape', {
-      business: businessName, city, total: (data.results||[]).length, filtered: filtered.length,
+      business: businessName, city, total: results.length, filtered: filtered.length,
     });
     return urls;
   } catch(e) {
@@ -937,6 +1195,95 @@ async function scrapeDDGPhotos(businessName, city, entityType) {
     TechLog.warn('PHOTO', 'ddg_scrape_error', { error: e.message });
     return [];
   }
+}
+
+// ── Source 1.5: venue-owned photos (website + Facebook page) ─────────────────
+// The most trustworthy keyless source: photos published by the venue itself.
+// Two channels, both using only already-permitted endpoints:
+//   a) OSM Nominatim `extratags` exposes the venue's own website → a DDG image
+//      search restricted to `site:<that domain>` returns the venue's own
+//      (typically professional, high-res) photos.
+//   b) A DDG image search restricted to `site:facebook.com` surfaces the
+//      venue's Facebook page photos via Bing's crawler cache
+//      (lookaside.fbsbx.com) at full resolution — no FB login required.
+// Results are venue-confirmed by construction (a) or filtered to require all
+// business-name tokens (b), so no further relevance ranking is needed.
+async function scrapeVenueOwnedPhotos(businessName, city) {
+  bgLog('info', 'PhotoScrape[VenueOwned] start', { businessName, city });
+  const urls = [];
+  const JUNK_RE = /\b(logo|menu|menukaart|plattegrond|map|icon|banner)\b/i;
+  const bigEnough = r => Math.min(r.width || 0, r.height || 0) >= MIN_SOURCE_DIM
+    && (r.width / r.height) < 3 && (r.height / r.width) < 3;
+
+  // The two channels are independent (different endpoints), so they run in
+  // parallel — venue-owned latency is the slower channel, not the sum.
+  let website = null;
+
+  // a) venue website via Nominatim extratags → site-restricted image search
+  const websiteChannel = (async () => {
+    try {
+      const nomRes = await fetch(
+        `https://nominatim.openstreetmap.org/search?q=${encodeURIComponent(`${businessName} ${city}`)}&format=jsonv2&extratags=1&limit=3`,
+        { headers: { Accept: 'application/json' } }
+      );
+      if (nomRes.ok) {
+        const places = await nomRes.json();
+        const tags = places.find(p => p.extratags?.website || p.extratags?.['contact:website'])?.extratags;
+        website = tags?.website || tags?.['contact:website'] || null;
+      }
+    } catch (e) {
+      bgLog('warn', `PhotoScrape[VenueOwned] Nominatim lookup failed: ${e.message}`);
+    }
+
+    if (!website) {
+      bgLog('info', 'PhotoScrape[VenueOwned] no website found in OSM tags');
+      return [];
+    }
+    try {
+      const domain = new URL(website).hostname.replace(/^www\./, '');
+      const results = await ddgImageSearch(`site:${domain}`);
+      const own = results
+        .filter(bigEnough)
+        .filter(r => !JUNK_RE.test(`${r.title || ''} ${r.image || ''}`))
+        .sort((a, b) => (b.width * b.height) - (a.width * a.height));
+      bgLog('info', `PhotoScrape[VenueOwned] website ${domain}: ${own.length} candidates`);
+      return own.map(r => r.image).filter(Boolean).map(ddgProxyUrl).slice(0, 10);
+    } catch (e) {
+      bgLog('warn', `PhotoScrape[VenueOwned] website search failed: ${e.message}`);
+      return [];
+    }
+  })();
+
+  // b) venue's Facebook page photos via Bing crawler cache
+  const facebookChannel = (async () => {
+    try {
+      const results = await ddgImageSearch(`site:facebook.com "${businessName}" ${city}`);
+      const nameTokens = businessName.toLowerCase().split(/\s+/).filter(t => t.length >= 3);
+      const fb = results
+        .filter(bigEnough)
+        .filter(r => !JUNK_RE.test(r.title || ''))
+        // Require every business-name token — FB hosts millions of food photos,
+        // so partial matches are too risky for a "venue-owned" source.
+        .filter(r => {
+          const hay = `${r.url || ''} ${r.title || ''}`.toLowerCase();
+          return nameTokens.every(t => hay.includes(t));
+        })
+        .sort((a, b) => (b.width * b.height) - (a.width * a.height));
+      bgLog('info', `PhotoScrape[VenueOwned] facebook: ${fb.length} candidates`);
+      return fb.map(r => r.image).filter(Boolean).map(ddgProxyUrl).slice(0, 10);
+    } catch (e) {
+      bgLog('warn', `PhotoScrape[VenueOwned] facebook search failed: ${e.message}`);
+      return [];
+    }
+  })();
+
+  const [siteUrls, fbUrls] = await Promise.all([websiteChannel, facebookChannel]);
+  urls.push(...siteUrls, ...fbUrls);
+
+  TechLog.info('PHOTO', 'venue_owned_scrape', {
+    business: businessName, city, website: website || null, count: urls.length,
+  });
+  return urls;
 }
 
 // ── Source 3: Yelp photo pages ────────────────────────────────────────────────
@@ -1122,52 +1469,88 @@ async function fetchFoursquarePhotos(businessName, city, apiKey) {
 // The `source` field in the return value reflects the first (primary) source
 // that contributed photos. When multiple sources are needed, `photoLog` records
 // the origin of every individual photo for full TechLog traceability.
-async function fetchPhotosWaterfall(businessName, address, entityType, minPics, apiKey, placePhotoObjects, foursquareApiKey = null) {
+// Scraped URL-list cache — re-searching the same venue (or topping up the
+// spare pool after dismissals) skips the Nominatim + DDG round-trips entirely.
+// URL lists only (a few KB); downloaded images are never cached here.
+const _scrapeCacheBG = new Map(); // "name|city" → { gm, vo, ddg, expiresAt }
+const SCRAPE_CACHE_TTL_MS = 10 * 60 * 1000;
+
+async function fetchPhotosWaterfall(businessName, address, entityType, minPics, apiKey, placePhotoObjects, foursquareApiKey = null, { poolExtra = 4, excludeUrls = [] } = {}) {
   const cityM = address.match(CITY_FROM_ADDRESS_RE_BG);
   const city  = (cityM?.[1] || address.split(',')[0] || '').trim();
   const target = Math.min(Math.max(minPics, SCRAPE_MIN), 5);
-  // Over-collect a small pool beyond `target` so the most engaging photos
-  // (highest rankScore — quality + content appeal) can be picked from a
-  // wider set rather than just the first `target` that pass the gate.
-  const poolTarget = Math.min(target + 2, 8);
+  // Over-collect a pool beyond `target` so (a) the most engaging photos
+  // (highest rankScore — quality + content appeal) can be picked from a wider
+  // set rather than just the first `target` that pass the gate, and (b) the
+  // surplus is returned as ranked spares so the popup can swap in a fresh photo
+  // when the user dismisses one. The top `target` go in the post; the rest are
+  // spares. `poolExtra` controls how many spares to aim for — the manual flow
+  // requests a deep pool (many dismiss-swaps), the Auto Bot a shallow one
+  // (nobody is there to dismiss photos mid-run).
+  const poolTarget = Math.min(target + poolExtra, 15);
 
   bgLog('info', `PhotoWaterfall start — "${businessName}" ${city}, target=${target}`);
   TechLog.info('PHOTO', 'waterfall_start', { businessName, city, entityType, target });
 
   // Shared accumulator — filled incrementally across sources.
   const collected = [];
+  // Candidate URLs the caller has already received in a previous run (used by
+  // the popup's spare-pool top-up) — skipped without downloading.
+  const excludeSet = new Set(excludeUrls);
 
   // Convert scraped URLs → quality-passing data URLs, contributing up to
   // `needed` photos into `collected`. Exhausts the full URL list before
   // giving up so that every candidate from a source is evaluated before
   // moving on. Quality failures are logged and skipped; the loop simply
   // continues to the next URL in the same source's pool.
-  async function collectFromUrls(urls, sourceName) {
+  async function collectFromUrls(urls, sourceName, { ignoreResolution = false } = {}) {
     const needed = poolTarget - collected.length;
     if (needed <= 0) return;
 
     let accepted = 0, rejected = 0;
-    for (const url of urls) {
-      if (collected.length >= poolTarget) break;
-      try {
-        const controller = new AbortController();
-        const timeoutId  = setTimeout(() => controller.abort(), 9000);
-        let dataUrl;
+    const pending = urls.filter(u => !excludeSet.has(u));
+    // Download in small parallel batches (image hosts are independent, so
+    // concurrency cuts wall-clock time several-fold), then score sequentially
+    // in source order so higher-priority candidates still claim pool slots
+    // first.
+    const CONCURRENCY = 5;
+    for (let i = 0; i < pending.length && collected.length < poolTarget; i += CONCURRENCY) {
+      const chunk = await Promise.all(pending.slice(i, i + CONCURRENCY).map(async url => {
         try {
-          dataUrl = await fetchAsDataUrl(url, controller.signal);
-        } finally {
-          clearTimeout(timeoutId);
-        }
+          const controller = new AbortController();
+          const timeoutId  = setTimeout(() => controller.abort(), 9000);
+          try {
+            return { url, dataUrl: await fetchAsDataUrl(url, controller.signal) };
+          } finally {
+            clearTimeout(timeoutId);
+          }
+        } catch (_) { return null; }
+      }));
 
+      for (const item of chunk) {
+      if (!item) continue;
+      if (collected.length >= poolTarget) break;
+      const { url, dataUrl } = item;
+      try {
         // ── Canvas-based quality gate ──────────────────────────────────────
         const quality = await scoreImageQuality(dataUrl);
-        if (!quality.passed) {
+
+        // Perceptual dedup: the same photo republished at a different size or
+        // compression (venue site vs. Facebook vs. aggregators) hashes within
+        // a few bits of the original — byte comparison can't catch that.
+        if (quality.phash && collected.some(p => p.phash && phashDistance(p.phash, quality.phash) <= 5)) {
+          bgLog('info', `PhotoQuality[${sourceName}]: ✗ near-duplicate of an already-collected photo — ${url.slice(0, 80)}`);
+          continue;
+        }
+        const reasons = ignoreResolution ? quality.reasons.filter(r => !r.startsWith('low resolution')) : quality.reasons;
+        const passed  = ignoreResolution ? reasons.length === 0 : quality.passed;
+        if (!passed) {
           rejected++;
-          bgLog('info', `PhotoQuality[${sourceName}]: ✗ ${url.slice(0, 80)} — ${quality.reasons.join(', ')}`);
+          bgLog('info', `PhotoQuality[${sourceName}]: ✗ ${url.slice(0, 80)} — ${reasons.join(', ')}`);
           TechLog.info('PHOTO', 'quality_rejected', {
             source: sourceName,
             url: url.slice(0, 120),
-            reasons: quality.reasons,
+            reasons,
             metrics: {
               width:      quality.width,
               height:     quality.height,
@@ -1183,8 +1566,13 @@ async function fetchPhotosWaterfall(businessName, address, entityType, minPics, 
         bgLog('info', `PhotoQuality[${sourceName}]: ✓ blur=${quality.blur.toFixed(0)} bright=${quality.brightness.toFixed(0)} contrast=${quality.contrast.toFixed(0)} sat=${quality.saturation.toFixed(1)}% appeal=${quality.appeal.toFixed(0)} (${collected.length + 1}/${poolTarget})`);
         // ──────────────────────────────────────────────────────────────────
 
+        // Ship at posting resolution (≤1280px long side) — platforms render at
+        // ~1080px, so the original's extra megabytes buy nothing downstream.
+        const postDataUrl = await downscaleDataUrl(dataUrl);
+
         collected.push({
-          dataUrl, sourceUrl: url, source: sourceName,
+          dataUrl: postDataUrl, sourceUrl: url, source: sourceName,
+          phash: quality.phash,
           width: quality.width, height: quality.height,
           blur: quality.blur, brightness: quality.brightness,
           contrast: quality.contrast, saturation: quality.saturation,
@@ -1193,6 +1581,7 @@ async function fetchPhotosWaterfall(businessName, address, entityType, minPics, 
           rankScore: quality.rankScore,
         });
       } catch(_) {}
+      }
     }
 
     if (accepted > 0) {
@@ -1205,15 +1594,47 @@ async function fetchPhotosWaterfall(businessName, address, entityType, minPics, 
     }
   }
 
-  // ── 1. Google Maps ─────────────────────────────────────────────────────────
-  const gmUrls = await raceTimeout(scrapeGoogleMapsPhotos(businessName, city), 10000);
+  // ── 1/1.5/2: Google Maps, venue-owned, DuckDuckGo ──────────────────────────
+  // The three primary scrapers only fetch URL *lists* (a few KB each), so they
+  // are kicked off in parallel — total scrape latency becomes the slowest of
+  // the three instead of their sum. Collection (the heavy image downloads)
+  // still runs in strict priority order: venue-confirmed photos claim pool
+  // slots before generic web-search results.
+  // A fresh cache entry skips the scrapes entirely — re-searches and the
+  // popup's dismiss-driven top-ups are then near-instant.
+  const cacheKey = `${businessName}|${city}`.toLowerCase();
+  const cachedScrape = _scrapeCacheBG.get(cacheKey);
+  let gmUrls, voUrls, ddgUrls;
+  if (cachedScrape && cachedScrape.expiresAt > Date.now()) {
+    bgLog('info', 'PhotoWaterfall: using cached scrape URL lists');
+    ({ gm: gmUrls, vo: voUrls, ddg: ddgUrls } = cachedScrape);
+  } else {
+    // Google Maps gets a short leash: its photo URLs are JS-loaded, so the
+    // static scrape almost always yields nothing — don't let a slow Google
+    // response hold up stage-1 collection.
+    [gmUrls, voUrls, ddgUrls] = await Promise.all([
+      raceTimeout(scrapeGoogleMapsPhotos(businessName, city), 4000),
+      raceTimeout(scrapeVenueOwnedPhotos(businessName, city), 20000),
+      raceTimeout(scrapeDDGPhotos(businessName, city, entityType), 14000),
+    ]);
+    _scrapeCacheBG.set(cacheKey, { gm: gmUrls, vo: voUrls, ddg: ddgUrls, expiresAt: Date.now() + SCRAPE_CACHE_TTL_MS });
+  }
+
+  // 1. Google Maps (highest-res when it works)
   if (gmUrls.length > 0) await collectFromUrls(gmUrls, 'google_maps');
 
-  // ── 2. DuckDuckGo — only if still short of pool ────────────────────────────
-  if (collected.length < poolTarget) {
+  // 1.5 Venue-owned (website + Facebook page) — most trustworthy keyless
+  // source: the venue's own published photos, discovered via OSM website tags
+  // and Bing's Facebook crawler cache. Collected before the generic web search
+  // so venue-confirmed shots fill the pool first.
+  if (collected.length < poolTarget && voUrls.length > 0) {
+    await collectFromUrls(voUrls, 'venue_owned');
+  }
+
+  // 2. DuckDuckGo — only if still short of pool
+  if (collected.length < poolTarget && ddgUrls.length > 0) {
     bgLog('info', `PhotoWaterfall: need ${poolTarget - collected.length} more — trying DuckDuckGo`);
-    const ddgUrls = await raceTimeout(scrapeDDGPhotos(businessName, city, entityType), 14000);
-    if (ddgUrls.length > 0) await collectFromUrls(ddgUrls, 'duckduckgo');
+    await collectFromUrls(ddgUrls, 'duckduckgo');
   }
 
   // ── 3. Yelp — only if still short of pool ──────────────────────────────────
@@ -1252,18 +1673,28 @@ async function fetchPhotosWaterfall(businessName, address, entityType, minPics, 
     }
   }
 
-  // ── Rank by content appeal & trim to target ───────────────────────────────
-  // The pool may hold up to `poolTarget` quality-passing photos; keep the
-  // `target` highest-rankScore ones (quality + content appeal blend) so the
-  // most engaging shots make it into the post.
-  let droppedForTelemetry = [];
+  // ── 4.5 DuckDuckGo (relaxed) — last resort if every source above produced
+  // nothing. DDG thumbnails are normally rejected for being under
+  // MIN_SOURCE_DIM, but a low-res real photo beats an empty post.
+  if (collected.length === 0 && ddgUrls.length > 0) {
+    bgLog('info', 'PhotoWaterfall: nothing passed quality yet — retrying DuckDuckGo thumbnails without the resolution gate');
+    await collectFromUrls(ddgUrls, 'duckduckgo_lowres', { ignoreResolution: true });
+  }
+
+  // ── Rank by content appeal, split into post photos + spares ────────────────
+  // The pool may hold up to `poolTarget` quality-passing photos. Rank the whole
+  // pool by rankScore (quality + content appeal blend), keep the top `target`
+  // for the post, and retain the remainder as ranked spares — the popup swaps
+  // one in (next-best first) when the user dismisses a photo, rather than
+  // leaving an empty slot.
+  let spares = [];
   if (collected.length > target) {
     collected.sort((a, b) => b.rankScore - a.rankScore);
-    droppedForTelemetry = collected.splice(target);
-    bgLog('info', `PhotoWaterfall: ranked pool of ${collected.length + droppedForTelemetry.length} — kept top ${target} by appeal`);
+    spares = collected.splice(target);
+    bgLog('info', `PhotoWaterfall: ranked pool of ${collected.length + spares.length} — top ${target} for post, ${spares.length} spare(s) for swaps`);
     TechLog.info('PHOTO', 'appeal_ranking', {
-      kept: collected.map(p => ({ source: p.source, rankScore: +p.rankScore.toFixed(1), appeal: +p.appeal.toFixed(1) })),
-      dropped: droppedForTelemetry.map(p => ({ source: p.source, rankScore: +p.rankScore.toFixed(1), appeal: +p.appeal.toFixed(1) })),
+      kept:  collected.map(p => ({ source: p.source, rankScore: +p.rankScore.toFixed(1), appeal: +p.appeal.toFixed(1) })),
+      spare: spares.map(p => ({ source: p.source, rankScore: +p.rankScore.toFixed(1), appeal: +p.appeal.toFixed(1) })),
     });
   }
 
@@ -1279,7 +1710,7 @@ async function fetchPhotosWaterfall(businessName, address, entityType, minPics, 
     sendTelemetry('feedback', {
       photos: [
         ...collected.map(p => ({ ...photoMetrics(p), kept: true })),
-        ...droppedForTelemetry.map(p => ({ ...photoMetrics(p), kept: false })),
+        ...spares.map(p => ({ ...photoMetrics(p), kept: false })),
       ],
     });
   }
@@ -1306,9 +1737,16 @@ async function fetchPhotosWaterfall(businessName, address, entityType, minPics, 
   });
 
   return {
-    dataUrls: collected.map(p => p.dataUrl),
-    source:   sourceLabel,
-    photoLog: collected,
+    dataUrls:      collected.map(p => p.dataUrl),
+    // Ranked spares (next-best first) — the post uses `dataUrls`; the popup
+    // appends these so dismissing a photo swaps in a fresh one. The Auto Bot
+    // ignores these fields and posts only `dataUrls`.
+    extraDataUrls: spares.map(p => p.dataUrl),
+    source:        sourceLabel,
+    photoLog:      collected,
+    // Full metrics for the spares too, so the popup can reuse waterfall scores
+    // (quality badges) without re-downloading and re-scoring every photo.
+    extraPhotoLog: spares,
   };
 }
 
@@ -1834,7 +2272,7 @@ async function autoPostNow(postIndex) {
       type: config.type, country: config.country, region: config.region || "all" });
     bgLog("info", `Auto Bot post ${postIndex}: searching for ${config.type||"restaurant"}…`);
 
-    const place   = await searchAutoPlaceBG(config, apiKey);
+    const place   = await searchAutoPlaceBG(config, apiKey, foursquareApiKey);
     const name    = place.displayName?.text || "";
     const address = place.formattedAddress  || "";
     TechLog.info("SEARCH", "search_done", { run_id: runId, run_type: "auto",
@@ -1983,7 +2421,7 @@ async function autoPostRoundupNow(postIndex) {
       type: config.type, country: config.country, region: configuredRegion || "random", size: config.size, ranking: config.ranking });
     bgLog("info", `Region Roundup post ${postIndex}: searching top ${config.size||"5"} ${config.type||"restaurant"}s in ${configuredRegion || "a random region"}…`);
 
-    const { places, source: searchSource, region } = await searchAutoPlacesCollectionBG(config, apiKey);
+    const { places, source: searchSource, region } = await searchAutoPlacesCollectionBG(config, apiKey, foursquareApiKey);
     TechLog.info("SEARCH", "search_done", { run_id: runId, run_type: "roundup",
       count: places.length, source: searchSource, duration_ms: Date.now()-t_search });
     bgLog("info", `Region Roundup: found ${places.length} entities (source: ${searchSource})`);
@@ -2376,6 +2814,27 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
   }
   if (msg.type === "GET_SILENT_RESULTS") {
     chrome.storage.local.get({ silentTestResults: {} }, d => sendResponse(d.silentTestResults));
+    return true;
+  }
+  // Used by manual search results that have no Places-API-style photos (e.g.
+  // OpenStreetMap fallback, or a Foursquare venue with no photos of its own).
+  // Runs the free scrape sources (Google Maps, DuckDuckGo, Yelp, TripAdvisor)
+  // and any configured Foursquare key — never touches the Google Places API.
+  if (msg.type === "FETCH_FREE_PHOTOS") {
+    (async () => {
+      const { foursquareApiKey = null } = await chrome.storage.local.get({ foursquareApiKey: null });
+      // Manual flow: request a deep spare pool (target + 10) — the user swaps
+      // photos via the grid's dismiss button, so plenty of ranked alternatives
+      // should be on hand. The Auto Bot keeps the default shallow pool.
+      // `excludeUrls`: candidate URLs already delivered in a previous run —
+      // set by the popup's spare-pool top-up so only fresh photos come back.
+      const result = await fetchPhotosWaterfall(
+        msg.businessName, msg.address, msg.entityType || "restaurant",
+        msg.minPics || 3, "", [], foursquareApiKey,
+        { poolExtra: 10, excludeUrls: msg.excludeUrls || [] }
+      );
+      sendResponse(result);
+    })();
     return true;
   }
 });
@@ -5875,6 +6334,7 @@ if (typeof module !== 'undefined' && module.exports) {
   module.exports = {
     injectFacebook, injectInstagram, injectTikTok, INJECTORS,
     sendTelemetry, getInstallId, TechLog, computeAppealMetrics, scoreImageQuality,
+    computePhash, phashDistance, downscaleDataUrl,
     searchAutoPlacesCollectionBG, getAutoCaptionRoundupBG,
   };
 }
