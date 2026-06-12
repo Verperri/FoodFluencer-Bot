@@ -29,7 +29,8 @@ function buildFeatureStatus(hasKey, hasFsqKey = false) {
     { label: 'Photo source 5 — Foursquare API',           on: hasFsqKey, note: hasFsqKey ? '' : ' — add Foursquare key to enable' },
     { label: 'Photo source 6 — Google Places API',        on: hasKey,    note: hasKey    ? '' : ' — add Google key to enable' },
     // Posting
-    { label: 'Automatic business discovery',  on: hasKey, note: hasKey ? '' : ' — requires Google key' },
+    { label: 'Manual business search',        on: true, note: (hasKey || hasFsqKey) ? '' : ' — using free OpenStreetMap fallback (add a key for better results)' },
+    { label: 'Random/automatic business discovery', on: true, note: (hasKey || hasFsqKey) ? '' : ' — using free OpenStreetMap fallback (no rating filters)' },
     { label: 'Scheduled auto-posting',        on: true },
     { label: 'Auto-retry on post failure',    on: true },
     // Captions
@@ -745,6 +746,10 @@ chrome.storage.local.get({ hasSeenOnboarding: false, googleApiKey: '', settingsR
 const PLACES_SEARCH = "https://places.googleapis.com/v1/places:searchText";
 const PLACES_PHOTO  = "https://places.googleapis.com/v1";
 const ITUNES_SEARCH = "https://itunes.apple.com/search";
+const FSQ_SEARCH    = "https://api.foursquare.com/v3/places/search";
+const FSQ_PHOTOS    = "https://api.foursquare.com/v3/places";
+const OSM_NOMINATIM = "https://nominatim.openstreetmap.org/search";
+const OSM_OVERPASS  = "https://overpass-api.de/api/interpreter";
 
 const COST_TEXT_SEARCH = 0.017;
 const COST_PHOTO       = 0.007;
@@ -878,6 +883,7 @@ const CITY_FROM_ADDRESS_RE = /\d{4}\s+([A-Za-zÀ-ÿ\s-]+),\s*(?:Belgium|France|G
 // ── State ─────────────────────────────────────────────────────────────────────
 
 let API_KEY           = "";
+let FSQ_API_KEY       = "";
 let currentRestaurant = null;
 const uriCache        = new Map(); // "photoName|maxWidth" → uri
 let selectedSong      = null;
@@ -1232,7 +1238,10 @@ function saveState() {
   chrome.storage.local.set({
     lastState: {
       restaurant:      currentRestaurant,
-      uriCacheEntries: [...uriCache.entries()],
+      // Data-URL photos are self-contained (the "name" IS the image), so
+      // caching their resolution is pure duplication — persisting them would
+      // double the multi-MB payload written on every save.
+      uriCacheEntries: [...uriCache.entries()].filter(([k]) => !k.startsWith("data:")),
       selectedSong,
       caption:         $("caption")?.value || "",
       activePlatforms: [...activePlatforms],
@@ -1321,9 +1330,10 @@ function restoreState(saved) {
 // ── Init ──────────────────────────────────────────────────────────────────────
 
 chrome.storage.local.get(
-  { googleApiKey: "", lastState: null, autoBotActive: false, regionRoundupActive: false },
-  ({ googleApiKey, lastState, autoBotActive: botActive, regionRoundupActive: roundupActive }) => {
-    API_KEY = googleApiKey;
+  { googleApiKey: "", foursquareApiKey: "", lastState: null, autoBotActive: false, regionRoundupActive: false, hasSeenOnboarding: false },
+  ({ googleApiKey, foursquareApiKey, lastState, autoBotActive: botActive, regionRoundupActive: roundupActive, hasSeenOnboarding }) => {
+    API_KEY     = googleApiKey;
+    FSQ_API_KEY = foursquareApiKey;
 
     if (botActive || roundupActive) {
       // A bot is running — skip mode selector, go directly to Auto Bot panel
@@ -1336,12 +1346,15 @@ chrome.storage.local.get(
         setTimeout(restoreRoundupActiveState, 80);
       }, 50);
     } else {
-      showKeySetup(!API_KEY);
+      // Only show the inline key-setup prompt on a truly first run. Once the
+      // user has been through onboarding (whether they added a key or skipped
+      // it via Foursquare/free fallback), don't interrupt every popup open.
+      showKeySetup(!API_KEY && !FSQ_API_KEY && !hasSeenOnboarding);
       checkUsageWarning();
       loadAutoBotConfig();        // populate Auto Bot filter settings
       loadRegionRoundupConfig();  // populate Region Round-Up filter settings
       loadManualConfig();         // populate independent Manual Post filter settings
-      if (API_KEY && lastState) restoreState(lastState);
+      if ((API_KEY || FSQ_API_KEY) && lastState) restoreState(lastState);
     }
   }
 );
@@ -1368,7 +1381,15 @@ $("saveKeyBtn").addEventListener("click", () => {
 document.getElementById('saveFsqKeyBtn')?.addEventListener('click', () => {
   const key = document.getElementById('fsqKeyInput')?.value.trim();
   if (!key) return;
-  chrome.storage.local.set({ foursquareApiKey: key });
+  chrome.storage.local.set({ foursquareApiKey: key }, () => {
+    FSQ_API_KEY = key;
+    showKeySetup(false);
+  });
+});
+
+document.getElementById('skipKeySetupBtn')?.addEventListener('click', () => {
+  chrome.storage.local.set({ hasSeenOnboarding: true });
+  showKeySetup(false);
 });
 
 // ── API usage tracking ────────────────────────────────────────────────────────
@@ -1418,7 +1439,17 @@ $("downloadLogBtn").addEventListener("click", () => {
 // Searches for places matching a free-text query, biased to the configured
 // country, and returns up to several candidates so the user can disambiguate
 // (e.g. "Hilton" -> several Hilton hotels in the area).
+// Waterfall: Google Places (if configured) → Foursquare (if configured) →
+// OpenStreetMap/Nominatim (always available, no key required). Picks the
+// first configured source — errors from a configured source (quota, no
+// results, etc.) surface directly rather than being masked by a fallback.
 async function searchRestaurantMulti(query, country = "BE") {
+  if (API_KEY)     return searchRestaurantGoogle(query, country);
+  if (FSQ_API_KEY) return searchRestaurantFoursquare(query, country);
+  return searchRestaurantOSM(query, country);
+}
+
+async function searchRestaurantGoogle(query, country = "BE") {
   const countryName = AB_COUNTRY_NAMES[country] || "Belgium";
   const bounds      = AB_COUNTRY_BOUNDS[country] || AB_COUNTRY_BOUNDS.BE;
   const q = new RegExp(countryName, "i").test(query) ? query : `${query} ${countryName}`;
@@ -1451,13 +1482,110 @@ async function searchRestaurantMulti(query, country = "BE") {
   return data.places;
 }
 
+// Fallback discovery search used when no Google Places API key is configured.
+// Returns results in the same shape as searchRestaurantGoogle (minus photos,
+// which are fetched lazily once the user picks a place from the dropdown).
+async function searchRestaurantFoursquare(query, country = "BE") {
+  const countryName = AB_COUNTRY_NAMES[country] || "Belgium";
+  const q = new RegExp(countryName, "i").test(query) ? query : `${query} ${countryName}`;
+
+  const res = await fetch(`${FSQ_SEARCH}?query=${encodeURIComponent(q)}&limit=8`, {
+    headers: { Authorization: FSQ_API_KEY, Accept: "application/json" },
+  });
+
+  if (!res.ok) {
+    const err = await res.json().catch(() => ({}));
+    const msg = err?.message || `Foursquare API error ${res.status}`;
+    throw new Error(msg);
+  }
+  const data = await res.json();
+  const results = data.results || [];
+  if (!results.length)
+    throw new Error(`No results found for "${query}" in ${countryName}.`);
+
+  return results.map(v => ({
+    id:               v.fsq_id,
+    displayName:      { text: v.name || "Unknown" },
+    formattedAddress: v.location?.formatted_address || "",
+    googleMapsUri:    v.fsq_id ? `https://foursquare.com/v/${v.fsq_id}` : "",
+    photos:           [],
+    _fsq:             true,
+  }));
+}
+
+// Last-resort discovery search — OpenStreetMap's Nominatim geocoder, free and
+// keyless. Returns no rating/photo data; photos are filled in lazily via the
+// free scrape waterfall once the user picks a result (see renderResults).
+async function searchRestaurantOSM(query, country = "BE") {
+  const countryName = AB_COUNTRY_NAMES[country] || "Belgium";
+  const cc = OSM_COUNTRY_CODES[country] || "be";
+  const q = new RegExp(countryName, "i").test(query) ? query : `${query} ${countryName}`;
+
+  const res = await fetch(`${OSM_NOMINATIM}?q=${encodeURIComponent(q)}&format=jsonv2&addressdetails=1&namedetails=1&limit=8&countrycodes=${cc}`, {
+    headers: { Accept: "application/json" },
+  });
+  if (!res.ok) throw new Error(`OpenStreetMap search error ${res.status}`);
+  const data = await res.json();
+  if (!data?.length)
+    throw new Error(`No results found for "${query}" in ${countryName}.`);
+
+  return data.map(r => ({
+    id:               `osm:${r.osm_type}/${r.osm_id}`,
+    displayName:      { text: r.namedetails?.name || r.name || (r.display_name || "Unknown").split(",")[0] },
+    formattedAddress: formatOSMNominatimAddress(r.address, r.display_name, countryName),
+    googleMapsUri:    `https://www.openstreetmap.org/${r.osm_type}/${r.osm_id}`,
+    photos:           [],
+    _osm:             true,
+  }));
+}
+
+// Builds a Google-style "Street 12, 1000 City, Country" address from a
+// Nominatim addressdetails object, so CITY_FROM_ADDRESS_RE_BG (used by the
+// photo waterfall and caption generator) can reliably extract the city.
+// Nominatim's raw `display_name` lists the venue name first ("Cuore di
+// Puglia, Nationalestraat, ..., 2000, België"), which would otherwise cause
+// the city extraction to fall back to the business name itself.
+function formatOSMNominatimAddress(addr = {}, displayName, countryName) {
+  const parts = [];
+  if (addr.road) {
+    parts.push(addr.house_number ? `${addr.road} ${addr.house_number}` : addr.road);
+  }
+  const city = addr.city || addr.town || addr.village || addr.municipality || "";
+  const cityLine = `${addr.postcode || ""} ${city}`.trim();
+  if (cityLine) parts.push(cityLine);
+  parts.push(countryName);
+  const built = parts.filter(Boolean).join(", ");
+  return built || displayName || "";
+}
+
+// Fetches photo references for a Foursquare venue, lazily called once a place
+// is selected from the search dropdown (the search endpoint doesn't return photos).
+async function fetchFoursquarePlacePhotos(fsqId) {
+  const res = await fetch(`${FSQ_PHOTOS}/${fsqId}/photos?limit=10&sort=POPULAR`, {
+    headers: { Authorization: FSQ_API_KEY, Accept: "application/json" },
+  });
+  if (!res.ok) return [];
+  const data = await res.json().catch(() => []);
+  return (data || []).map(p => ({ name: `fsq:${p.prefix}::${p.suffix}` }));
+}
+
 async function resolvePhotoUri(photoName, maxWidth = 400) {
   const key = `${photoName}|${maxWidth}`;
   if (uriCache.has(key)) return uriCache.get(key);
-  trackApiCall("photo", "");
-  const res  = await fetch(`${PLACES_PHOTO}/${photoName}/media?maxWidthPx=${maxWidth}&key=${API_KEY}&skipHttpRedirect=true`);
-  const data = await res.json();
-  const uri  = data.photoUri;
+
+  let uri;
+  if (photoName.startsWith("data:")) {
+    // Already-resolved data URL from the free photo waterfall (no API call needed).
+    uri = photoName;
+  } else if (photoName.startsWith("fsq:")) {
+    const [prefix, suffix] = photoName.slice(4).split("::");
+    uri = `${prefix}${maxWidth}x${maxWidth}${suffix}`;
+  } else {
+    trackApiCall("photo", "");
+    const res  = await fetch(`${PLACES_PHOTO}/${photoName}/media?maxWidthPx=${maxWidth}&key=${API_KEY}&skipHttpRedirect=true`);
+    const data = await res.json();
+    uri = data.photoUri;
+  }
   uriCache.set(key, uri);
   return uri;
 }
@@ -1494,6 +1622,11 @@ function renderResults(place, target = "bot") {
 
   renderPhotoGrid();
 
+  // Sources like OpenStreetMap (and Foursquare venues with no photos of their
+  // own) return no photos at all — fall back to the free scrape waterfall
+  // (Google Maps/DuckDuckGo/Yelp/TripAdvisor) so the grid isn't left empty.
+  if (allPhotos.length === 0) fillFreePhotos();
+
   // Auto-fill caption on fresh search (not restore)
   if ($("caption")) $("caption").value = buildDefaultCaption();
 
@@ -1506,6 +1639,64 @@ function renderResults(place, target = "bot") {
   }
   $("results").classList.remove("hidden");
   saveState();
+}
+
+// Runs the free photo-scrape waterfall (no API keys required) and fills the
+// grid for results that came back with zero photos (OpenStreetMap, or a
+// Foursquare venue with no photos of its own).
+async function fillFreePhotos() {
+  const restaurant = currentRestaurant;
+  if (!restaurant || restaurant.allPhotos.length > 0) return;
+
+  const grid = $("photoGrid");
+  if (grid) grid.innerHTML = `<div class="loading-thumb">Searching free photo sources…</div>`;
+
+  try {
+    const { type } = getManualSettings();
+    const result = await chrome.runtime.sendMessage({
+      type:         "FETCH_FREE_PHOTOS",
+      businessName: restaurant.name,
+      address:      restaurant.address,
+      entityType:   type || "restaurant",
+      minPics:      CONFIG.MAX_PHOTOS,
+    });
+
+    if (currentRestaurant !== restaurant) return; // a newer search has since replaced this one
+
+    // Reuse the waterfall's quality metrics (it already scored every photo)
+    // so the grid badges render without re-downloading and re-scoring each
+    // image. Falls back to bare data URLs if photoLog is missing.
+    const fromLog = entry => ({
+      name:            entry.dataUrl,
+      qualityScore:    entry.rankScore,
+      meetsResolution: Math.min(entry.width || 0, entry.height || 0) >= MIN_PHOTO_DIM || entry.width === 0,
+    });
+    const photos = result?.photoLog?.length
+      ? result.photoLog.map(fromLog)
+      : (result?.dataUrls || []).map(name => ({ name }));
+    if (!photos.length) {
+      if (grid) grid.innerHTML = `<div class="loading-thumb">No photos found</div>`;
+      return;
+    }
+    // Ranked spares the waterfall collected beyond the post set — kept in
+    // `allPhotos` (after the shown photos) so dismissing a photo swaps in the
+    // next-best one instead of leaving an empty slot.
+    const spares = result?.extraPhotoLog?.length
+      ? result.extraPhotoLog.map(fromLog)
+      : (result?.extraDataUrls || []).map(name => ({ name }));
+    currentRestaurant.allPhotos = [...photos, ...spares];
+    currentRestaurant.photos    = photos.slice(0, CONFIG.MAX_PHOTOS);
+    // Source URLs already consumed — the dismiss-driven top-up sends these as
+    // excludeUrls so the waterfall only returns photos we haven't seen.
+    currentRestaurant.seenSourceUrls = [
+      ...(result?.photoLog || []), ...(result?.extraPhotoLog || []),
+    ].map(p => p.sourceUrl).filter(Boolean);
+    renderPhotoGrid();
+  } catch (err) {
+    if (currentRestaurant !== restaurant) return;
+    AppLog.warn("Free photo fallback failed", { error: err.message });
+    if (grid) grid.innerHTML = `<div class="loading-thumb">No photos found</div>`;
+  }
 }
 
 function renderPhotoGrid() {
@@ -1579,12 +1770,18 @@ function fillPhotoSlot(div, uri, index) {
     <button class="dismiss-btn" title="Replace with another photo">✕</button>`;
 
   // Score quality (contrast + blur + resolution) and update grid badges.
+  // Free-waterfall photos arrive pre-scored by the service worker — reuse
+  // those metrics instead of re-downloading and re-scanning the image.
   // The resolution check needs the TRUE source dimensions, so score against a
   // high-res fetch (2048px) rather than the 400px grid thumbnail — a 400px
   // image can never satisfy MIN_PHOTO_DIM (720), which would flag every photo
   // as low-res regardless of its real size. This mirrors the Auto Bot's
   // photo-quality gate, which scores resolvePhotoUriBG(name, 2048, ...).
-  const scoreName = currentRestaurant?.photos[index]?.name;
+  const slotPhoto = currentRestaurant?.photos[index];
+  if (slotPhoto?.qualityScore != null) {
+    updateQualityBadges();
+  } else {
+  const scoreName = slotPhoto?.name;
   (scoreName ? resolvePhotoUri(scoreName, QUALITY_SCAN_DIM) : Promise.resolve(uri))
     .then(scanUri => scorePhotoQuality(scanUri || uri))
     .then(({ score, meetsResolution }) => {
@@ -1594,6 +1791,7 @@ function fillPhotoSlot(div, uri, index) {
         updateQualityBadges();
       }
     });
+  }
 
   // Show cover overlay preview on the cover photo — use 1600px source for quality
   if (isCover && currentRestaurant) {
@@ -1625,8 +1823,15 @@ function fillPhotoSlot(div, uri, index) {
 
 async function dismissPhoto(index) {
   const { photos, allPhotos } = currentRestaurant;
+  // Remember every dismissed photo (persisted with the restaurant state) so it
+  // can never be offered as a replacement again — without this, the dismissed
+  // photo is still in allPhotos and gets swapped right back in on the next
+  // dismissal, ping-ponging between the same two images instead of advancing
+  // through the spare pool.
+  const dismissed = currentRestaurant.dismissedNames || (currentRestaurant.dismissedNames = []);
+  if (photos[index]) dismissed.push(photos[index].name);
   const shownNames = new Set(photos.map(p => p.name));
-  const next = allPhotos.find(p => !shownNames.has(p.name));
+  const next = allPhotos.find(p => !shownNames.has(p.name) && !dismissed.includes(p.name));
 
   const slot = $("photoGrid").querySelector(`[data-slot="${index}"]`);
 
@@ -1652,6 +1857,59 @@ async function dismissPhoto(index) {
     renderPhotoGrid();
   }
   saveState();
+
+  // Speculative top-up: when the spare pool runs low, fetch the next tier of
+  // candidates in the background (the scrape URL lists are cached service-worker
+  // side, so this only downloads images we haven't evaluated yet). By the time
+  // the user dismisses again, fresh alternatives are already waiting.
+  const remainingSpares = currentRestaurant.allPhotos.filter(p =>
+    !currentRestaurant.photos.some(s => s.name === p.name) &&
+    !(currentRestaurant.dismissedNames || []).includes(p.name)
+  ).length;
+  if (remainingSpares < 2) topUpFreePhotos();
+}
+
+// Background continuation of the free-photo waterfall: asks for more photos
+// while excluding every candidate URL already delivered, and appends the new
+// arrivals to the spare pool. No-op for API-photo results (no seenSourceUrls)
+// or while a top-up is already in flight.
+let _photoTopUpInFlight = false;
+async function topUpFreePhotos() {
+  const restaurant = currentRestaurant;
+  if (!restaurant?.seenSourceUrls?.length || _photoTopUpInFlight) return;
+  _photoTopUpInFlight = true;
+  try {
+    const { type } = getManualSettings();
+    const result = await chrome.runtime.sendMessage({
+      type:         "FETCH_FREE_PHOTOS",
+      businessName: restaurant.name,
+      address:      restaurant.address,
+      entityType:   type || "restaurant",
+      minPics:      CONFIG.MAX_PHOTOS,
+      excludeUrls:  restaurant.seenSourceUrls,
+    });
+    if (currentRestaurant !== restaurant) return; // newer search replaced this one
+    const fresh    = [...(result?.photoLog || []), ...(result?.extraPhotoLog || [])];
+    const existing = new Set(restaurant.allPhotos.map(p => p.name));
+    let added = 0;
+    for (const p of fresh) {
+      if (!p.dataUrl || existing.has(p.dataUrl)) continue;
+      restaurant.allPhotos.push({
+        name:            p.dataUrl,
+        qualityScore:    p.rankScore,
+        meetsResolution: Math.min(p.width || 0, p.height || 0) >= MIN_PHOTO_DIM || p.width === 0,
+      });
+      if (p.sourceUrl) restaurant.seenSourceUrls.push(p.sourceUrl);
+      added++;
+    }
+    if (added > 0) {
+      AppLog.info("Photo pool topped up", { added });
+      saveState();
+    }
+  } catch (_) {
+  } finally {
+    _photoTopUpInFlight = false;
+  }
 }
 
 // ── Caption ───────────────────────────────────────────────────────────────────
@@ -1762,9 +2020,17 @@ function renderSearchResultsDropdown(places) {
       <div class="search-result-name">${name}</div>
       <div class="search-result-address">${place.formattedAddress || ""}</div>
       ${meta ? `<div class="search-result-meta">${meta}</div>` : ""}`;
-    div.addEventListener("click", () => {
+    div.addEventListener("click", async () => {
       $("query").value = name;
       hideSearchResultsDropdown();
+      if (place._fsq && !place._photosLoaded) {
+        setStatus("Loading photos…");
+        try {
+          place.photos = await fetchFoursquarePlacePhotos(place.id);
+        } catch { /* leave photos empty — quality fallback sources still apply */ }
+        place._photosLoaded = true;
+        $("status").classList.add("hidden");
+      }
       renderResults(place, "manual");
       AppLog.info("Restaurant selected from search results", { name });
     });
@@ -1775,7 +2041,6 @@ function renderSearchResultsDropdown(places) {
 
 async function doSearch(query) {
   if (!query.trim()) return;
-  if (!API_KEY) { setStatus("Please save your API key first.", "error"); return; }
   setStatus("Searching…");
   $("results").classList.add("hidden");
   hideSearchResultsDropdown();
@@ -1797,7 +2062,6 @@ async function doSearch(query) {
 $("searchBtn").addEventListener("click", () => doSearch($("query").value));
 $("query").addEventListener("keydown", e => { if (e.key === "Enter") doSearch($("query").value); });
 $("randomBtn").addEventListener("click", async () => {
-  if (!API_KEY) { setStatus("Please save your API key first.", "error"); return; }
   setStatus("Picking a random place…");
   $("results").classList.add("hidden");
   hideSearchResultsDropdown();
@@ -2486,6 +2750,15 @@ const AB_COUNTRY_NAMES = {
   NL: "The Netherlands",
 };
 
+// ISO country codes for OpenStreetMap/Nominatim's `countrycodes` filter.
+const OSM_COUNTRY_CODES = {
+  BE: "be",
+  FR: "fr",
+  DE: "de",
+  LU: "lu",
+  NL: "nl",
+};
+
 // City pools — used when "All regions" is selected so each search is anchored
 // to a different city rather than the whole country (country-wide queries always
 // return the same top-20 nationally popular places from the Places API).
@@ -2582,7 +2855,18 @@ function getManualSettings() {
 }
 
 // Search Places API with ALL filter parameters baked in (one call)
+// Waterfall: Google Places (if configured) → Foursquare (if configured) →
+// OpenStreetMap/Overpass (always available, no key required). Picks the
+// first configured source — errors from a configured source (quota, no
+// matches, etc.) surface directly rather than being masked by a fallback.
+// OSM has no rating data, so minRatings/minStars are best-effort there.
 async function searchAutoPlace(type, country, region, minRatings = 0, minStars = 3, minPics = 3) {
+  if (API_KEY)     return searchAutoPlaceGoogle(type, country, region, minRatings, minStars, minPics);
+  if (FSQ_API_KEY) return searchAutoPlaceFoursquare(type, country, region, minRatings, minStars, minPics);
+  return searchAutoPlaceOSM(type, country, region, minRatings, minStars, minPics);
+}
+
+async function searchAutoPlaceGoogle(type, country, region, minRatings = 0, minStars = 3, minPics = 3) {
   const typeQuery   = AB_TYPE_QUERY[type] || "restaurant";
   const countryName = AB_COUNTRY_NAMES[country] || "Belgium";
   const bounds      = AB_COUNTRY_BOUNDS[country] || AB_COUNTRY_BOUNDS.BE;
@@ -2642,6 +2926,123 @@ async function searchAutoPlace(type, country, region, minRatings = 0, minStars =
 
   // Pick a random result from the filtered set for variety
   return filtered[Math.floor(Math.random() * filtered.length)];
+}
+
+// FSQ "Dining and Drinking" category IDs used for the random-pick fallback.
+const FSQ_TYPE_CATEGORY = {
+  restaurant: "13065", // Restaurant
+  bar:        "13003", // Bar
+  hotel:      "19014", // Hotel
+};
+
+// Foursquare fallback for the random-pick feature. FSQ's `rating` field is on
+// a 0-10 scale (converted to 0-5 to match minStars); `stats.total_ratings` is
+// a premium field that's often absent, so minRatings is best-effort here.
+async function searchAutoPlaceFoursquare(type, country, region, minRatings = 0, minStars = 3, minPics = 3) {
+  const countryName  = AB_COUNTRY_NAMES[country] || "Belgium";
+  const category     = FSQ_TYPE_CATEGORY[type] || FSQ_TYPE_CATEGORY.restaurant;
+  const locationPart = region ? `${region}, ${countryName}` : `${pickRandomCity(country)}, ${countryName}`;
+
+  AppLog.info("Auto Bot search (Foursquare)", { type, country, region, locationPart, minRatings, minStars, minPics });
+
+  const res = await fetch(`${FSQ_SEARCH}?near=${encodeURIComponent(locationPart)}&categories=${category}&sort=RATING&limit=20`, {
+    headers: { Authorization: FSQ_API_KEY, Accept: "application/json" },
+  });
+  if (!res.ok) {
+    const err = await res.json().catch(() => ({}));
+    throw new Error(err?.message || `Foursquare API error ${res.status}`);
+  }
+  const data    = await res.json();
+  const results = data.results || [];
+  if (!results.length)
+    throw new Error(`No ${type}s found in "${locationPart}" via Foursquare.`);
+
+  const mapped = results.map(v => ({
+    id:               v.fsq_id,
+    displayName:      { text: v.name || "Unknown" },
+    formattedAddress: v.location?.formatted_address || "",
+    rating:           typeof v.rating === "number" ? v.rating / 2 : undefined,
+    userRatingCount:  v.stats?.total_ratings,
+    googleMapsUri:    v.fsq_id ? `https://foursquare.com/v/${v.fsq_id}` : "",
+    photos:           [],
+    _fsq:             true,
+  }));
+
+  const filtered = mapped.filter(p => p.rating === undefined || p.rating >= minStars);
+  const pool = filtered.length ? filtered : mapped;
+  if (filtered.length !== mapped.length)
+    AppLog.warn("Some Foursquare results lack rating data — included anyway", { minStars });
+
+  const place = pool[Math.floor(Math.random() * pool.length)];
+  place.photos = await fetchFoursquarePlacePhotos(place.id);
+  place._photosLoaded = true;
+  return place;
+}
+
+// OSM amenity/tourism tags used for the random-pick fallback.
+const OSM_TYPE_TAG = {
+  restaurant: '"amenity"="restaurant"',
+  bar:        '"amenity"~"^(bar|pub)$"',
+  hotel:      '"tourism"="hotel"',
+};
+
+// Last-resort random pick — OpenStreetMap via Nominatim (geocode the city) +
+// Overpass (find nearby POIs of the right type). No rating data exists in OSM,
+// so minRatings/minStars cannot be honoured; this returns a random nearby match.
+async function searchAutoPlaceOSM(type, country, region, minRatings = 0, minStars = 3, minPics = 3) {
+  const countryName  = AB_COUNTRY_NAMES[country] || "Belgium";
+  const cc           = OSM_COUNTRY_CODES[country] || "be";
+  const locationPart = region || pickRandomCity(country);
+
+  AppLog.info("Auto Bot search (OpenStreetMap)", { type, country, region, locationPart });
+  AppLog.warn("OpenStreetMap has no rating data — minRatings/minStars are not applied for this source");
+
+  const geoRes = await fetch(
+    `${OSM_NOMINATIM}?q=${encodeURIComponent(`${locationPart}, ${countryName}`)}&format=jsonv2&limit=1&countrycodes=${cc}`,
+    { headers: { Accept: "application/json" } }
+  );
+  if (!geoRes.ok) throw new Error(`OpenStreetMap geocoding error ${geoRes.status}`);
+  const geo = (await geoRes.json())[0];
+  if (!geo) throw new Error(`Could not locate "${locationPart}" via OpenStreetMap.`);
+
+  const tag = OSM_TYPE_TAG[type] || OSM_TYPE_TAG.restaurant;
+  const overpassQuery = `[out:json][timeout:25];nwr[${tag}](around:5000,${geo.lat},${geo.lon});out center 50;`;
+  const res = await fetch(OSM_OVERPASS, {
+    method: "POST",
+    headers: { "Content-Type": "application/x-www-form-urlencoded" },
+    body: "data=" + encodeURIComponent(overpassQuery),
+  });
+  if (!res.ok) throw new Error(`Overpass API error ${res.status}`);
+  const data     = await res.json();
+  const elements = (data.elements || []).filter(e => e.tags?.name);
+  if (!elements.length)
+    throw new Error(`No ${type}s found near "${locationPart}" via OpenStreetMap.`);
+
+  const el  = elements[Math.floor(Math.random() * elements.length)];
+  const lat = el.lat ?? el.center?.lat;
+  const lon = el.lon ?? el.center?.lon;
+
+  return {
+    id:               `osm:${el.type}/${el.id}`,
+    displayName:      { text: el.tags.name },
+    formattedAddress: formatOSMAddress(el.tags, locationPart, countryName),
+    googleMapsUri:    (lat != null && lon != null) ? `https://www.openstreetmap.org/${el.type}/${el.id}` : "",
+    photos:           [],
+    _osm:             true,
+  };
+}
+
+// Builds a best-effort address string from OSM `addr:*` tags.
+function formatOSMAddress(tags = {}, fallbackCity, countryName) {
+  const parts = [];
+  if (tags["addr:street"]) {
+    parts.push(tags["addr:housenumber"] ? `${tags["addr:street"]} ${tags["addr:housenumber"]}` : tags["addr:street"]);
+  }
+  const city = tags["addr:city"] || fallbackCity;
+  const cityLine = `${tags["addr:postcode"] || ""} ${city || ""}`.trim();
+  if (cityLine) parts.push(cityLine);
+  parts.push(countryName);
+  return parts.filter(Boolean).join(", ");
 }
 
 // ── Auto Bot caption generator ────────────────────────────────────────────────
