@@ -383,6 +383,11 @@ h1 { font-size: 0.95rem; font-weight: 700; line-height: 1.2; }
 
 /* ── Group (label + control) ── */
 .ab-group { display: flex; flex-direction: column; gap: 6px; }
+/* Region/City are independent sources for a roundup — picking one greys the
+   other so it's clear which drives the search. The muted control stays
+   clickable so the user can switch the active source back at any time. */
+.ab-group.rr-source-muted { opacity: .42; transition: opacity .15s ease; }
+.ab-group.rr-source-muted .ab-label-hint::after { content: " · disabled"; }
 .ab-label {
   font-size: .74rem; font-weight: 700; color: var(--text);
   text-transform: uppercase; letter-spacing: .04em;
@@ -633,6 +638,11 @@ h1 { font-size: 0.95rem; font-weight: 700; line-height: 1.2; }
 .auto-preview-photos {
   display: grid; grid-template-columns: repeat(5, 1fr); gap: 6px;
 }
+.auto-preview-photo { position: relative; }
+.auto-preview-photo.replacing { opacity: .55; pointer-events: none; }
+/* Region Round-Up: per-photo entity-name toggle (mirrors the cover-photo
+   control). Active (name shown) uses the accent; inactive is neutral dark. */
+.rr-name-toggle.is-on { background: var(--accent); }
 .auto-preview-photo img,
 .auto-preview-photo .loading-thumb {
   width: 100%; aspect-ratio: 1/1; object-fit: cover;

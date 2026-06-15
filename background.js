@@ -552,11 +552,35 @@ function _rankPlaces(places, ranking) {
   return sorted;
 }
 
-async function searchAutoPlacesCollectionBG(config, apiKey, foursquareApiKey) {
+// Stable identity for a roundup entity, used by the "don't repeat recently-posted
+// venues" tracker. Name + locality so the same venue maps to the same key across
+// posts (addresses from scraped sources are noisy, so we anchor on the city).
+function roundupEntityKey(place, city) {
+  const name = (place.displayName?.text || "").toLowerCase().replace(/\s+/g, " ").trim();
+  return `${name}|${(city || "").toLowerCase().trim()}`;
+}
+
+// Ranks candidates and takes the top `size`, but first drops any whose key is in
+// `excludeKeys` (recently-posted venues). If excluding leaves too few to fill the
+// roundup, the freshest are kept and the excluded ones are appended (ranked) so a
+// post is never left short — repeats are a last resort, not the default.
+function _selectRanked(candidates, { excludeKeys, size, ranking, city }) {
+  const excl  = excludeKeys instanceof Set ? excludeKeys : new Set(excludeKeys || []);
+  const fresh   = candidates.filter(p => !excl.has(roundupEntityKey(p, city)));
+  const ranked  = _rankPlaces(fresh, ranking);
+  if (ranked.length >= size) return ranked.slice(0, size);
+  const repeats = _rankPlaces(candidates.filter(p => excl.has(roundupEntityKey(p, city))), ranking);
+  return [...ranked, ...repeats].slice(0, size);
+}
+
+async function searchAutoPlacesCollectionBG(config, apiKey, foursquareApiKey, excludeKeys = []) {
   const typeQ      = AB_TYPE_QUERY_BG[config.type] || "restaurant";
   const country    = AB_COUNTRY_NAMES_BG[config.country] || "Belgium";
+  // City is an independent location source that overrides the region/province
+  // when set; otherwise fall back to the province (random → a random city).
+  const explicitCity   = (config.city || "").trim();
   const isRandomRegion = !config.region || config.region === "__random__";
-  const city       = isRandomRegion ? pickRandomCity(config.country) : config.region;
+  const city       = explicitCity || (isRandomRegion ? pickRandomCity(config.country) : config.region);
   const minStars   = parseFloat(config.minStars   || "4");
   const minRatings = parseInt (config.minRatings  || "100", 10);
   const size       = Math.max(1, parseInt(config.size || "5", 10));
@@ -590,7 +614,7 @@ async function searchAutoPlacesCollectionBG(config, apiKey, foursquareApiKey) {
       }));
       const filtered = candidates.filter(p => p.rating >= minStars && p.userRatingCount >= minRatings);
       const pool     = filtered.length >= size ? filtered : candidates;
-      const top      = _rankPlaces(pool, ranking).slice(0, size);
+      const top      = _selectRanked(pool, { excludeKeys, size, ranking, city });
       bgLog('info', `RoundupSearch[Maps]: ${candidates.length} found, ${filtered.length} quality — picked top ${top.length}`);
       TechLog.info('SEARCH', 'roundup_search_done', {
         source: 'maps_scrape', total: candidates.length, quality: filtered.length, picked: top.length,
@@ -633,7 +657,7 @@ async function searchAutoPlacesCollectionBG(config, apiKey, foursquareApiKey) {
         userRatingCount:  0,
         photos:           [],
       }));
-      const top = candidates.slice(0, size);
+      const top = _selectRanked(candidates, { excludeKeys, size, ranking, city });
       bgLog('info', `RoundupSearch[Yelp]: ${candidates.length} slugs — picked top ${top.length}`);
       TechLog.info('SEARCH', 'roundup_search_done', {
         source: 'yelp_scrape', total: candidates.length, picked: top.length,
@@ -653,7 +677,7 @@ async function searchAutoPlacesCollectionBG(config, apiKey, foursquareApiKey) {
       if (candidates.length) {
         const filtered = candidates.filter(p => p.rating >= minStars && (p.userRatingCount || 0) >= minRatings);
         const pool = filtered.length >= size ? filtered : candidates;
-        const top  = _rankPlaces(pool, ranking).slice(0, size);
+        const top  = _selectRanked(pool, { excludeKeys, size, ranking, city });
         bgLog('info', `RoundupSearch[Foursquare]: ${candidates.length} found, ${filtered.length} quality — picked top ${top.length}`);
         TechLog.info('SEARCH', 'roundup_search_done', {
           source: 'foursquare', total: candidates.length, quality: filtered.length, picked: top.length,
@@ -670,7 +694,7 @@ async function searchAutoPlacesCollectionBG(config, apiKey, foursquareApiKey) {
   try {
     const candidates = await fetchOSMCandidatesBG(typeQ, city, country);
     if (candidates.length) {
-      const top = _rankPlaces(candidates, ranking).slice(0, size);
+      const top = _selectRanked(candidates, { excludeKeys, size, ranking, city });
       bgLog('info', `RoundupSearch[OSM]: ${candidates.length} found — picked top ${top.length}`);
       TechLog.info('SEARCH', 'roundup_search_done', {
         source: 'openstreetmap', total: candidates.length, picked: top.length,
@@ -709,7 +733,7 @@ async function searchAutoPlacesCollectionBG(config, apiKey, foursquareApiKey) {
       if (res.places?.length) {
         const filtered = res.places.filter(p => (p.userRatingCount || 0) >= minRatings);
         const pool  = filtered.length >= size ? filtered : res.places;
-        const top   = _rankPlaces(pool, ranking).slice(0, size);
+        const top   = _selectRanked(pool, { excludeKeys, size, ranking, city });
         bgLog('info', `RoundupSearch[Places API]: ${res.places.length} found, ${filtered.length} quality — picked top ${top.length}`);
         TechLog.info('SEARCH', 'roundup_search_done', {
           source: 'places_api', total: res.places.length, quality: filtered.length, picked: top.length,
@@ -770,15 +794,17 @@ async function generateSyntheticTestPhotoDataUrl() {
   return `data:image/jpeg;base64,${btoa(parts.join(''))}`;
 }
 
-async function fetchAsDataUrl(url, signal) {
-  const res  = await fetch(url, signal ? { signal } : undefined);
-  const blob = await res.blob();
-  const ab   = await blob.arrayBuffer();
-  const bytes = new Uint8Array(ab);
+async function blobToDataUrl(blob) {
+  const bytes = new Uint8Array(await blob.arrayBuffer());
   const parts = [];
   for (let i = 0; i < bytes.length; i += 8192)
     parts.push(String.fromCharCode(...bytes.slice(i, i + 8192)));
   return `data:${blob.type || "image/jpeg"};base64,${btoa(parts.join(''))}`;
+}
+
+async function fetchAsDataUrl(url, signal) {
+  const res  = await fetch(url, signal ? { signal } : undefined);
+  return blobToDataUrl(await res.blob());
 }
 
 // Re-encode a data URL so its long side is at most `maxDim` px (JPEG q0.85).
@@ -805,6 +831,91 @@ async function downscaleDataUrl(dataUrl, maxDim = MAX_POST_DIM) {
   } catch (_) {
     return dataUrl;
   }
+}
+
+// Burns a small venue-name label into the bottom-right of a roundup photo so each
+// slide makes clear which entity it represents. Draws its own translucent dark
+// rounded backing, so the name stays legible over any background ("wherever there
+// is a black-ish region" — we create one). Runs in the service worker via
+// OffscreenCanvas. Returns the original data URL unchanged on any failure.
+async function applyEntityNameLabel(dataUrl, name) {
+  const label0 = (name || "").trim();
+  if (!label0) return dataUrl;
+  try {
+    const blob = await fetch(dataUrl).then(r => r.blob());
+    const bmp  = await createImageBitmap(blob);
+    const W = bmp.width, H = bmp.height;
+    const canvas = new OffscreenCanvas(W, H);
+    const ctx = canvas.getContext('2d');
+    ctx.drawImage(bmp, 0, 0, W, H);
+    bmp.close();
+
+    const label = label0.length > 38 ? label0.slice(0, 37).trimEnd() + '…' : label0;
+
+    const fontSize = Math.max(20, Math.round(W * 0.032));
+    const padX   = Math.round(fontSize * 0.6);
+    const padY   = Math.round(fontSize * 0.42);
+    const margin = Math.round(W * 0.028);
+    ctx.font = `600 ${fontSize}px "Helvetica Neue", Arial, sans-serif`;
+    ctx.textBaseline = 'middle';
+    ctx.textAlign = 'left';
+
+    const maxBoxW = W - margin * 2;
+    const textW = Math.min(ctx.measureText(label).width, maxBoxW - padX * 2);
+    const boxW = textW + padX * 2;
+    const boxH = fontSize + padY * 2;
+    const boxX = W - margin - boxW;
+    const boxY = H - margin - boxH;
+    const r = Math.round(boxH * 0.26);
+
+    ctx.fillStyle = 'rgba(0,0,0,0.58)';
+    ctx.beginPath();
+    ctx.moveTo(boxX + r, boxY);
+    ctx.arcTo(boxX + boxW, boxY,        boxX + boxW, boxY + boxH, r);
+    ctx.arcTo(boxX + boxW, boxY + boxH, boxX,        boxY + boxH, r);
+    ctx.arcTo(boxX,        boxY + boxH, boxX,        boxY,        r);
+    ctx.arcTo(boxX,        boxY,        boxX + boxW, boxY,        r);
+    ctx.closePath();
+    ctx.fill();
+
+    ctx.fillStyle    = '#ffffff';
+    ctx.shadowColor  = 'rgba(0,0,0,0.55)';
+    ctx.shadowBlur   = Math.round(fontSize * 0.22);
+    ctx.fillText(label, boxX + padX, boxY + boxH / 2 + 1, maxBoxW - padX * 2);
+
+    const out = await canvas.convertToBlob({ type: 'image/jpeg', quality: 0.9 });
+    const bytes = new Uint8Array(await out.arrayBuffer());
+    const parts = [];
+    for (let i = 0; i < bytes.length; i += 8192)
+      parts.push(String.fromCharCode(...bytes.slice(i, i + 8192)));
+    return `data:image/jpeg;base64,${btoa(parts.join(''))}`;
+  } catch (e) {
+    bgLog('warn', `Entity-name label failed for "${name}": ${e.message}`);
+    return dataUrl;
+  }
+}
+
+// ── Recently-posted roundup tracker ───────────────────────────────────────────
+// Remembers the venues used in recent roundup posts so the discovery waterfall
+// can skip them, preventing the same restaurant from resurfacing a few posts
+// later. Capped to a rolling window (large enough to span ~20-30 posts).
+const ROUNDUP_RECENT_CAP = 200;
+
+async function getRoundupRecentKeys() {
+  const { regionRoundupRecentEntities = [] } =
+    await chrome.storage.local.get({ regionRoundupRecentEntities: [] });
+  return Array.isArray(regionRoundupRecentEntities) ? regionRoundupRecentEntities : [];
+}
+
+async function recordRoundupPostedEntities(places, city, cap = ROUNDUP_RECENT_CAP) {
+  const newKeys = (places || [])
+    .map(p => roundupEntityKey(p, city))
+    .filter(k => k && k !== '|');
+  if (!newKeys.length) return;
+  const prev = await getRoundupRecentKeys();
+  // Newest last; drop any prior occurrence so re-posted venues move to the back.
+  const merged = [...prev.filter(k => !newKeys.includes(k)), ...newKeys];
+  await chrome.storage.local.set({ regionRoundupRecentEntities: merged.slice(-cap) });
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -1195,6 +1306,52 @@ async function scrapeDDGPhotos(businessName, city, entityType) {
     TechLog.warn('PHOTO', 'ddg_scrape_error', { error: e.message });
     return [];
   }
+}
+
+// Fetches a representative cover photo of the round-up's LOCATION (e.g. a nice
+// shot of Brussels for "Top 5 restaurants in Brussels"), used as the first slide
+// behind the "Top N…" header. Keyless — reuses the already-permitted DuckDuckGo
+// image search + proxy. Prefers landscape, decent-resolution, non-stock shots.
+// Returns a downscaled data URL, or null so the caller can fall back to the
+// first entity's photo.
+async function fetchRegionCoverPhoto(location, country) {
+  const place = (location || "").trim();
+  if (!place) return null;
+  const query = `${place} ${country} cityscape skyline`;
+  bgLog("info", `RoundupCover: searching a cover image for "${place}"`);
+  try {
+    const results = await ddgImageSearch(query);
+    const STOCK_RE = /shutterstock|getty|istock|alamy|dreamstime|depositphotos|fotolia|123rf|bigstock/i;
+    const JUNK_RE  = /\b(logo|menu|map|flag|coat of arms|wappen|drapeau|vlag)\b/i;
+    const tokens   = place.toLowerCase().split(/\s+/).filter(t => t.length >= 3);
+
+    const candidates = (results || [])
+      .filter(r => r.image && Math.min(r.width || 0, r.height || 0) >= MIN_SOURCE_DIM)
+      .filter(r => (r.width || 0) >= (r.height || 0))                 // landscape reads better as a cover
+      .filter(r => !STOCK_RE.test(`${r.url || ""} ${r.title || ""}`))
+      .filter(r => !JUNK_RE.test(r.title || ""))
+      .sort((a, b) => {
+        const rel = r => tokens.filter(t => `${r.url || ""} ${r.title || ""}`.toLowerCase().includes(t)).length;
+        return (rel(b) - rel(a)) || ((b.width * b.height) - (a.width * a.height));
+      });
+
+    for (const r of candidates.slice(0, 6)) {
+      try {
+        const blob = await fetch(ddgProxyUrl(r.image)).then(x => x.ok ? x.blob() : Promise.reject(new Error(`HTTP ${x.status}`)));
+        const bmp  = await createImageBitmap(blob); // throws if not a decodable image
+        const ok   = Math.min(bmp.width, bmp.height) >= MIN_SOURCE_DIM;
+        bmp.close();
+        if (!ok) continue;
+        const dataUrl = await blobToDataUrl(blob);
+        bgLog("info", `RoundupCover: using a cover image for "${place}"`);
+        return await downscaleDataUrl(dataUrl, 1280);
+      } catch (_) { /* try the next candidate */ }
+    }
+    bgLog("warn", `RoundupCover: no suitable cover image for "${place}" — using first entity`);
+  } catch (e) {
+    bgLog("warn", `RoundupCover search failed: ${e.message} — using first entity`);
+  }
+  return null;
 }
 
 // ── Source 1.5: venue-owned photos (website + Facebook page) ─────────────────
@@ -2416,12 +2573,18 @@ async function autoPostRoundupNow(postIndex) {
   try {
     // 1 ── Find ranked entities ────────────────────────────────────────────────
     const t_search = Date.now();
-    const configuredRegion = (config.region && config.region !== "__random__") ? config.region : "";
+    const configuredRegion = (config.city || "").trim()
+      || ((config.region && config.region !== "__random__") ? config.region : "");
     TechLog.info("SEARCH", "search_start", { run_id: runId, run_type: "roundup",
       type: config.type, country: config.country, region: configuredRegion || "random", size: config.size, ranking: config.ranking });
     bgLog("info", `Region Roundup post ${postIndex}: searching top ${config.size||"5"} ${config.type||"restaurant"}s in ${configuredRegion || "a random region"}…`);
 
-    const { places, source: searchSource, region } = await searchAutoPlacesCollectionBG(config, apiKey, foursquareApiKey);
+    // Skip venues used in recent roundup posts so the same restaurant doesn't
+    // resurface a handful of posts later (the search relaxes this only if it
+    // would otherwise be unable to fill the roundup).
+    const recentKeys = await getRoundupRecentKeys();
+    const { places, source: searchSource, region } =
+      await searchAutoPlacesCollectionBG(config, apiKey, foursquareApiKey, recentKeys);
     TechLog.info("SEARCH", "search_done", { run_id: runId, run_type: "roundup",
       count: places.length, source: searchSource, duration_ms: Date.now()-t_search });
     bgLog("info", `Region Roundup: found ${places.length} entities (source: ${searchSource})`);
@@ -2446,7 +2609,9 @@ async function autoPostRoundupNow(postIndex) {
       const allPhotos = (place.photos||[]).sort((a,b)=>(b.width||0)-(a.width||0));
       const photoResult = await fetchPhotosWaterfall(name, address, config.type||"restaurant", 1, apiKey, allPhotos, foursquareApiKey);
       if (photoResult.dataUrls.length > 0) {
-        photoDataUrls.push(photoResult.dataUrls[0]);
+        // Burn the venue name into the photo so each slide is self-identifying.
+        const labeled = await applyEntityNameLabel(photoResult.dataUrls[0], name);
+        photoDataUrls.push(labeled);
         keptPlaces.push(place);
       } else {
         bgLog("warn", `Region Roundup: no photo found for "${name}" — dropping from list`);
@@ -2463,6 +2628,15 @@ async function autoPostRoundupNow(postIndex) {
 
     TechLog.info("MEDIA", "photos_done", { run_id: runId, run_type: "roundup",
       photo_count: photoDataUrls.length, entity_count: keptPlaces.length, duration_ms: Date.now()-t_photos });
+
+    // 2.5 ── Region cover slide ────────────────────────────────────────────────
+    // Lead with a representative photo of the location itself (e.g. Brussels);
+    // the injector then overlays it with the "Top N…" header. Falls back to the
+    // first entity photo when no suitable city image is found.
+    const countryName  = AB_COUNTRY_NAMES_BG[config.country] || "Belgium";
+    const coverDataUrl  = await fetchRegionCoverPhoto(region, countryName).catch(() => null);
+    const postPhotos    = coverDataUrl ? [coverDataUrl, ...photoDataUrls] : photoDataUrls;
+    TechLog.info("MEDIA", "cover_slide", { run_id: runId, run_type: "roundup", has_cover: !!coverDataUrl });
 
     // 3 ── Pick a song ────────────────────────────────────────────────────────
     const t_song = Date.now();
@@ -2503,7 +2677,7 @@ async function autoPostRoundupNow(postIndex) {
       bgLog("info", `Region Roundup: posting to ${platform}…`);
 
       const result = await handleSocialPost({
-        platform, photoDataUrls, caption,
+        platform, photoDataUrls: postPhotos, caption,
         songName:           songInfo?.name || "",
         location:           region,
         restaurantName:     header,
@@ -2536,6 +2710,13 @@ async function autoPostRoundupNow(postIndex) {
 
     const finalStatus       = anyFailed ? "failed" : (anyUnconfirmed ? "unconfirmed" : "done");
     const total_duration_ms = Date.now()-runStart;
+
+    // Remember the venues just used so they're skipped in upcoming roundups.
+    if (finalStatus !== "failed") {
+      await recordRoundupPostedEntities(keptPlaces, region);
+      bgLog("info", `Region Roundup: recorded ${keptPlaces.length} venues in recent-posts tracker`);
+    }
+
     await updateRoundupRunLogStatus(postIndex, finalStatus, post.platforms);
     TechLog.info("POST", "run_complete", { run_id: runId, run_type: "roundup",
       postIndex, region, platforms: post.platforms, status: finalStatus, total_duration_ms });
@@ -2834,6 +3015,51 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
         { poolExtra: 10, excludeUrls: msg.excludeUrls || [] }
       );
       sendResponse(result);
+    })();
+    return true;
+  }
+
+  // Keyless Region Roundup preview/generate for the popup. Runs the same
+  // discovery waterfall + free photo waterfall the scheduled bot uses, and
+  // embeds one cover photo per place as a data URL in place.photos[0] so the
+  // popup's existing render/post code works without a Google key.
+  if (msg.type === "GENERATE_ROUNDUP_PREVIEW") {
+    (async () => {
+      try {
+        const config = msg.config || {};
+        const apiKey = await getApiKey();
+        const { foursquareApiKey = null } = await chrome.storage.local.get({ foursquareApiKey: null });
+
+        const { places, source, region } = await searchAutoPlacesCollectionBG(config, apiKey, foursquareApiKey);
+        const kept = [];
+        for (const place of places) {
+          const name     = place.displayName?.text || "";
+          const address  = place.formattedAddress  || "";
+          const existing = (place.photos || []).sort((a, b) => (b.width || 0) - (a.width || 0));
+          // Pull a deep pool per entity so the popup's "dismiss → another photo
+          // of this entity" can swap locally without a round-trip each time, and
+          // hand back the consumed source URLs for on-demand top-ups.
+          const photoResult = await fetchPhotosWaterfall(
+            name, address, config.type || "restaurant", 5, apiKey, existing, foursquareApiKey,
+            { poolExtra: 8 }
+          );
+          const log = [...(photoResult.photoLog || []), ...(photoResult.extraPhotoLog || [])];
+          const candidates = log.length
+            ? log.filter(p => p.dataUrl).map(p => ({ name: p.dataUrl }))
+            : (photoResult.dataUrls || []).map(u => ({ name: u }));
+          if (candidates.length > 0) {
+            place.photos = candidates;
+            place._seenSourceUrls = log.map(p => p.sourceUrl).filter(Boolean);
+            kept.push(place);
+          } else {
+            bgLog("warn", `Roundup preview: no photo for "${name}" — dropping from list`);
+          }
+        }
+        sendResponse({ ok: true, places: kept, source, region });
+      } catch (e) {
+        bgLog("error", `Roundup preview failed: ${e.message}`);
+        sendResponse({ ok: false, error: e.message });
+      }
     })();
     return true;
   }
@@ -6336,6 +6562,7 @@ if (typeof module !== 'undefined' && module.exports) {
     sendTelemetry, getInstallId, TechLog, computeAppealMetrics, scoreImageQuality,
     computePhash, phashDistance, downscaleDataUrl,
     searchAutoPlacesCollectionBG, getAutoCaptionRoundupBG,
+    roundupEntityKey, recordRoundupPostedEntities, getRoundupRecentKeys,
   };
 }
 

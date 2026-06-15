@@ -321,8 +321,16 @@
               </div>
 
               <div class="ab-group">
-                <label class="ab-label" for="mrRegion">Region <span class="ab-label-hint">(single region)</span></label>
+                <label class="ab-label" for="mrRegion">Region <span class="ab-label-hint">(province)</span></label>
                 <select id="mrRegion" class="ab-select">
+                  <!-- populated by JS based on country -->
+                </select>
+              </div>
+
+              <!-- ── City (independent of region — selecting one greys the other) ── -->
+              <div class="ab-group">
+                <label class="ab-label" for="mrCity">City <span class="ab-label-hint">(optional — overrides region)</span></label>
+                <select id="mrCity" class="ab-select">
                   <!-- populated by JS based on country -->
                 </select>
               </div>
@@ -716,8 +724,16 @@
         </div>
 
         <div class="ab-group">
-          <label class="ab-label" for="rrRegion">Region <span class="ab-label-hint">(single region)</span></label>
+          <label class="ab-label" for="rrRegion">Region <span class="ab-label-hint">(province)</span></label>
           <select id="rrRegion" class="ab-select">
+            <!-- populated by JS based on country -->
+          </select>
+        </div>
+
+        <!-- ── City (independent of region — selecting one greys the other) ── -->
+        <div class="ab-group">
+          <label class="ab-label" for="rrCity">City <span class="ab-label-hint">(optional — overrides region)</span></label>
+          <select id="rrCity" class="ab-select">
             <!-- populated by JS based on country -->
           </select>
         </div>

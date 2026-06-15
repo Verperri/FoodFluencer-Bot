@@ -97,6 +97,63 @@ describe('searchAutoPlacesCollectionBG', () => {
     expect(result.places).toHaveLength(3);
     result.places.forEach(p => expect(p.displayName.text).toContain('Bruges'));
   });
+
+  test('excludes recently-posted venues when fresh alternatives can fill the roundup', async () => {
+    const html = `
+      {"displayName":{"text":"Hotel A"}} {"formattedAddress":"Antwerp, Belgium"} {"rating":4.2} {"userRatingCount":150}
+      {"displayName":{"text":"Hotel B"}} {"formattedAddress":"Antwerp, Belgium"} {"rating":4.8} {"userRatingCount":300}
+      {"displayName":{"text":"Hotel C"}} {"formattedAddress":"Antwerp, Belgium"} {"rating":4.5} {"userRatingCount":500}
+    `;
+    global.fetch = jest.fn(() => Promise.resolve({ ok: true, text: () => Promise.resolve(html) }));
+
+    const config = { type: 'hotel', country: 'BE', region: 'Antwerp', size: '2', ranking: 'rating', minStars: '4', minRatings: '100' };
+    // Hotel B was posted recently — it must be skipped while C and A remain.
+    const result = await bg.searchAutoPlacesCollectionBG(config, null, null, ['hotel b|antwerp']);
+
+    expect(result.places.map(p => p.displayName.text)).toEqual(['Hotel C', 'Hotel A']);
+    expect(result.places.find(p => p.displayName.text === 'Hotel B')).toBeUndefined();
+  });
+
+  test('relaxes the recently-posted exclusion rather than leaving the roundup short', async () => {
+    const html = `
+      {"displayName":{"text":"Hotel A"}} {"formattedAddress":"Antwerp, Belgium"} {"rating":4.2} {"userRatingCount":150}
+      {"displayName":{"text":"Hotel B"}} {"formattedAddress":"Antwerp, Belgium"} {"rating":4.8} {"userRatingCount":300}
+      {"displayName":{"text":"Hotel C"}} {"formattedAddress":"Antwerp, Belgium"} {"rating":4.5} {"userRatingCount":500}
+    `;
+    global.fetch = jest.fn(() => Promise.resolve({ ok: true, text: () => Promise.resolve(html) }));
+
+    const config = { type: 'hotel', country: 'BE', region: 'Antwerp', size: '3', ranking: 'rating', minStars: '4', minRatings: '100' };
+    // Both B and C are recent, but size 3 needs all three — A stays first (fresh),
+    // then the excluded venues are appended (ranked) to fill.
+    const result = await bg.searchAutoPlacesCollectionBG(config, null, null, ['hotel b|antwerp', 'hotel c|antwerp']);
+
+    expect(result.places).toHaveLength(3);
+    expect(result.places[0].displayName.text).toBe('Hotel A');
+    expect(result.places.map(p => p.displayName.text).sort())
+      .toEqual(['Hotel A', 'Hotel B', 'Hotel C']);
+  });
+});
+
+describe('recently-posted roundup tracker', () => {
+  test('roundupEntityKey normalizes name + city', () => {
+    expect(bg.roundupEntityKey({ displayName: { text: '  De  Kruidtuin ' } }, 'Antwerp'))
+      .toBe('de kruidtuin|antwerp');
+  });
+
+  test('records venues, moves repeats to the back, and caps the window', async () => {
+    await bg.recordRoundupPostedEntities(
+      [{ displayName: { text: 'X' } }, { displayName: { text: 'Y' } }], 'Gent');
+    expect(await bg.getRoundupRecentKeys()).toEqual(['x|gent', 'y|gent']);
+
+    // Re-posting Y moves it to the back; Z is appended.
+    await bg.recordRoundupPostedEntities(
+      [{ displayName: { text: 'Y' } }, { displayName: { text: 'Z' } }], 'Gent');
+    expect(await bg.getRoundupRecentKeys()).toEqual(['x|gent', 'y|gent', 'z|gent']);
+
+    // The cap keeps only the most-recent keys.
+    await bg.recordRoundupPostedEntities([{ displayName: { text: 'W' } }], 'Gent', 2);
+    expect(await bg.getRoundupRecentKeys()).toEqual(['z|gent', 'w|gent']);
+  });
 });
 
 describe('getAutoCaptionRoundupBG', () => {
