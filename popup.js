@@ -1076,8 +1076,8 @@ function updateQualityBadges() {
   });
 }
 
-async function createCoverOverlay(imgUri, restaurantName, address) {
-  const key = `${imgUri.slice(-40)}|${restaurantName}`;
+async function createCoverOverlay(imgUri, restaurantName, address, country = "Belgium") {
+  const key = `${imgUri.slice(-40)}|${restaurantName}|${country}`;
   if (coverOverlayCache.has(key)) return coverOverlayCache.get(key);
 
   return new Promise(resolve => {
@@ -1189,7 +1189,7 @@ async function createCoverOverlay(imgUri, restaurantName, address) {
         ctx.shadowBlur   = 3;
         ctx.shadowOffsetY = 0;
         const pad = Math.round(W * 0.032);
-        ctx.fillText(`${city}, Belgium`, W - pad, H - pad);
+        ctx.fillText(`${city}, ${country}`, W - pad, H - pad);
       }
 
       const result = canvas.toDataURL('image/jpeg', 0.97);
@@ -4373,12 +4373,104 @@ function buildRegionSelect(countryCode, selectId = "rrRegion") {
   if (prev === RR_RANDOM_REGION || regions.includes(prev)) sel.value = prev;
 }
 buildRegionSelect("BE");
+
+// ── City dropdown — an independent location source alongside the province
+// dropdown. Reuses the per-country AB_CITY_POOL so no extra data is needed.
+// Empty value ("— Select a city —") means "use the region instead".
+function buildCitySelect(countryCode, selectId) {
+  const sel = document.getElementById(selectId);
+  if (!sel) return;
+  const prev   = sel.value;
+  const cities = (AB_CITY_POOL[countryCode] || []).slice().sort((a, b) => a.localeCompare(b));
+  sel.innerHTML = "";
+
+  const none = document.createElement("option");
+  none.value = "";
+  none.textContent = "— Select a city —";
+  sel.appendChild(none);
+
+  cities.forEach(name => {
+    const opt = document.createElement("option");
+    opt.value = name;
+    opt.textContent = name;
+    sel.appendChild(opt);
+  });
+  // Preserve previous city if it still exists for the new country, else reset.
+  sel.value = cities.includes(prev) ? prev : "";
+}
+
+// Region and City are mutually-exclusive sources: a non-empty city greys the
+// region group; a specific province (not "Random Region") greys the city group.
+// When both are neutral (random region + no city) neither is greyed — both stay
+// freely selectable. Greying is visual only (no `disabled`), so the user can
+// click the muted control to hand the active source back to it.
+function applyRoundupSourceMode(regionId, cityId) {
+  const regionSel = document.getElementById(regionId);
+  const citySel   = document.getElementById(cityId);
+  if (!regionSel || !citySel) return;
+  const cityMode     = !!citySel.value;
+  const provinceMode = !cityMode && regionSel.value !== RR_RANDOM_REGION;
+  regionSel.closest(".ab-group")?.classList.toggle("rr-source-muted", cityMode);
+  citySel.closest(".ab-group")?.classList.toggle("rr-source-muted", provinceMode);
+}
+
+// Wire the change handlers that keep the two sources mutually exclusive.
+function wireRoundupSource(regionId, cityId, onChange) {
+  const regionSel = document.getElementById(regionId);
+  const citySel   = document.getElementById(cityId);
+  if (!regionSel || !citySel) return;
+  citySel.addEventListener("change", () => {
+    if (citySel.value) regionSel.value = RR_RANDOM_REGION; // city wins → neutralize province
+    applyRoundupSourceMode(regionId, cityId);
+    onChange?.();
+  });
+  regionSel.addEventListener("change", () => {
+    if (regionSel.value !== RR_RANDOM_REGION) citySel.value = ""; // province wins → clear city
+    applyRoundupSourceMode(regionId, cityId);
+    onChange?.();
+  });
+}
+
+// Resolves the effective search location from a region/city pair: the city when
+// one is selected, otherwise the province (a "Random Region" picks one at random).
+function resolveRoundupLocation(regionVal, cityVal, country) {
+  if (cityVal) return cityVal;
+  if (regionVal === RR_RANDOM_REGION) {
+    const regions = REGIONS[country] || [];
+    return regions.length ? regions[Math.floor(Math.random() * regions.length)] : "";
+  }
+  return regionVal || "";
+}
+
+buildCitySelect("BE", "rrCity");
 document.getElementById("rrCountry")?.addEventListener("change", e => {
   buildRegionSelect(e.target.value);
+  buildCitySelect(e.target.value, "rrCity");
+  applyRoundupSourceMode("rrRegion", "rrCity");
 });
+wireRoundupSource("rrRegion", "rrCity", () => regionRoundupChanged());
 
 // ── Region Roundup search waterfall (popup-side, for previews) ────────────────
 async function searchAutoPlacesCollection(type, country, region, minRatings, minStars, size, ranking) {
+  // Keyless mode: no Google key configured — delegate to the background's
+  // keyless roundup waterfall (Maps/Yelp scrape → Foursquare → OSM), which also
+  // resolves a cover photo per place via the free photo waterfall and embeds it
+  // as a data URL in place.photos[0] so the existing render/post code works
+  // unchanged. Mirrors the keyless approach used by manual search (V3.1).
+  if (!API_KEY) {
+    const resp = await chrome.runtime.sendMessage({
+      type:   "GENERATE_ROUNDUP_PREVIEW",
+      config: { type, country, region, size, ranking, minRatings, minStars },
+    });
+    if (!resp?.ok) throw new Error(resp?.error || "Keyless roundup search failed.");
+    if (!resp.places?.length)
+      throw new Error(`No ${type}s found in "${region}" (try relaxing filters)`);
+    return resp.places;
+  }
+  return searchAutoPlacesCollectionGoogle(type, country, region, minRatings, minStars, size, ranking);
+}
+
+async function searchAutoPlacesCollectionGoogle(type, country, region, minRatings, minStars, size, ranking) {
   const typeQuery   = AB_TYPE_QUERY[type] || "restaurant";
   const countryName = AB_COUNTRY_NAMES[country] || "Belgium";
   const bounds      = AB_COUNTRY_BOUNDS[country] || AB_COUNTRY_BOUNDS.BE;
@@ -4482,8 +4574,6 @@ function getAutoCaptionRoundup(places, type, region, language, captionOpts, song
 
 // Preview Example Roundup Post — runs a real search and renders the result
 async function previewExampleRoundupPost() {
-  if (!API_KEY) { setStatus("Please save your API key first.", "error"); return; }
-
   const panel   = document.getElementById("rrPreview");
   const content = document.getElementById("rrPreviewContent");
   if (!panel || !content) return;
@@ -4575,6 +4665,7 @@ function saveRegionRoundupConfig() {
     type:      document.querySelector("#rrType .ab-pill.active")?.dataset?.val || "restaurant",
     country:   document.getElementById("rrCountry")?.value || "BE",
     region:    document.getElementById("rrRegion")?.value  || "",
+    city:      document.getElementById("rrCity")?.value    || "",
     size:      document.querySelector("#rrSize .ab-pill.active")?.dataset?.val || "5",
     ranking:   document.querySelector("#rrRanking .ab-pill.active")?.dataset?.val || "rating",
     minRatings: document.getElementById("rrMinRatings")?.value || "100",
@@ -4601,7 +4692,7 @@ function saveRegionRoundupConfig() {
 }
 
 const RR_CONFIG_DEFAULTS = {
-  type: "restaurant", country: "BE", region: "Antwerp",
+  type: "restaurant", country: "BE", region: "Antwerp", city: "",
   size: "5", ranking: "rating", minRatings: "100", minStars: "4",
   language: "nl", songGenre: "top100",
   capRatings: true, capReviewCount: true, capHashtags: false, capSong: true,
@@ -4622,7 +4713,10 @@ function loadRegionRoundupConfig() {
     pill("rrType", cfg.type);
     sel("rrCountry", cfg.country);
     buildRegionSelect(cfg.country);
+    buildCitySelect(cfg.country, "rrCity");
     if (cfg.region) sel("rrRegion", cfg.region);
+    if (cfg.city != null) sel("rrCity", cfg.city);
+    applyRoundupSourceMode("rrRegion", "rrCity");
 
     pill("rrSize", cfg.size);
     pill("rrRanking", cfg.ranking);
@@ -4690,11 +4784,9 @@ initRegionRoundupPersistence();
 function getRegionRoundupSettings() {
   const country = document.getElementById("rrCountry")?.value || "BE";
   const type    = document.querySelector("#rrType .ab-pill.active")?.dataset?.val || "restaurant";
-  let region    = document.getElementById("rrRegion")?.value || "";
-  if (region === RR_RANDOM_REGION) {
-    const regions = REGIONS[country] || [];
-    region = regions.length ? regions[Math.floor(Math.random() * regions.length)] : "";
-  }
+  const regionVal = document.getElementById("rrRegion")?.value || "";
+  const cityVal   = document.getElementById("rrCity")?.value   || "";
+  const region    = resolveRoundupLocation(regionVal, cityVal, country);
 
   const minRatings = parseInt(document.getElementById("rrMinRatings")?.value || "100", 10);
   const minStars   = parseFloat(document.querySelector("#rrMinStars .ab-pill.active")?.dataset?.val || "4");
@@ -4879,8 +4971,9 @@ document.getElementById("rrScheduleBtn")?.addEventListener("click", () => {
 });
 
 function activateRoundup() {
-  if (!API_KEY) { alert("Please save your Google API key before activating Region Roundup."); return; }
-  if (!document.getElementById("rrRegion")?.value) { alert("Please select a region for Region Roundup."); return; }
+  if (!document.getElementById("rrRegion")?.value && !document.getElementById("rrCity")?.value) {
+    alert("Please select a region or city for Region Roundup."); return;
+  }
   const platforms = [];
   if (document.getElementById("rrSocialIG")?.classList.contains("active")) platforms.push("instagram");
   if (document.getElementById("rrSocialFB")?.classList.contains("active")) platforms.push("facebook");
@@ -5154,9 +5247,10 @@ function updateRoundupConfigSummary() {
   const size    = document.querySelector("#rrSize .ab-pill.active")?.dataset?.val || "5";
   const cc      = document.getElementById("rrCountry")?.value || "BE";
   const country = AB_COUNTRY_NAMES[cc] || cc;
+  const cityVal   = document.getElementById("rrCity")?.value || "";
   const regionVal = document.getElementById("rrRegion")?.value || "—";
-  const region  = regionVal === RR_RANDOM_REGION ? "🎲 Random region" : regionVal;
-  el.textContent = `Top ${size} ${type}s · ${region}, ${country}`;
+  const location  = cityVal || (regionVal === RR_RANDOM_REGION ? "🎲 Random region" : regionVal);
+  el.textContent = `Top ${size} ${type}s · ${location}, ${country}`;
 }
 
 // ── Paused banner ──────────────────────────────────────────────────────────────
@@ -5290,9 +5384,13 @@ if (rrSlider && rrSliderVal) {
 let currentRoundup = null; // { places, photoDataUrls, caption, type, region, size }
 
 buildRegionSelect("BE", "mrRegion");
+buildCitySelect("BE", "mrCity");
 document.getElementById("mrCountry")?.addEventListener("change", e => {
   buildRegionSelect(e.target.value, "mrRegion");
+  buildCitySelect(e.target.value, "mrCity");
+  applyRoundupSourceMode("mrRegion", "mrCity");
 });
+wireRoundupSource("mrRegion", "mrCity");
 
 // ── Collapsible config toggle ─────────────────────────────────────────────────
 document.getElementById("mrConfigToggle")?.addEventListener("click", () => {
@@ -5333,12 +5431,10 @@ if (mrSlider && mrSliderVal) {
 
 // ── Read current Manual Roundup form values ───────────────────────────────────
 function getManualRoundupSettings() {
-  const country = document.getElementById("mrCountry")?.value || "BE";
-  let region    = document.getElementById("mrRegion")?.value || "";
-  if (region === RR_RANDOM_REGION) {
-    const regions = REGIONS[country] || [];
-    region = regions.length ? regions[Math.floor(Math.random() * regions.length)] : "";
-  }
+  const country   = document.getElementById("mrCountry")?.value || "BE";
+  const regionVal = document.getElementById("mrRegion")?.value || "";
+  const cityVal   = document.getElementById("mrCity")?.value   || "";
+  const region    = resolveRoundupLocation(regionVal, cityVal, country);
 
   return {
     type:     document.querySelector("#mrType .ab-pill.active")?.dataset?.val || "restaurant",
@@ -5362,10 +5458,8 @@ function getManualRoundupSettings() {
 document.getElementById("mrGenerateBtn")?.addEventListener("click", generateManualRoundup);
 
 async function generateManualRoundup() {
-  if (!API_KEY) { setStatus("Please save your API key first.", "error"); return; }
-
   const settings = getManualRoundupSettings();
-  if (!settings.region) { setStatus("Please select a region for the roundup.", "error"); return; }
+  if (!settings.region) { setStatus("Please select a region or city for the roundup.", "error"); return; }
 
   const panel   = document.getElementById("mrPreview");
   const content = document.getElementById("mrPreviewContent");
@@ -5390,24 +5484,31 @@ async function generateManualRoundup() {
     TechLog.info("SEARCH", "search_done", { run_id: runId, run_type: "manual_roundup",
       count: places.length, duration_ms: Date.now()-t_search });
 
-    setStatus(`Preparing ${places.length} cover photos…`);
-    const photoDataUrls = [];
-    for (const place of places) {
-      const photo = (place.photos || [])[0];
-      if (!photo) continue;
-      try {
-        const uri = await resolvePhotoUri(photo.name, 1440);
-        photoDataUrls.push(await photoToDataUrl(uri));
-      } catch (e) {
-        AppLog.error("Roundup photo fetch failed", { place: place.displayName?.text, error: String(e) });
-      }
-    }
+    setStatus(`Preparing cover photos for ${places.length} ${settings.type}s…`);
+    // One entity per place, each with its OWN pool of candidate photos so a
+    // picture can be dismissed and replaced by another photo of the same entity.
+    const entities = places
+      .map(place => ({
+        name:           place.displayName?.text || "",
+        address:        place.formattedAddress  || "",
+        country:        AB_COUNTRY_NAMES[settings.country] || "Belgium",
+        candidates:     (place.photos || []).filter(p => p?.name),
+        idx:            0,
+        dismissed:      [],
+        showName:       true,   // entity-name overlay shown by default
+        seenSourceUrls: place._seenSourceUrls || [],
+        finalDataUrl:   "",
+      }))
+      .filter(e => e.candidates.length > 0);
 
     const caption  = getAutoCaptionRoundup(places, settings.type, settings.region, settings.language, settings.captionOpts, null);
     const typeLabel  = settings.type.charAt(0).toUpperCase() + settings.type.slice(1);
     const langLabels = { nl:"Dutch", en:"English", fr:"French", de:"German" };
 
-    currentRoundup = { places, photoDataUrls, caption, type: settings.type, region: settings.region };
+    currentRoundup = {
+      places, entities, caption, photoDataUrls: [],
+      type: settings.type, region: settings.region,
+    };
 
     content.innerHTML = `
       <div class="auto-preview-meta">
@@ -5415,27 +5516,23 @@ async function generateManualRoundup() {
         <span class="auto-preview-region">📍 ${escapeHtml(settings.region)}</span>
         <span class="auto-preview-lang">🌐 ${langLabels[settings.language] || settings.language}</span>
       </div>
+      <p class="ab-preview-hint">Toggle <strong>Name</strong> to show/hide the entity name on a photo, or <strong>✕</strong> to swap in another photo of that ${escapeHtml(settings.type)}.</p>
       <div class="auto-preview-photos" id="mrPreviewPhotos"></div>
       ${caption ? `<div class="auto-preview-caption">${escapeHtml(caption).replace(/\n/g, "<br>")}</div>` : ""}
-      <p class="auto-preview-note">${places.length} entities · ≥${escapeHtml(settings.minRatings)} ratings · ≥${escapeHtml(settings.minStars)}⭐</p>
+      <p class="auto-preview-note">${entities.length} entities · ≥${escapeHtml(settings.minRatings)} ratings · ≥${escapeHtml(settings.minStars)}⭐</p>
     `;
 
-    const photoGrid = document.getElementById("mrPreviewPhotos");
-    if (photoGrid) {
-      photoDataUrls.forEach((dataUrl, i) => {
-        const div = document.createElement("div");
-        div.className = "auto-preview-photo";
-        div.innerHTML = `<img src="${dataUrl}" alt="${escapeHtml(places[i]?.displayName?.text || "")}" />`;
-        photoGrid.appendChild(div);
-      });
-    }
+    // Resolve each entity's first photo (name overlay burned in) and render.
+    await Promise.all(entities.map(e => renderRoundupEntityPhoto(e)));
+    syncRoundupPhotoDataUrls();
+    renderRoundupGrid();
 
     TechLog.info("MEDIA", "photos_done", { run_id: runId, run_type: "manual_roundup",
-      photo_source: "google_places_manual", photo_count: photoDataUrls.length });
+      photo_source: API_KEY ? "google_places_manual" : "free_waterfall", photo_count: currentRoundup.photoDataUrls.length });
     TechLog.info("POST", "run_complete", { run_id: runId, run_type: "manual_roundup",
       region: settings.region, status: "rendered", total_duration_ms: Date.now()-runStart });
     TechLog._flush();
-    AppLog.info("Manual Region Roundup generated", { region: settings.region, count: places.length });
+    AppLog.info("Manual Region Roundup generated", { region: settings.region, count: entities.length });
     setStatus("✅ Roundup ready — choose platforms and post!", "success");
   } catch (err) {
     TechLog.error("POST", "run_failed", { run_id: runId, run_type: "manual_roundup",
@@ -5446,6 +5543,155 @@ async function generateManualRoundup() {
     currentRoundup = null;
   } finally {
     if (genBtn) genBtn.disabled = false;
+  }
+}
+
+// Resolves an entity's currently-selected candidate into a post-ready data URL:
+// the entity-name cover overlay burned in when showName is true, or a plain
+// centre-cropped photo when it's hidden. Reuses the single-post cover workflow
+// (createCoverOverlay) so the name treatment matches the rest of the app.
+async function renderRoundupEntityPhoto(entity) {
+  const cand = entity.candidates[entity.idx];
+  if (!cand) { entity.finalDataUrl = ""; return ""; }
+  try {
+    const uri = await resolvePhotoUri(cand.name, 1600);
+    entity.finalDataUrl = entity.showName
+      ? (await createCoverOverlay(uri, entity.name, entity.address, entity.country)) || (await photoToDataUrl(uri))
+      : await photoToDataUrl(uri);
+  } catch (e) {
+    AppLog.error("Roundup entity photo failed", { entity: entity.name, error: String(e) });
+    entity.finalDataUrl = "";
+  }
+  return entity.finalDataUrl;
+}
+
+// Keeps the flat photoDataUrls array (consumed by post/export) in sync with the
+// per-entity selections + name-overlay state.
+function syncRoundupPhotoDataUrls() {
+  if (!currentRoundup) return;
+  currentRoundup.photoDataUrls = currentRoundup.entities
+    .map(e => e.finalDataUrl)
+    .filter(Boolean);
+}
+
+// Renders the interactive roundup photo grid — one slot per entity, each with a
+// name-overlay toggle and a dismiss (swap-photo) button.
+function renderRoundupGrid() {
+  const grid = document.getElementById("mrPreviewPhotos");
+  if (!grid || !currentRoundup) return;
+  grid.innerHTML = "";
+  currentRoundup.entities.forEach((entity, i) => {
+    const div = document.createElement("div");
+    div.className = "auto-preview-photo";
+    div.dataset.entity = i;
+    div.title = entity.name;
+    fillRoundupSlot(div, entity, i);
+    grid.appendChild(div);
+  });
+}
+
+function fillRoundupSlot(div, entity, i) {
+  const hasAlt = roundupHasAlternative(entity);
+  div.innerHTML = entity.finalDataUrl
+    ? `<img src="${entity.finalDataUrl}" alt="${escapeHtml(entity.name)}" />`
+    : `<div class="loading-thumb">Unavailable</div>`;
+  div.insertAdjacentHTML("beforeend", `
+    <button class="make-cover-btn rr-name-toggle ${entity.showName ? "is-on" : ""}"
+            title="${entity.showName ? "Hide entity name" : "Show entity name"}">${entity.showName ? "Name ✕" : "+ Name"}</button>
+    <span class="photo-label">${i + 1}</span>
+    ${hasAlt ? `<button class="dismiss-btn" title="Swap in another photo of ${escapeHtml(entity.name)}">✕</button>` : ""}
+  `);
+  div.querySelector(".rr-name-toggle")?.addEventListener("click", e => {
+    e.stopPropagation(); toggleRoundupName(i);
+  });
+  div.querySelector(".dismiss-btn")?.addEventListener("click", e => {
+    e.stopPropagation(); dismissRoundupPhoto(i);
+  });
+}
+
+// Index of the next candidate to show for an entity: the first one that isn't
+// the current photo and hasn't already been dismissed (-1 if none remain).
+function pickNextRoundupIdx(entity) {
+  return entity.candidates.findIndex((c, idx) =>
+    idx !== entity.idx && !entity.dismissed.includes(c.name));
+}
+
+// True when another photo can be shown for this entity — either an un-dismissed
+// local candidate, or a keyless source we can still top up from.
+function roundupHasAlternative(entity) {
+  return pickNextRoundupIdx(entity) !== -1 || (entity.seenSourceUrls?.length > 0);
+}
+
+// Hide/show the entity name on a single photo (re-burns or strips the overlay).
+async function toggleRoundupName(i) {
+  const entity = currentRoundup?.entities[i];
+  if (!entity) return;
+  entity.showName = !entity.showName;
+  const div = document.querySelector(`#mrPreviewPhotos [data-entity="${i}"]`);
+  if (div) div.classList.add("replacing");
+  await renderRoundupEntityPhoto(entity);
+  syncRoundupPhotoDataUrls();
+  if (div) { div.classList.remove("replacing"); fillRoundupSlot(div, entity, i); }
+}
+
+// Dismiss the current photo and swap in another one OF THE SAME ENTITY.
+async function dismissRoundupPhoto(i) {
+  const entity = currentRoundup?.entities[i];
+  if (!entity) return;
+  const current = entity.candidates[entity.idx];
+  if (current) entity.dismissed.push(current.name);
+
+  const div = document.querySelector(`#mrPreviewPhotos [data-entity="${i}"]`);
+  let nextIdx = pickNextRoundupIdx(entity);
+
+  // Local pool exhausted — try a keyless top-up for fresh photos of this entity.
+  if (nextIdx === -1 && entity.seenSourceUrls?.length) {
+    if (div) { div.classList.add("replacing"); div.querySelector("img")?.replaceWith(Object.assign(document.createElement("div"), { className: "loading-thumb", textContent: "Loading…" })); }
+    await topUpRoundupPhotos(entity);
+    nextIdx = pickNextRoundupIdx(entity);
+  }
+
+  if (nextIdx === -1) {
+    if (current) entity.dismissed.pop(); // nothing to swap to — keep current photo
+    if (div) { div.classList.remove("replacing"); fillRoundupSlot(div, entity, i); }
+    setStatus(`No more photos available for ${entity.name}.`, "error");
+    return;
+  }
+
+  entity.idx = nextIdx;
+  if (div) div.classList.add("replacing");
+  await renderRoundupEntityPhoto(entity);
+  syncRoundupPhotoDataUrls();
+  if (div) { div.classList.remove("replacing"); fillRoundupSlot(div, entity, i); }
+}
+
+// Keyless top-up: fetch more free photos for one entity, excluding the source
+// URLs already consumed, and append them to its candidate pool.
+let _roundupTopUpInFlight = false;
+async function topUpRoundupPhotos(entity) {
+  if (_roundupTopUpInFlight || !entity.seenSourceUrls?.length) return;
+  _roundupTopUpInFlight = true;
+  try {
+    const result = await chrome.runtime.sendMessage({
+      type:         "FETCH_FREE_PHOTOS",
+      businessName: entity.name,
+      address:      entity.address,
+      entityType:   currentRoundup?.type || "restaurant",
+      minPics:      5,
+      excludeUrls:  entity.seenSourceUrls,
+    });
+    const fresh = [...(result?.photoLog || []), ...(result?.extraPhotoLog || [])];
+    const have  = new Set(entity.candidates.map(c => c.name));
+    for (const p of fresh) {
+      if (!p.dataUrl || have.has(p.dataUrl)) continue;
+      entity.candidates.push({ name: p.dataUrl });
+      have.add(p.dataUrl);
+      if (p.sourceUrl) entity.seenSourceUrls.push(p.sourceUrl);
+    }
+  } catch (e) {
+    AppLog.warn("Roundup photo top-up failed", { entity: entity.name, error: String(e) });
+  } finally {
+    _roundupTopUpInFlight = false;
   }
 }
 
@@ -5609,6 +5855,9 @@ if (typeof module !== 'undefined' && module.exports) {
     // Region Roundup
     REGIONS,
     buildRegionSelect,
+    buildCitySelect,
+    applyRoundupSourceMode,
+    resolveRoundupLocation,
     searchAutoPlacesCollection,
     getAutoCaptionRoundup,
     getRegionRoundupSettings,
@@ -5622,6 +5871,8 @@ if (typeof module !== 'undefined' && module.exports) {
     generateManualRoundup,
     postManualRoundup,
     exportManualRoundup,
+    pickNextRoundupIdx,
+    roundupHasAlternative,
     getCurrentRoundup: () => currentRoundup,
   };
 }
