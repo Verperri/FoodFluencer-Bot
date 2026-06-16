@@ -27,6 +27,15 @@ async function loadPopupDom(storageOverrides = {}) {
 
   global.CONFIG = { REGION: 'be', MAX_PHOTOS: 5 };
 
+  // popup.js consumes the SHARED_* reference data (normally provided by config.js
+  // loaded via its <script> tag, which we strip here) at module load. Expose
+  // every SHARED_* export from the real config.js so the test uses the same
+  // single source of truth — new shared symbols are picked up automatically.
+  const shared = require('../../config.js');
+  for (const k of Object.keys(shared)) {
+    if (k.startsWith('SHARED_')) global[k] = shared[k];
+  }
+
   const storageData = {
     hasSeenOnboarding: true,
     googleApiKey: 'test-google-key',

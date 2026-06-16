@@ -865,20 +865,24 @@ const AppLog = {
       message,
       data:    data !== undefined ? (typeof data === "string" ? data : JSON.stringify(data)) : null,
     };
-    chrome.storage.local.get({ appLog: [] }, ({ appLog }) => {
-      appLog.push(entry);
-      if (appLog.length > 800) appLog = appLog.slice(-600);
-      chrome.storage.local.set({ appLog });
-    });
+    // Hand the line to the service worker, the single writer of `appLog`, so the
+    // popup and the background bot can't clobber each other's entries with a
+    // racing get→push→set. Fire-and-forget — logging never blocks or throws.
+    try {
+      const p = chrome.runtime.sendMessage({ type: "APP_LOG", entry });
+      if (p && typeof p.catch === "function") p.catch(() => {});
+    } catch (_) { /* background unreachable — drop the line */ }
   },
   info:  (msg, d) => AppLog._write("info",  msg, d),
   warn:  (msg, d) => AppLog._write("warn",  msg, d),
   error: (msg, d) => AppLog._write("error", msg, d),
 };
 
-// Reused regex for extracting city from a formatted address
-// Matches "1234 CityName, Country" patterns across all supported countries.
-const CITY_FROM_ADDRESS_RE = /\d{4}\s+([A-Za-zÀ-ÿ\s-]+),\s*(?:Belgium|France|Germany|Luxembourg|(?:The )?Netherlands)/i;
+// City extraction from a formatted address — shared with the service worker via
+// config.js (single source of truth). Previously a popup-local, country-anchored
+// variant here silently failed on localized country names (e.g. "België") and
+// fell back to the street name; the shared pattern fixes that.
+const CITY_FROM_ADDRESS_RE = SHARED_CITY_FROM_ADDRESS_RE;
 
 // ── State ─────────────────────────────────────────────────────────────────────
 
@@ -1203,9 +1207,10 @@ async function createCoverOverlay(imgUri, restaurantName, address, country = "Be
 
 function setCoverPhoto(newIndex) {
   if (!currentRestaurant) return;
-  // Clicking the current cover photo's badge again clears it (no cover photo)
+  // Clicking the current cover photo's badge again clears it (no cover photo).
+  // No cache invalidation needed — overlays are keyed per image+name+country, so
+  // toggling which photo is the cover reuses any overlay already computed.
   coverPhotoIndex = (newIndex === coverPhotoIndex) ? -1 : newIndex;
-  coverOverlayCache.clear(); // invalidate cache (photo changed)
   renderPhotoGrid();
   saveState();
 }
@@ -1225,7 +1230,7 @@ function reorderPhotos(fromIndex, toIndex) {
 
   if (coverPhoto) coverPhotoIndex = photos.indexOf(coverPhoto);
 
-  coverOverlayCache.clear();
+  // Reordering changes positions, not image content — overlays stay valid.
   renderPhotoGrid();
   saveState();
   AppLog.info("Photo order changed", { fromIndex, toIndex });
@@ -2735,20 +2740,10 @@ async function getAutoSong(genre, country) {
 
 // ── Auto Bot: type / country data ────────────────────────────────────────────
 
-// Maps UI type value → plain-language search term for Places API
-const AB_TYPE_QUERY = {
-  restaurant: "restaurant",
-  hotel:      "hotel",
-  bar:        "bar",
-};
-
-const AB_COUNTRY_NAMES = {
-  BE: "Belgium",
-  FR: "France",
-  DE: "Germany",
-  LU: "Luxembourg",
-  NL: "The Netherlands",
-};
+// Type / country / city data is shared with the service worker via config.js
+// (single source of truth — see SHARED_* there).
+const AB_TYPE_QUERY    = SHARED_TYPE_QUERY;
+const AB_COUNTRY_NAMES = SHARED_COUNTRY_NAMES;
 
 // ISO country codes for OpenStreetMap/Nominatim's `countrycodes` filter.
 const OSM_COUNTRY_CODES = {
@@ -2762,23 +2757,7 @@ const OSM_COUNTRY_CODES = {
 // City pools — used when "All regions" is selected so each search is anchored
 // to a different city rather than the whole country (country-wide queries always
 // return the same top-20 nationally popular places from the Places API).
-const AB_CITY_POOL = {
-  BE: ["Bruges","Ghent","Antwerp","Brussels","Liège","Namur","Mons","Leuven",
-       "Mechelen","Hasselt","Kortrijk","Ostend","Aalst","Genk","Sint-Niklaas",
-       "Tournai","Charleroi","Arlon","Dinant","Durbuy","Spa","Bastogne",
-       "Tongeren","Diest","Dendermonde","Roeselare","Ieper","Veurne","Chimay"],
-  FR: ["Paris","Lyon","Marseille","Bordeaux","Toulouse","Nice","Strasbourg",
-       "Nantes","Montpellier","Lille","Rennes","Reims","Tours","Angers",
-       "Metz","Nancy","Dijon","Grenoble","Brest","Perpignan"],
-  DE: ["Berlin","Hamburg","Munich","Cologne","Frankfurt","Stuttgart","Düsseldorf",
-       "Leipzig","Dortmund","Bremen","Hannover","Nuremberg","Dresden","Freiburg",
-       "Heidelberg","Trier","Erfurt","Regensburg","Würzburg","Lübeck"],
-  LU: ["Luxembourg City","Esch-sur-Alzette","Differdange","Dudelange","Ettelbruck",
-       "Diekirch","Wiltz","Echternach","Remich","Vianden"],
-  NL: ["Amsterdam","Rotterdam","The Hague","Utrecht","Eindhoven","Groningen",
-       "Tilburg","Almere","Breda","Nijmegen","Leiden","Maastricht","Haarlem",
-       "Arnhem","Delft","Deventer","Zwolle","Amersfoort","Middelburg"],
-};
+const AB_CITY_POOL = SHARED_CITY_POOL;
 
 function pickRandomCity(cc) {
   const pool = AB_CITY_POOL[cc] || AB_CITY_POOL.BE;
@@ -4517,24 +4496,10 @@ async function searchAutoPlacesCollectionGoogle(type, country, region, minRating
 }
 
 // ── Region Roundup caption generator (popup-side, mirrors background) ────────
-const RR_TYPE_LABELS = {
-  en: { restaurant: { s: "restaurant", p: "restaurants" }, hotel: { s: "hotel", p: "hotels" }, bar: { s: "bar", p: "bars" } },
-  nl: { restaurant: { s: "restaurant", p: "restaurants" }, hotel: { s: "hotel", p: "hotels" }, bar: { s: "bar", p: "bars" } },
-  fr: { restaurant: { s: "restaurant", p: "restaurants" }, hotel: { s: "hôtel", p: "hôtels" }, bar: { s: "bar", p: "bars" } },
-  de: { restaurant: { s: "Restaurant", p: "Restaurants" }, hotel: { s: "Hotel", p: "Hotels" }, bar: { s: "Bar", p: "Bars" } },
-};
-const RR_HEADER_TEMPLATES = {
-  en: (n, p, region) => `🔝 Top ${n} ${p} in ${region}`,
-  nl: (n, p, region) => `🔝 Top ${n} ${p} in ${region}`,
-  fr: (n, p, region) => `🔝 Top ${n} ${p} à ${region}`,
-  de: (n, p, region) => `🔝 Top ${n} ${p} in ${region}`,
-};
-const RR_INTRO_TEMPLATES = {
-  en: (region) => `Here's our pick of the best spots ${region} has to offer 👇`,
-  nl: (region) => `Dit zijn de beste plekjes die ${region} te bieden heeft 👇`,
-  fr: (region) => `Voici notre sélection des meilleures adresses à ${region} 👇`,
-  de: (region) => `Das sind die besten Adressen, die ${region} zu bieten hat 👇`,
-};
+// Roundup caption building blocks — shared with the service worker via config.js.
+const RR_TYPE_LABELS      = SHARED_RR_TYPE_LABELS;
+const RR_HEADER_TEMPLATES = SHARED_RR_HEADER_TEMPLATES;
+const RR_INTRO_TEMPLATES  = SHARED_RR_INTRO_TEMPLATES;
 
 function getAutoCaptionRoundup(places, type, region, language, captionOpts, songInfo) {
   const lang   = RR_TYPE_LABELS[language] ? language : "en";
