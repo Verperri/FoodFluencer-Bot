@@ -901,7 +901,9 @@ h1 { font-size: 0.95rem; font-weight: 700; line-height: 1.2; }
 .ab-sched-status.done     { background: #f0fdf4; color: #15803d; }
 .ab-sched-status.triggered{ background: #eff6ff; color: #1d4ed8; }
 .ab-sched-status.failed   { background: #fef2f2; color: #991b1b; }
+.ab-sched-status.partial  { background: #eff6ff; color: #1e40af; }
 .ab-sched-status.unconfirmed { background: #fefce8; color: #a16207; }
+.ab-sched-status.missed   { background: #f4f4f5; color: #6b7280; }
 
 /* ── Source badge (combined schedule overview) ── */
 .ab-sched-source {
