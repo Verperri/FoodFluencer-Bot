@@ -34,6 +34,12 @@ async function mapLimit(items, limit, fn) {
 // gap between platform posts is a common automation fingerprint.
 const PLATFORM_SWITCH_DELAY_MS = 4000;
 
+// Yelp has returned HTTP 403 (DataDome) to every scrape request for days — see
+// tech_log: yelp_scrape_error on every run, in both search and photo waterfalls.
+// It never contributes a result and only adds latency + log noise, so it's
+// disabled at the waterfall level. Flip to true to re-enable if Yelp reopens.
+const YELP_ENABLED = false;
+
 // ── Post-failure failsafe ────────────────────────────────────────────────────
 // Classifies a failed post by inspecting the error message and a snippet of
 // the page captured at the moment of failure. This lets the bot react
@@ -136,6 +142,35 @@ chrome.runtime.onInstalled.addListener((details) => {
   }
 });
 
+// ── Scheduled-run pacing ──────────────────────────────────────────────────────
+// When the laptop wakes from sleep, Chrome fires every alarm that was missed
+// while it was closed — all at once. Firing many posting runs concurrently makes
+// them fight over window focus and races their song/photo picks (see tech_log
+// 2026-06-15 05:31: a 9-run burst on wake, every one unconfirmed). Two guards:
+//   1. SKIP badly-overdue runs — a post that only fired now because the machine
+//      was asleep is stale; publishing a hours/days-late shot helps no one.
+//   2. SERIALIZE the rest through a queue with a gap, so at most one posting flow
+//      is active at a time instead of a simultaneous burst.
+const RUN_GRACE_MS   = 2 * 60 * 60 * 1000; // later than this past its slot ⇒ stale
+const RUN_STAGGER_MS = 15000;              // gap between consecutive queued runs
+
+let _runQueueChain = Promise.resolve();
+function enqueueScheduledRun(label, fn) {
+  _runQueueChain = _runQueueChain.then(async () => {
+    try { await fn(); }
+    catch (e) { bgLog('error', `Scheduled run failed (${label})`, e?.message || String(e)); }
+    await sleep(RUN_STAGGER_MS, 0);
+  });
+  return _runQueueChain;
+}
+
+// A post's scheduled time is so far in the past it only fired because the device
+// was asleep — caller should skip it (mark "missed") rather than post stale.
+function isRunStale(post) {
+  const ms = new Date(`${post.date}T${post.time}:00`).getTime();
+  return Number.isFinite(ms) && (Date.now() - ms) > RUN_GRACE_MS;
+}
+
 // ── Auto Bot alarm handler ────────────────────────────────────────────────────
 // Fires when a scheduled post time is reached.
 // Logs the trigger and notifies the popup. Actual posting will be added in V1.5.
@@ -151,6 +186,21 @@ chrome.alarms.onAlarm.addListener((alarm) => {
       const post = data.autoBotRoundupSchedule?.posts?.[postIndex];
       if (!post) return;
 
+      // Stale (fired late after the device was asleep) — skip, don't post.
+      if (isRunStale(post)) {
+        const runLog = [...(data.regionRoundupRunLog || []), {
+          id: `roundup-${Date.now()}`, ts: new Date().toISOString(),
+          postIndex, date: post.date, time: post.time, platforms: post.platforms,
+          status: "missed",
+        }];
+        chrome.storage.local.set({ regionRoundupRunLog: runLog });
+        chrome.runtime.sendMessage({ type: "ROUNDUP_STATUS_UPDATE", postIndex, status: "missed" }).catch(() => {});
+        bgLog("warn", `Region Roundup: skipped stale post ${postIndex} (scheduled ${post.date} ${post.time}) — fired late after sleep`);
+        TechLog.warn("POST", "run_skipped_stale", { run_type: "roundup", postIndex, date: post.date, time: post.time });
+        TechLog._flush();
+        return;
+      }
+
       const logEntry = {
         id: `roundup-${Date.now()}`, ts: new Date().toISOString(),
         postIndex, date: post.date, time: post.time, platforms: post.platforms,
@@ -164,7 +214,7 @@ chrome.alarms.onAlarm.addListener((alarm) => {
         date: post.date, time: post.time, platforms: post.platforms,
       });
 
-      autoPostRoundupNow(postIndex);
+      enqueueScheduledRun(`roundup-${postIndex}`, () => autoPostRoundupNow(postIndex));
     });
     return;
   }
@@ -179,6 +229,21 @@ chrome.alarms.onAlarm.addListener((alarm) => {
 
     const post = data.autoBotSchedule?.posts?.[postIndex];
     if (!post) return;
+
+    // Stale (fired late after the device was asleep) — skip, don't post.
+    if (isRunStale(post)) {
+      const runLog = [...(data.autoBotRunLog || []), {
+        id: `post-${Date.now()}`, ts: new Date().toISOString(),
+        postIndex, date: post.date, time: post.time, platforms: post.platforms,
+        status: "missed",
+      }];
+      chrome.storage.local.set({ autoBotRunLog: runLog });
+      chrome.runtime.sendMessage({ type: "AUTO_BOT_STATUS_UPDATE", postIndex, status: "missed" }).catch(() => {});
+      bgLog("warn", `Auto Bot: skipped stale post ${postIndex} (scheduled ${post.date} ${post.time}) — fired late after sleep`);
+      TechLog.warn("POST", "run_skipped_stale", { run_type: "auto", postIndex, date: post.date, time: post.time });
+      TechLog._flush();
+      return;
+    }
 
     const logEntry = {
       id:          `post-${Date.now()}`,
@@ -202,8 +267,9 @@ chrome.alarms.onAlarm.addListener((alarm) => {
       platforms: post.platforms,
     });
 
-    // Trigger the full auto-posting flow
-    autoPostNow(postIndex);
+    // Trigger the full auto-posting flow (serialized so a wake-burst of alarms
+    // runs one at a time instead of all at once).
+    enqueueScheduledRun(`auto-${postIndex}`, () => autoPostNow(postIndex));
   });
 });
 
@@ -404,8 +470,8 @@ async function searchAutoPlaceBG(config, apiKey, foursquareApiKey) {
     TechLog.warn('SEARCH', 'auto_search_error', { source: 'maps_scrape', error: e.message });
   }
 
-  // ── 2. Yelp search page ────────────────────────────────────────────────────
-  try {
+  // ── 2. Yelp search page (disabled — Yelp returns HTTP 403 to scrapers) ──────
+  if (YELP_ENABLED) try {
     const html = await Promise.race([
       fetch(
         `https://www.yelp.com/search?find_desc=${encodeURIComponent(typeQ)}&find_loc=${encodeURIComponent(`${city}, ${country}`)}`,
@@ -634,8 +700,8 @@ async function searchAutoPlacesCollectionBG(config, apiKey, foursquareApiKey, ex
     TechLog.warn('SEARCH', 'roundup_search_error', { source: 'maps_scrape', error: e.message });
   }
 
-  // ── 2. Yelp search page ────────────────────────────────────────────────────
-  try {
+  // ── 2. Yelp search page (disabled — Yelp returns HTTP 403 to scrapers) ──────
+  if (YELP_ENABLED) try {
     const html = await Promise.race([
       fetch(
         `https://www.yelp.com/search?find_desc=${encodeURIComponent(typeQ)}&find_loc=${encodeURIComponent(`${city}, ${country}`)}`,
@@ -1806,8 +1872,8 @@ async function fetchPhotosWaterfall(businessName, address, entityType, minPics, 
     await collectFromUrls(ddgUrls, 'duckduckgo');
   }
 
-  // ── 3. Yelp — only if still short of pool ──────────────────────────────────
-  if (collected.length < poolTarget) {
+  // ── 3. Yelp — only if still short of pool (disabled: Yelp 403s every run) ───
+  if (YELP_ENABLED && collected.length < poolTarget) {
     bgLog('info', `PhotoWaterfall: need ${poolTarget - collected.length} more — trying Yelp`);
     const yelpUrls = await raceTimeout(scrapeYelpPhotos(businessName, city), 18000);
     if (yelpUrls.length > 0) await collectFromUrls(yelpUrls, 'yelp');
@@ -2296,23 +2362,26 @@ function getAutoCaptionRoundupBG(places, type, region, language, captionOpts, so
 
 // platforms param: pass explicitly from autoPostNow so we don't depend on
 // re-reading the schedule (which may have changed since the run started).
-async function updateRunLogStatus(postIndex, status, platforms = null) {
+async function updateRunLogStatus(postIndex, status, platforms = null, confirmedPlatforms = null, detail = null) {
   // 1. Update the per-schedule run log
   const d = await chrome.storage.local.get({ autoBotRunLog:[], autoBotSchedule:null });
   const log = d.autoBotRunLog;
   const entry = log.find(e => e.postIndex === postIndex);
-  if (entry) entry.status = status; else log.push({ postIndex, status, ts:new Date().toISOString() });
+  if (entry) { entry.status = status; if (detail) entry.detail = detail; }
+  else log.push({ postIndex, status, detail: detail || null, ts:new Date().toISOString() });
   await chrome.storage.local.set({ autoBotRunLog: log });
 
-  // 2. On completion, append to the persistent activityLog (survives deactivation)
-  if (status === "done") {
-    // Use the platforms passed directly — avoids stale schedule re-read
-    const resolvedPlatforms = platforms
-      || d.autoBotSchedule?.posts?.[postIndex]?.platforms
-      || [];
-
-    if (resolvedPlatforms.length) {
-      const newEntries = resolvedPlatforms.map(platform => ({
+  // 2. Append the platforms that ACTUALLY confirmed to the persistent activityLog
+  // (survives deactivation). On "done" that's every platform; on "partial" it's
+  // only the confirmed subset — so a real TikTok success is still recorded even
+  // when Instagram couldn't be confirmed.
+  const recordPlatforms = status === "done"
+    ? (confirmedPlatforms?.length ? confirmedPlatforms
+        : (platforms || d.autoBotSchedule?.posts?.[postIndex]?.platforms || []))
+    : (status === "partial" ? (confirmedPlatforms || []) : []);
+  if (status === "done" || status === "partial") {
+    if (recordPlatforms.length) {
+      const newEntries = recordPlatforms.map(platform => ({
         id:       `al-${Date.now()}-${platform}`,
         ts:       new Date().toISOString(),
         platform, postIndex, status: "done",
@@ -2321,36 +2390,38 @@ async function updateRunLogStatus(postIndex, status, platforms = null) {
       await chrome.storage.local.set({
         activityLog: [...al.activityLog, ...newEntries].slice(-2000),
       });
-      TechLog.info("LOG", "activity_log_written", { postIndex, platforms: resolvedPlatforms });
+      TechLog.info("LOG", "activity_log_written", { postIndex, platforms: recordPlatforms, runStatus: status });
       TechLog._flush(); // flush immediately so it survives even if worker is killed
-    } else {
+    } else if (status === "done") {
       TechLog.warn("LOG", "activity_log_skipped", { postIndex,
         reason: "no platforms resolved — schedule may have been regenerated" });
       TechLog._flush();
     }
   }
 
-  chrome.runtime.sendMessage({ type:"AUTO_BOT_STATUS_UPDATE", postIndex, status }).catch(() => {});
+  chrome.runtime.sendMessage({ type:"AUTO_BOT_STATUS_UPDATE", postIndex, status, detail }).catch(() => {});
 }
 
 // platforms param: pass explicitly from autoPostRoundupNow so we don't depend on
 // re-reading the schedule (which may have changed since the run started).
-async function updateRoundupRunLogStatus(postIndex, status, platforms = null) {
+async function updateRoundupRunLogStatus(postIndex, status, platforms = null, confirmedPlatforms = null, detail = null) {
   // 1. Update the per-schedule run log
   const d = await chrome.storage.local.get({ regionRoundupRunLog:[], autoBotRoundupSchedule:null });
   const log = d.regionRoundupRunLog;
   const entry = log.find(e => e.postIndex === postIndex);
-  if (entry) entry.status = status; else log.push({ postIndex, status, ts:new Date().toISOString() });
+  if (entry) { entry.status = status; if (detail) entry.detail = detail; }
+  else log.push({ postIndex, status, detail: detail || null, ts:new Date().toISOString() });
   await chrome.storage.local.set({ regionRoundupRunLog: log });
 
-  // 2. On completion, append to the persistent activityLog (survives deactivation)
-  if (status === "done") {
-    const resolvedPlatforms = platforms
-      || d.autoBotRoundupSchedule?.posts?.[postIndex]?.platforms
-      || [];
-
-    if (resolvedPlatforms.length) {
-      const newEntries = resolvedPlatforms.map(platform => ({
+  // 2. Append confirmed platforms to the persistent activityLog (survives
+  // deactivation). "done" → all platforms; "partial" → confirmed subset only.
+  const recordPlatforms = status === "done"
+    ? (confirmedPlatforms?.length ? confirmedPlatforms
+        : (platforms || d.autoBotRoundupSchedule?.posts?.[postIndex]?.platforms || []))
+    : (status === "partial" ? (confirmedPlatforms || []) : []);
+  if (status === "done" || status === "partial") {
+    if (recordPlatforms.length) {
+      const newEntries = recordPlatforms.map(platform => ({
         id:       `al-${Date.now()}-${platform}`,
         ts:       new Date().toISOString(),
         platform, postIndex, status: "done",
@@ -2360,16 +2431,16 @@ async function updateRoundupRunLogStatus(postIndex, status, platforms = null) {
       await chrome.storage.local.set({
         activityLog: [...al.activityLog, ...newEntries].slice(-2000),
       });
-      TechLog.info("LOG", "roundup_activity_log_written", { postIndex, platforms: resolvedPlatforms });
+      TechLog.info("LOG", "roundup_activity_log_written", { postIndex, platforms: recordPlatforms, runStatus: status });
       TechLog._flush();
-    } else {
+    } else if (status === "done") {
       TechLog.warn("LOG", "roundup_activity_log_skipped", { postIndex,
         reason: "no platforms resolved — schedule may have been regenerated" });
       TechLog._flush();
     }
   }
 
-  chrome.runtime.sendMessage({ type:"ROUNDUP_STATUS_UPDATE", postIndex, status }).catch(() => {});
+  chrome.runtime.sendMessage({ type:"ROUNDUP_STATUS_UPDATE", postIndex, status, detail }).catch(() => {});
 }
 
 // ── MV3 service-worker keepalive ──────────────────────────────────────────────
@@ -2484,6 +2555,7 @@ async function autoPostNow(postIndex) {
 
     // 6 ── Post to each platform ──────────────────────────────────────────────
     let anyFailed = false, anyUnconfirmed = false;
+    const platformResults = {}; // platform -> 'success' | 'unconfirmed' | 'failed'
     for (const platform of post.platforms) {
       const t_platform = Date.now();
       TechLog.info("POST", "platform_start", { run_id: runId, run_type: "auto",
@@ -2521,15 +2593,23 @@ async function autoPostNow(postIndex) {
         TechLog.info("POST", "platform_success", { run_id: runId, run_type: "auto",
           platform, duration_ms: Date.now()-t_platform });
       }
+      platformResults[platform] = result?.failed ? 'failed' : (result?.confirmed === false ? 'unconfirmed' : 'success');
       if (post.platforms.indexOf(platform) < post.platforms.length - 1)
         await sleep(PLATFORM_SWITCH_DELAY_MS);
     }
 
     // "done" ONLY when every platform explicitly confirmed its post.
-    const finalStatus       = anyFailed ? "failed" : (anyUnconfirmed ? "unconfirmed" : "done");
+    // "done" = every platform confirmed. "partial" = at least one confirmed but
+    // not all (e.g. TikTok succeeded but Instagram couldn't be confirmed) — this
+    // stops a single unconfirmed platform from masking a genuine success.
+    const confirmedPlatforms = Object.keys(platformResults).filter(p => platformResults[p] === 'success');
+    const finalStatus = anyFailed ? "failed"
+      : (!anyUnconfirmed ? "done"
+      : (confirmedPlatforms.length ? "partial" : "unconfirmed"));
+    const statusDetail = post.platforms.map(p => `${p}: ${platformResults[p] || 'skipped'}`).join(' · ');
     const total_duration_ms = Date.now()-runStart;
     // Pass post.platforms directly — prevents silent skip when schedule is stale
-    await updateRunLogStatus(postIndex, finalStatus, post.platforms);
+    await updateRunLogStatus(postIndex, finalStatus, post.platforms, confirmedPlatforms, statusDetail);
     TechLog.info("POST", "run_complete", { run_id: runId, run_type: "auto",
       postIndex, name, platforms: post.platforms, status: finalStatus, total_duration_ms });
     TechLog._flush();
@@ -2670,6 +2750,7 @@ async function autoPostRoundupNow(postIndex) {
 
     // 6 ── Post to each platform ──────────────────────────────────────────────
     let anyFailed = false, anyUnconfirmed = false;
+    const platformResults = {}; // platform -> 'success' | 'unconfirmed' | 'failed'
     for (const platform of post.platforms) {
       const t_platform = Date.now();
       TechLog.info("POST", "platform_start", { run_id: runId, run_type: "roundup",
@@ -2704,11 +2785,17 @@ async function autoPostRoundupNow(postIndex) {
         TechLog.info("POST", "platform_success", { run_id: runId, run_type: "roundup",
           platform, duration_ms: Date.now()-t_platform });
       }
+      platformResults[platform] = result?.failed ? 'failed' : (result?.confirmed === false ? 'unconfirmed' : 'success');
       if (post.platforms.indexOf(platform) < post.platforms.length - 1)
         await sleep(PLATFORM_SWITCH_DELAY_MS);
     }
 
-    const finalStatus       = anyFailed ? "failed" : (anyUnconfirmed ? "unconfirmed" : "done");
+    // "done" = every platform confirmed. "partial" = some confirmed, some not.
+    const confirmedPlatforms = Object.keys(platformResults).filter(p => platformResults[p] === 'success');
+    const finalStatus = anyFailed ? "failed"
+      : (!anyUnconfirmed ? "done"
+      : (confirmedPlatforms.length ? "partial" : "unconfirmed"));
+    const statusDetail = post.platforms.map(p => `${p}: ${platformResults[p] || 'skipped'}`).join(' · ');
     const total_duration_ms = Date.now()-runStart;
 
     // Remember the venues just used so they're skipped in upcoming roundups.
@@ -2717,7 +2804,7 @@ async function autoPostRoundupNow(postIndex) {
       bgLog("info", `Region Roundup: recorded ${keptPlaces.length} venues in recent-posts tracker`);
     }
 
-    await updateRoundupRunLogStatus(postIndex, finalStatus, post.platforms);
+    await updateRoundupRunLogStatus(postIndex, finalStatus, post.platforms, confirmedPlatforms, statusDetail);
     TechLog.info("POST", "run_complete", { run_id: runId, run_type: "roundup",
       postIndex, region, platforms: post.platforms, status: finalStatus, total_duration_ms });
     TechLog._flush();
@@ -2949,6 +3036,14 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
   // posting flow progressed (and where it stalled/failed).
   if (msg.type === "TIKTOK_STEP") {
     TechLog.info("POST", "tiktok_step", { step: msg.step, detail: msg.detail });
+    return;
+  }
+  // Instagram / Facebook step tracker — same idea as tiktok_step. Until now
+  // these injectors wrote nothing to the technical log, so a hang showed up as
+  // ~90s of silence between injector_fired and platform_unconfirmed with no clue
+  // where it stalled. Now every banner update is mirrored here.
+  if (msg.type === "POST_STEP") {
+    TechLog.info("POST", "platform_step", { platform: msg.platform || null, step: msg.step, detail: msg.detail });
     return;
   }
   // TikTok's generic "Something went wrong. Please try again." error screen.
@@ -4364,6 +4459,13 @@ function injectFacebook(photoDataUrls, caption, songName, location, opts) {
         padding:3px 9px;cursor:pointer;white-space:nowrap;flex-shrink:0">✕ Close</button>`;
     document.body.prepend(b);
     b.querySelector('#ffbot-close-btn')?.addEventListener('click', () => b.remove());
+    // Mirror progress to the technical log (relayed to background), same as IG.
+    const plain = String(html).replace(/<[^>]+>/g, '').replace(/&nbsp;/g, ' ').replace(/\s+/g, ' ').trim();
+    try {
+      document.dispatchEvent(new CustomEvent('__ffbot_event', { detail: {
+        type: 'POST_STEP', platform: 'facebook', step: `${n}/${total}`, detail: plain.slice(0, 180),
+      }}));
+    } catch (_) {}
   }
 
   /* ── main flow ── */
@@ -4518,7 +4620,15 @@ function injectFacebook(photoDataUrls, caption, songName, location, opts) {
     } else {
       step(4, total, `✅ ${files.length} photo${files.length > 1 ? 's' : ''} &amp; caption ready — click <strong>Post</strong> to publish.`, 'success');
     }
-  })();
+  })().catch(e => {
+    // Any uncaught error in the flow above would otherwise leave the injector
+    // hung — the background waits out the full timeout with no signal. Surface
+    // it as an explicit failure (with page context) so it's diagnosable.
+    dbg('Facebook injector crashed: ' + (e && e.message || e));
+    try {
+      document.dispatchEvent(new CustomEvent('__ffbot_failed', { detail:{ platform:'facebook', error:'Facebook injector error: ' + (e && e.message || e), ...capturePageContext() } }));
+    } catch (_) {}
+  });
 }
 
 // ─── Instagram ────────────────────────────────────────────────────────────────
@@ -4633,7 +4743,15 @@ function injectInstagram(photoDataUrls, caption, songName, location, opts) {
     ensureBanner.__last_n = n;
     ensureBanner.__last_total = total;
     ensureBanner(n, total, html, type);
-    dbg(`Step ${n}/${total}: ${html.replace(/<[^>]+>/g, '')}`);
+    const plain = String(html).replace(/<[^>]+>/g, '').replace(/&nbsp;/g, ' ').replace(/\s+/g, ' ').trim();
+    dbg(`Step ${n}/${total}: ${plain}`);
+    // Mirror progress to the technical log (MAIN→ISOLATED relay → background) so
+    // an Instagram stall is diagnosable instead of 90s of silence.
+    try {
+      document.dispatchEvent(new CustomEvent('__ffbot_event', { detail: {
+        type: 'POST_STEP', platform: 'instagram', step: `${n}/${total}`, detail: plain.slice(0, 180),
+      }}));
+    } catch (_) {}
   }
 
   (async () => {
@@ -5406,7 +5524,16 @@ function injectInstagram(photoDataUrls, caption, songName, location, opts) {
         'success');
       dbg('Bot stopped — waiting for user to click Share');
     }
-  })();
+  })().catch(e => {
+    // The Instagram flow had no top-level catch: any thrown error (e.g. a
+    // file-injection step that rejects, or a selector op on a changed DOM) left
+    // the injector silently hung until the 90s timeout → platform_unconfirmed
+    // with zero diagnostics. Surface it as an explicit failure instead.
+    dbg('Instagram injector crashed: ' + (e && e.message || e));
+    try {
+      document.dispatchEvent(new CustomEvent('__ffbot_failed', { detail:{ platform:'instagram', error:'Instagram injector error: ' + (e && e.message || e), ...capturePageContext() } }));
+    } catch (_) {}
+  });
 }
 
 // ─── TikTok ───────────────────────────────────────────────────────────────────
@@ -6583,6 +6710,7 @@ if (typeof module !== 'undefined' && module.exports) {
     searchAutoPlacesCollectionBG, getAutoCaptionRoundupBG,
     roundupEntityKey, recordRoundupPostedEntities, getRoundupRecentKeys,
     mapLimit, appendAppLog,
+    isRunStale, enqueueScheduledRun, RUN_GRACE_MS, RUN_STAGGER_MS,
   };
 }
 

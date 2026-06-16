@@ -3895,17 +3895,29 @@ const SCHED_STATUS_LABELS = {
   triggered:   "🔄 Posting…",
   done:        "✓ Done",
   failed:      "✗ Failed",
+  partial:     "◑ Partial",
   unconfirmed: "⚠ Unconfirmed",
+  missed:      "⊘ Missed",
 };
+
+// Rolling display window for the schedule: yesterday (00:00) through 6 days
+// ahead (inclusive). At generation a schedule only has today→+6, so there's no
+// "yesterday" yet and it shows today→+6; once a day rolls over, yesterday's
+// posts (and their run results) stay visible while the week ahead still shows.
+// Note: this is display-only — it never changes which posts are planned/posted.
+function abInScheduleWindow(dateStr) {
+  if (!dateStr) return false;
+  const d     = new Date(`${dateStr}T00:00:00`);
+  const start = new Date(); start.setHours(0, 0, 0, 0); start.setDate(start.getDate() - 1); // yesterday 00:00
+  const end   = new Date(); end.setHours(0, 0, 0, 0);   end.setDate(end.getDate() + 7);     // today+7 00:00 (exclusive)
+  return d >= start && d < end;
+}
 
 function renderScheduledPosts(schedule, runLog = []) {
   const body  = document.getElementById("abSchedBody");
   const badge = document.getElementById("abSchedCount");
   const title = document.querySelector("#abScheduledSection .ab-collapse-hdr-title");
   if (!body) return;
-
-  const postCount = schedule?.posts?.length || 0;
-  if (badge) badge.textContent = postCount;
 
   // Show generation timestamp in the section header
   if (title && schedule?.generatedAt) {
@@ -3916,17 +3928,24 @@ function renderScheduledPosts(schedule, runLog = []) {
 
   body.innerHTML = "";
 
+  // Only show posts within the rolling [yesterday … +6 days] window. idx is the
+  // original index into schedule.posts so run-log lookup by postIndex stays correct.
+  const windowPosts = (schedule?.posts || [])
+    .map((post, idx) => ({ ...post, idx }))
+    .filter(p => abInScheduleWindow(p.date));
+  if (badge) badge.textContent = windowPosts.length;
+
   // Empty state
-  if (!postCount) {
+  if (!windowPosts.length) {
     body.innerHTML = `<div style="padding:12px;text-align:center;font-size:.75rem;color:var(--muted)">No upcoming posts scheduled</div>`;
     return;
   }
 
   // Group by date
   const grouped = {};
-  schedule.posts.forEach((post, idx) => {
+  windowPosts.forEach(post => {
     if (!grouped[post.date]) grouped[post.date] = [];
-    grouped[post.date].push({ ...post, idx });
+    grouped[post.date].push(post);
   });
 
   Object.entries(grouped).sort(([a],[b]) => a.localeCompare(b)).forEach(([date, posts]) => {
@@ -3941,8 +3960,10 @@ function renderScheduledPosts(schedule, runLog = []) {
 
       // Status comes from the ACTUAL run log — never from the clock.
       // "✓ Done" is only shown when the run confirmed success on every platform.
-      const logStatus = runLog.find(e => e.postIndex === post.idx)?.status;
+      const logEntry  = runLog.find(e => e.postIndex === post.idx);
+      const logStatus = logEntry?.status;
       const status    = SCHED_STATUS_LABELS[logStatus] ? logStatus : "pending";
+      const detailAttr = logEntry?.detail ? ` title="${escapeHtml(logEntry.detail)}"` : "";
 
       const item = document.createElement("div");
       item.className = "ab-sched-item";
@@ -3950,7 +3971,7 @@ function renderScheduledPosts(schedule, runLog = []) {
       item.innerHTML = `
         <span class="ab-sched-time">${escapeHtml(post.time)}</span>
         <span class="ab-sched-platforms">${escapeHtml(plat)}</span>
-        <span class="ab-sched-status ${status}" id="abSchedStatus-${post.idx}">
+        <span class="ab-sched-status ${status}" id="abSchedStatus-${post.idx}"${detailAttr}>
           ${SCHED_STATUS_LABELS[status]}
         </span>`;
       dayEl.appendChild(item);
@@ -3959,12 +3980,13 @@ function renderScheduledPosts(schedule, runLog = []) {
   });
 }
 
-function updateScheduledItemStatus(idx, status) {
-  updateCombinedScheduleItemStatus("singular", idx, status);
+function updateScheduledItemStatus(idx, status, detail) {
+  updateCombinedScheduleItemStatus("singular", idx, status, detail);
   const el = document.getElementById(`abSchedStatus-${idx}`);
   if (!el) return;
   el.textContent = SCHED_STATUS_LABELS[status] || status;
   el.className   = `ab-sched-status ${status}`;
+  if (detail) el.title = detail;
 }
 
 // ── Progress ──────────────────────────────────────────────────────────────────
@@ -4118,7 +4140,7 @@ chrome.runtime.onMessage.addListener((msg) => {
     });
   }
   if (msg.type === "AUTO_BOT_STATUS_UPDATE") {
-    updateScheduledItemStatus(msg.postIndex, msg.status);
+    updateScheduledItemStatus(msg.postIndex, msg.status, msg.detail);
     chrome.storage.local.get({ autoBotRunLog:[], autoBotSchedule:null }, ({ autoBotRunLog, autoBotSchedule }) => {
       refreshActivityLog(); // reads from persistent activityLog
       const done = autoBotRunLog.filter(e => e.status === "done").length;
@@ -5025,9 +5047,6 @@ function renderScheduledRoundupPosts(schedule, runLog = []) {
   const title = document.querySelector("#rrScheduledSection .ab-collapse-hdr-title");
   if (!body) return;
 
-  const postCount = schedule?.posts?.length || 0;
-  if (badge) badge.textContent = postCount;
-
   if (title && schedule?.generatedAt) {
     const genTime = new Date(schedule.generatedAt).toLocaleTimeString("en-GB", { hour:"2-digit", minute:"2-digit" });
     const genDate = new Date(schedule.generatedAt).toLocaleDateString("en-GB", { day:"numeric", month:"short" });
@@ -5036,15 +5055,22 @@ function renderScheduledRoundupPosts(schedule, runLog = []) {
 
   body.innerHTML = "";
 
-  if (!postCount) {
+  // Rolling display window: yesterday → 6 days ahead (display-only). idx stays
+  // the original index into schedule.posts so run-log lookup stays correct.
+  const windowPosts = (schedule?.posts || [])
+    .map((post, idx) => ({ ...post, idx }))
+    .filter(p => abInScheduleWindow(p.date));
+  if (badge) badge.textContent = windowPosts.length;
+
+  if (!windowPosts.length) {
     body.innerHTML = `<div style="padding:12px;text-align:center;font-size:.75rem;color:var(--muted)">No upcoming posts scheduled</div>`;
     return;
   }
 
   const grouped = {};
-  schedule.posts.forEach((post, idx) => {
+  windowPosts.forEach(post => {
     if (!grouped[post.date]) grouped[post.date] = [];
-    grouped[post.date].push({ ...post, idx });
+    grouped[post.date].push(post);
   });
 
   Object.entries(grouped).sort(([a],[b]) => a.localeCompare(b)).forEach(([date, posts]) => {
@@ -5075,12 +5101,13 @@ function renderScheduledRoundupPosts(schedule, runLog = []) {
   });
 }
 
-function updateScheduledRoundupItemStatus(idx, status) {
-  updateCombinedScheduleItemStatus("roundup", idx, status);
+function updateScheduledRoundupItemStatus(idx, status, detail) {
+  updateCombinedScheduleItemStatus("roundup", idx, status, detail);
   const el = document.getElementById(`rrSchedStatus-${idx}`);
   if (!el) return;
   el.textContent = SCHED_STATUS_LABELS[status] || status;
   el.className   = `ab-sched-status ${status}`;
+  if (detail) el.title = detail;
 }
 
 // ── Progress ──────────────────────────────────────────────────────────────────
@@ -5140,29 +5167,34 @@ function renderCombinedSchedule() {
 
       if (autoBotActive && autoBotSchedule?.posts?.length) {
         autoBotSchedule.posts.forEach((post, idx) => {
-          const logStatus = autoBotRunLog.find(e => e.postIndex === idx)?.status;
-          merged.push({ ...post, idx, source: "singular", status: SCHED_STATUS_LABELS[logStatus] ? logStatus : "pending" });
+          const logEntry = autoBotRunLog.find(e => e.postIndex === idx);
+          merged.push({ ...post, idx, source: "singular", detail: logEntry?.detail || null,
+            status: SCHED_STATUS_LABELS[logEntry?.status] ? logEntry.status : "pending" });
         });
       }
       if (regionRoundupActive && autoBotRoundupSchedule?.posts?.length) {
         autoBotRoundupSchedule.posts.forEach((post, idx) => {
-          const logStatus = regionRoundupRunLog.find(e => e.postIndex === idx)?.status;
-          merged.push({ ...post, idx, source: "roundup", status: SCHED_STATUS_LABELS[logStatus] ? logStatus : "pending" });
+          const logEntry = regionRoundupRunLog.find(e => e.postIndex === idx);
+          merged.push({ ...post, idx, source: "roundup", detail: logEntry?.detail || null,
+            status: SCHED_STATUS_LABELS[logEntry?.status] ? logEntry.status : "pending" });
         });
       }
 
+      // Rolling display window: yesterday → 6 days ahead (display-only).
+      const windowed = merged.filter(p => abInScheduleWindow(p.date));
+
       section.classList.remove("hidden");
-      if (badge) badge.textContent = merged.length;
+      if (badge) badge.textContent = windowed.length;
 
       body.innerHTML = "";
-      if (!merged.length) {
+      if (!windowed.length) {
         body.innerHTML = `<div style="padding:12px;text-align:center;font-size:.75rem;color:var(--muted)">No upcoming posts scheduled</div>`;
         return;
       }
 
       // Group by date, sorted chronologically (date, then time, then source)
       const grouped = {};
-      merged.forEach(post => {
+      windowed.forEach(post => {
         if (!grouped[post.date]) grouped[post.date] = [];
         grouped[post.date].push(post);
       });
@@ -5186,7 +5218,7 @@ function renderCombinedSchedule() {
             <span class="ab-sched-time">${escapeHtml(post.time)}</span>
             <span class="ab-sched-source">${COMBINED_SOURCE_LABELS[post.source]}</span>
             <span class="ab-sched-platforms">${escapeHtml(plat)}</span>
-            <span class="ab-sched-status ${post.status}" id="combinedSchedStatus-${post.source}-${post.idx}">
+            <span class="ab-sched-status ${post.status}" id="combinedSchedStatus-${post.source}-${post.idx}"${post.detail ? ` title="${escapeHtml(post.detail)}"` : ""}>
               ${SCHED_STATUS_LABELS[post.status]}
             </span>`;
           dayEl.appendChild(item);
@@ -5197,11 +5229,12 @@ function renderCombinedSchedule() {
   );
 }
 
-function updateCombinedScheduleItemStatus(source, idx, status) {
+function updateCombinedScheduleItemStatus(source, idx, status, detail) {
   const el = document.getElementById(`combinedSchedStatus-${source}-${idx}`);
   if (!el) return;
   el.textContent = SCHED_STATUS_LABELS[status] || status;
   el.className   = `ab-sched-status ${status}`;
+  if (detail) el.title = detail;
 }
 
 // ── Config summary (shown when config is collapsed) ───────────────────────────
@@ -5255,7 +5288,7 @@ chrome.runtime.onMessage.addListener((msg) => {
     });
   }
   if (msg.type === "ROUNDUP_STATUS_UPDATE") {
-    updateScheduledRoundupItemStatus(msg.postIndex, msg.status);
+    updateScheduledRoundupItemStatus(msg.postIndex, msg.status, msg.detail);
     chrome.storage.local.get({ regionRoundupRunLog:[], autoBotRoundupSchedule:null }, ({ regionRoundupRunLog, autoBotRoundupSchedule }) => {
       refreshActivityLog(); // roundup posts also feed the shared activity log
       const done = regionRoundupRunLog.filter(e => e.status === "done").length;
