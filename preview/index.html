@@ -1,0 +1,54 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>FoodFluencer Bot — Popup Preview</title>
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link href="https://fonts.googleapis.com/css2?family=Cormorant+Garamond:ital,wght@0,300;0,400;1,300&display=swap" rel="stylesheet" />
+  <link rel="stylesheet" href="../popup.css" />
+  <style>
+    /* Popup is normally a fixed-size extension window; give it room here. */
+    body { margin: 0; padding: 16px; background: #f3f3f3; }
+    .container { margin: 0 auto; }
+  </style>
+</head>
+<body>
+  <!-- popup.html's <body> contents are injected here at runtime -->
+  <div id="popup-root">Loading popup…</div>
+
+  <script src="chrome-mock.js"></script>
+  <script>
+    // Pre-seed storage so popup.js skips onboarding/key-setup screens.
+    if (!localStorage.getItem("ffbot_preview::hasSeenOnboarding")) {
+      localStorage.setItem("ffbot_preview::hasSeenOnboarding", "true");
+      localStorage.setItem("ffbot_preview::googleApiKey", JSON.stringify("preview-key"));
+    }
+  </script>
+  <script>
+    fetch("../popup.html")
+      .then(r => r.text())
+      .then(html => {
+        const body = html
+          .replace(/[\s\S]*<body[^>]*>/i, "")
+          .replace(/<\/body>[\s\S]*/i, "")
+          // Strip scripts that are loaded explicitly below in the right order.
+          .replace(/<script[^>]*src="[^"]*"[^>]*>\s*<\/script>/gi, "");
+        document.getElementById("popup-root").outerHTML = body;
+
+        // Load config.js then popup.js, in order, after the DOM is in place.
+        const configScript = document.createElement("script");
+        configScript.src = "../config.js";
+        configScript.onload = () => {
+          const popupScript = document.createElement("script");
+          popupScript.src = "../popup.js";
+          document.body.appendChild(popupScript);
+        };
+        document.body.appendChild(configScript);
+      })
+      .catch(err => {
+        document.getElementById("popup-root").textContent = "Failed to load popup.html: " + err;
+      });
+  </script>
+</body>
+</html>
