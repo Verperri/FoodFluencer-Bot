@@ -11,6 +11,29 @@ function sleep(ms, variance = 0.35) {
   return new Promise(r => setTimeout(r, jitter(ms, variance)));
 }
 
+// Order-preserving concurrent map with a fixed worker pool. Runs at most
+// `limit` of `fn` at once and returns results in INPUT order (so a ranked
+// roundup keeps its ranking). Per-item rejections are isolated: a failing item
+// resolves to `{ ok:false, error }` instead of aborting the whole batch.
+async function mapLimit(items, limit, fn) {
+  const results = new Array(items.length);
+  let next = 0;
+  const worker = async () => {
+    while (next < items.length) {
+      const i = next++;
+      try { results[i] = { ok: true, value: await fn(items[i], i) }; }
+      catch (error) { results[i] = { ok: false, error }; }
+    }
+  };
+  await Promise.all(Array.from({ length: Math.min(limit, items.length) }, worker));
+  return results;
+}
+
+// Pause between posting to consecutive platforms in a single run (spotlight or
+// roundup). Jittered by sleep() so the cadence isn't robotic — a fixed, uniform
+// gap between platform posts is a common automation fingerprint.
+const PLATFORM_SWITCH_DELAY_MS = 4000;
+
 // ── Post-failure failsafe ────────────────────────────────────────────────────
 // Classifies a failed post by inspecting the error message and a snippet of
 // the page captured at the moment of failure. This lets the bot react
@@ -194,7 +217,7 @@ const AB_PLACES_SEARCH = "https://places.googleapis.com/v1/places:searchText";
 const AB_PLACES_PHOTO  = "https://places.googleapis.com/v1";
 const AB_ITUNES_SEARCH = "https://itunes.apple.com/search";
 
-const AB_TYPE_QUERY_BG = { restaurant:"restaurant", hotel:"hotel", bar:"bar" };
+const AB_TYPE_QUERY_BG = SHARED_TYPE_QUERY;
 
 // Extra hashtags rotated into the caption's hashtag block so it isn't an
 // identical, repeating block every post — a recurring exact hashtag set
@@ -211,7 +234,7 @@ function pickExtraHashtags(count = 2) {
   }
   return picked;
 }
-const AB_COUNTRY_NAMES_BG = { BE:"Belgium", FR:"France", DE:"Germany", LU:"Luxembourg", NL:"The Netherlands" };
+const AB_COUNTRY_NAMES_BG = SHARED_COUNTRY_NAMES;
 const AB_BOUNDS_BG = {
   BE: { low:{latitude:49.5,longitude:2.5},  high:{latitude:51.5,longitude:6.4}  },
   FR: { low:{latitude:41.3,longitude:-5.1}, high:{latitude:51.1,longitude:9.6}  },
@@ -220,27 +243,11 @@ const AB_BOUNDS_BG = {
   NL: { low:{latitude:50.7,longitude:3.3},  high:{latitude:53.6,longitude:7.2}  },
 };
 
-// City pools used when no specific region is selected.
-// Cycling through cities gives genuine variety — the Places API always returns
-// the same top-20 national results for a country-wide query, so we anchor each
-// search to a different city to get a truly different result set every time.
-const AB_CITY_POOL_BG = {
-  BE: ["Bruges","Ghent","Antwerp","Brussels","Liège","Namur","Mons","Leuven",
-       "Mechelen","Hasselt","Kortrijk","Ostend","Aalst","Genk","Sint-Niklaas",
-       "Tournai","Charleroi","Arlon","Dinant","Durbuy","Spa","Bastogne",
-       "Tongeren","Diest","Dendermonde","Roeselare","Ieper","Veurne","Chimay"],
-  FR: ["Paris","Lyon","Marseille","Bordeaux","Toulouse","Nice","Strasbourg",
-       "Nantes","Montpellier","Lille","Rennes","Reims","Tours","Angers",
-       "Metz","Nancy","Dijon","Grenoble","Brest","Perpignan"],
-  DE: ["Berlin","Hamburg","Munich","Cologne","Frankfurt","Stuttgart","Düsseldorf",
-       "Leipzig","Dortmund","Bremen","Hannover","Nuremberg","Dresden","Freiburg",
-       "Heidelberg","Trier","Erfurt","Regensburg","Würzburg","Lübeck"],
-  LU: ["Luxembourg City","Esch-sur-Alzette","Differdange","Dudelange","Ettelbruck",
-       "Diekirch","Wiltz","Echternach","Remich","Vianden"],
-  NL: ["Amsterdam","Rotterdam","The Hague","Utrecht","Eindhoven","Groningen",
-       "Tilburg","Almere","Breda","Nijmegen","Leiden","Maastricht","Haarlem",
-       "Arnhem","Delft","Deventer","Zwolle","Amersfoort","Middelburg"],
-};
+// City pools used when no specific region is selected (shared with the popup via
+// config.js — single source of truth). Cycling through cities gives genuine
+// variety — the Places API always returns the same top-20 national results for a
+// country-wide query, so we anchor each search to a different city.
+const AB_CITY_POOL_BG = SHARED_CITY_POOL;
 
 function pickRandomCity(countryCode) {
   const pool = AB_CITY_POOL_BG[countryCode] || AB_CITY_POOL_BG.BE;
@@ -901,6 +908,11 @@ async function applyEntityNameLabel(dataUrl, name) {
 // later. Capped to a rolling window (large enough to span ~20-30 posts).
 const ROUNDUP_RECENT_CAP = 200;
 
+// How many entities' photos to fetch at once when building a roundup. The
+// per-entity photo waterfall is network-bound, so a small pool cuts prep time
+// for a Top-10 from ~10 serial fetches to ~4 batches, without hammering sources.
+const ROUNDUP_PHOTO_CONCURRENCY = 3;
+
 async function getRoundupRecentKeys() {
   const { regionRoundupRecentEntities = [] } =
     await chrome.storage.local.get({ regionRoundupRecentEntities: [] });
@@ -1158,7 +1170,7 @@ async function scoreImageQuality(dataUrl) {
 // ═══════════════════════════════════════════════════════════════════════════════
 
 const SCRAPE_UA  = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36';
-const CITY_FROM_ADDRESS_RE_BG = /\d{4}\s+([A-Za-zÀ-ÿ\s-]+?)(?:,|$)/;
+const CITY_FROM_ADDRESS_RE_BG = SHARED_CITY_FROM_ADDRESS_RE; // shared via config.js
 const SCRAPE_MIN = 3;   // minimum usable photos before accepting a source
 
 function raceTimeout(promise, ms) {
@@ -2240,26 +2252,10 @@ function getAutoCaptionBG(name, address, type, language, captionOpts, songInfo, 
 // Builds a "Top N {type}s in {region}" caption with a numbered, ranked list of
 // entities (one cover photo each), optional ratings/review counts, an optional
 // song line, and region/type hashtags.
-const RR_TYPE_LABELS_BG = {
-  en: { restaurant: { s: "restaurant", p: "restaurants" }, hotel: { s: "hotel", p: "hotels" }, bar: { s: "bar", p: "bars" } },
-  nl: { restaurant: { s: "restaurant", p: "restaurants" }, hotel: { s: "hotel", p: "hotels" }, bar: { s: "bar", p: "bars" } },
-  fr: { restaurant: { s: "restaurant", p: "restaurants" }, hotel: { s: "hôtel", p: "hôtels" }, bar: { s: "bar", p: "bars" } },
-  de: { restaurant: { s: "Restaurant", p: "Restaurants" }, hotel: { s: "Hotel", p: "Hotels" }, bar: { s: "Bar", p: "Bars" } },
-};
-
-const RR_HEADER_TEMPLATES_BG = {
-  en: (n, p, region) => `🔝 Top ${n} ${p} in ${region}`,
-  nl: (n, p, region) => `🔝 Top ${n} ${p} in ${region}`,
-  fr: (n, p, region) => `🔝 Top ${n} ${p} à ${region}`,
-  de: (n, p, region) => `🔝 Top ${n} ${p} in ${region}`,
-};
-
-const RR_INTRO_TEMPLATES_BG = {
-  en: (region) => `Here's our pick of the best spots ${region} has to offer 👇`,
-  nl: (region) => `Dit zijn de beste plekjes die ${region} te bieden heeft 👇`,
-  fr: (region) => `Voici notre sélection des meilleures adresses à ${region} 👇`,
-  de: (region) => `Das sind die besten Adressen, die ${region} zu bieten hat 👇`,
-};
+// Roundup caption building blocks — shared with the popup via config.js.
+const RR_TYPE_LABELS_BG      = SHARED_RR_TYPE_LABELS;
+const RR_HEADER_TEMPLATES_BG = SHARED_RR_HEADER_TEMPLATES;
+const RR_INTRO_TEMPLATES_BG  = SHARED_RR_INTRO_TEMPLATES;
 
 function getAutoCaptionRoundupBG(places, type, region, language, captionOpts, songInfo) {
   const lang   = RR_TYPE_LABELS_BG[language] ? language : "en";
@@ -2526,7 +2522,7 @@ async function autoPostNow(postIndex) {
           platform, duration_ms: Date.now()-t_platform });
       }
       if (post.platforms.indexOf(platform) < post.platforms.length - 1)
-        await sleep(4000); // pause between platforms — randomized to avoid a robotic cadence
+        await sleep(PLATFORM_SWITCH_DELAY_MS);
     }
 
     // "done" ONLY when every platform explicitly confirmed its post.
@@ -2601,21 +2597,25 @@ async function autoPostRoundupNow(postIndex) {
     const t_photos = Date.now();
     TechLog.info("MEDIA", "photos_start", { run_id: runId, run_type: "roundup", count: places.length });
 
-    const photoDataUrls = [];
-    const keptPlaces    = [];
-    for (const place of places) {
+    // Resolve every entity's cover photo concurrently (order preserved, so the
+    // ranking is kept); drop entities the waterfall couldn't find a photo for.
+    const resolved = await mapLimit(places, ROUNDUP_PHOTO_CONCURRENCY, async (place) => {
       const name      = place.displayName?.text || "";
       const address   = place.formattedAddress  || "";
       const allPhotos = (place.photos||[]).sort((a,b)=>(b.width||0)-(a.width||0));
       const photoResult = await fetchPhotosWaterfall(name, address, config.type||"restaurant", 1, apiKey, allPhotos, foursquareApiKey);
-      if (photoResult.dataUrls.length > 0) {
-        // Burn the venue name into the photo so each slide is self-identifying.
-        const labeled = await applyEntityNameLabel(photoResult.dataUrls[0], name);
-        photoDataUrls.push(labeled);
-        keptPlaces.push(place);
-      } else {
+      if (!photoResult.dataUrls.length) {
         bgLog("warn", `Region Roundup: no photo found for "${name}" — dropping from list`);
+        return null;
       }
+      // Burn the venue name into the photo so each slide is self-identifying.
+      return { place, dataUrl: await applyEntityNameLabel(photoResult.dataUrls[0], name) };
+    });
+
+    const photoDataUrls = [];
+    const keptPlaces    = [];
+    for (const r of resolved) {
+      if (r.ok && r.value) { photoDataUrls.push(r.value.dataUrl); keptPlaces.push(r.value.place); }
     }
 
     if (photoDataUrls.length === 0) {
@@ -2705,7 +2705,7 @@ async function autoPostRoundupNow(postIndex) {
           platform, duration_ms: Date.now()-t_platform });
       }
       if (post.platforms.indexOf(platform) < post.platforms.length - 1)
-        await sleep(4000);
+        await sleep(PLATFORM_SWITCH_DELAY_MS);
     }
 
     const finalStatus       = anyFailed ? "failed" : (anyUnconfirmed ? "unconfirmed" : "done");
@@ -2788,15 +2788,29 @@ const TechLog = {
 
 // ── Background logger ─────────────────────────────────────────────────────────
 
+// Single serialized writer for the shared `appLog` array. Both the service
+// worker (bgLog) and the popup (via the APP_LOG message) funnel their entries
+// through this one in-memory promise chain, so concurrent appends can no longer
+// clobber each other — the previous get→push→set was a lost-update race when
+// the popup and the bot logged at the same time.
+const APP_LOG_MAX = 800, APP_LOG_TRIM = 600;
+let _appLogChain = Promise.resolve();
+function appendAppLog(entry) {
+  _appLogChain = _appLogChain.then(async () => {
+    const data   = (await chrome.storage.local.get({ appLog: [] })) || {};
+    const appLog = Array.isArray(data.appLog) ? data.appLog : [];
+    appLog.push(entry);
+    await chrome.storage.local.set({
+      appLog: appLog.length > APP_LOG_MAX ? appLog.slice(-APP_LOG_TRIM) : appLog,
+    });
+  }).catch(() => { /* logging must never throw into the caller */ });
+  return _appLogChain;
+}
+
 function bgLog(level, message, data) {
-  const entry = {
+  appendAppLog({
     ts: new Date().toISOString(), source: 'background', level, message,
     data: data !== undefined ? (typeof data === 'string' ? data : JSON.stringify(data)) : null,
-  };
-  chrome.storage.local.get({ appLog: [] }, ({ appLog }) => {
-    appLog.push(entry);
-    if (appLog.length > 800) appLog = appLog.slice(-600);
-    chrome.storage.local.set({ appLog });
   });
 }
 
@@ -2896,6 +2910,10 @@ async function injectFileViaCDP(tabId, dataUrl, fileName, selector) {
 }
 
 chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
+  // Popup-originated app-log lines: the service worker is the single writer of
+  // `appLog`, so route them through the same serialized appender as bgLog.
+  if (msg.type === "APP_LOG" && msg.entry) { appendAppLog(msg.entry); return; }
+
   if (typeof msg.type === 'string' && msg.type.startsWith('TIKTOK_') && _sender.tab?.id != null) {
     tiktokLastActivity.set(_sender.tab.id, Date.now());
     if (msg.type === 'TIKTOK_STEP') tiktokLastStep.set(_sender.tab.id, { step: msg.step, detail: msg.detail });
@@ -3031,8 +3049,8 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
         const { foursquareApiKey = null } = await chrome.storage.local.get({ foursquareApiKey: null });
 
         const { places, source, region } = await searchAutoPlacesCollectionBG(config, apiKey, foursquareApiKey);
-        const kept = [];
-        for (const place of places) {
+        // Resolve every entity's photo pool concurrently (order preserved).
+        const resolved = await mapLimit(places, ROUNDUP_PHOTO_CONCURRENCY, async (place) => {
           const name     = place.displayName?.text || "";
           const address  = place.formattedAddress  || "";
           const existing = (place.photos || []).sort((a, b) => (b.width || 0) - (a.width || 0));
@@ -3043,18 +3061,19 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
             name, address, config.type || "restaurant", 5, apiKey, existing, foursquareApiKey,
             { poolExtra: 8 }
           );
-          const log = [...(photoResult.photoLog || []), ...(photoResult.extraPhotoLog || [])];
-          const candidates = log.length
-            ? log.filter(p => p.dataUrl).map(p => ({ name: p.dataUrl }))
+          const logArr = [...(photoResult.photoLog || []), ...(photoResult.extraPhotoLog || [])];
+          const candidates = logArr.length
+            ? logArr.filter(p => p.dataUrl).map(p => ({ name: p.dataUrl }))
             : (photoResult.dataUrls || []).map(u => ({ name: u }));
-          if (candidates.length > 0) {
-            place.photos = candidates;
-            place._seenSourceUrls = log.map(p => p.sourceUrl).filter(Boolean);
-            kept.push(place);
-          } else {
+          if (!candidates.length) {
             bgLog("warn", `Roundup preview: no photo for "${name}" — dropping from list`);
+            return null;
           }
-        }
+          place.photos = candidates;
+          place._seenSourceUrls = logArr.map(p => p.sourceUrl).filter(Boolean);
+          return place;
+        });
+        const kept = resolved.filter(r => r.ok && r.value).map(r => r.value);
         sendResponse({ ok: true, places: kept, source, region });
       } catch (e) {
         bgLog("error", `Roundup preview failed: ${e.message}`);
@@ -6563,6 +6582,7 @@ if (typeof module !== 'undefined' && module.exports) {
     computePhash, phashDistance, downscaleDataUrl,
     searchAutoPlacesCollectionBG, getAutoCaptionRoundupBG,
     roundupEntityKey, recordRoundupPostedEntities, getRoundupRecentKeys,
+    mapLimit, appendAppLog,
   };
 }
 
