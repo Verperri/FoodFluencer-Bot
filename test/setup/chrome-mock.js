@@ -124,13 +124,15 @@ if (typeof global.importScripts === 'undefined') {
     if (typeof global.CONFIG === 'undefined') {
       global.CONFIG = { REGION: 'be', MAX_PHOTOS: 5, TELEMETRY_ENDPOINT: '' };
     }
-    // config.js also defines the SHARED_* reference data consumed at module load
-    // by background.js / popup.js. Expose every SHARED_* export as a global (the
-    // single source of truth) without overwriting the test's CONFIG above. New
-    // shared symbols are picked up automatically — no test edits needed.
+    // config.js also defines the SHARED_* reference data and shared helper
+    // functions (getInstallId, computeAppealMetrics, …) consumed at module load
+    // by background.js / popup.js. Expose every export EXCEPT CONFIG as a global
+    // (mirroring how importScripts/<script> share config.js's top-level scope at
+    // runtime) without overwriting the test's CONFIG above. New shared symbols
+    // are picked up automatically — no test edits needed.
     const shared = require('../../config.js');
     for (const k of Object.keys(shared)) {
-      if (k.startsWith('SHARED_')) global[k] = shared[k];
+      if (k !== 'CONFIG') global[k] = shared[k];
     }
   };
 }
