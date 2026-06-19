@@ -1355,6 +1355,14 @@ h1 { font-size: 0.95rem; font-weight: 700; line-height: 1.2; }
 }
 .ob-feat.enabled  { background: #f0fdf4; color: #15803d; border: 1px solid #bbf7d0; }
 .ob-feat.disabled { background: #fff7ed; color: #c2410c; border: 1px solid #fed7aa; }
+/* Onboarding layout helpers (replace former inline styles) */
+.ob-title-note    { font-size: .7em; font-weight: 400; }
+.ob-api-how       { margin-bottom: 10px; }
+.ob-api-how--gap  { margin-top: 14px; }
+.ob-key-row       { margin: 6px 0 4px; }
+.ob-actions       { display: flex; gap: 8px; margin-top: 14px; }
+.ob-note          { margin-top: 10px; font-size: .78rem; }
+.feat-note        { font-size: .68rem; color: var(--muted); }
 
 /* ── Silent mode test log ────────────────────────────────────────────────── */
 .silent-test-log {

@@ -60,6 +60,28 @@ const SHARED_CITY_POOL = {
 // the street name. Single source of truth shared by the popup and service worker.
 const SHARED_CITY_FROM_ADDRESS_RE = /\d{4}\s+([A-Za-zÀ-ÿ\s-]+?)(?:,|$)/;
 
+// Photo sources, in waterfall priority order — the single source of truth for
+// the onboarding "how photos work" list, the Settings feature status, and the
+// service worker's YELP_ENABLED flag. Keeping them here stops these three
+// surfaces from drifting apart when a source is added, removed, or toggled.
+//   badge:       'free' (keyless) | 'key' (needs an API key)
+//   requiresKey: 'google' | 'foursquare' — only counted as active when present
+//   enabled:     false marks a source the waterfall currently skips (hidden
+//                from the user-facing lists and reflected by YELP_ENABLED)
+const SHARED_PHOTO_SOURCES = [
+  { id: 'google_maps',   name: 'Google Maps',       blurb: 'Venue photos scraped from Google Maps listings',                 badge: 'free' },
+  { id: 'venue_owned',   name: 'Venue website',     blurb: "Photos pulled straight from the venue's own site & Facebook page", badge: 'free' },
+  { id: 'duckduckgo',    name: 'DuckDuckGo',        blurb: 'Web image search filtered for food & atmosphere',                badge: 'free' },
+  { id: 'wikimedia',     name: 'Wikimedia Commons', blurb: 'Openly-licensed photos geotagged near the venue',                badge: 'free' },
+  { id: 'yelp',          name: 'Yelp',              blurb: 'Categorised food, interior & exterior photos',                   badge: 'free', enabled: false },
+  { id: 'tripadvisor',   name: 'TripAdvisor',       blurb: 'Scraped from TripAdvisor listing photo pages',                   badge: 'free' },
+  { id: 'foursquare',    name: 'Foursquare API',    blurb: 'Venue photos via Foursquare Places (950 free/day)',              badge: 'key', requiresKey: 'foursquare' },
+  { id: 'google_places', name: 'Google Places API', blurb: 'Official high-quality business photos',                          badge: 'key', requiresKey: 'google' },
+];
+// User-facing sources, in order — the ones the waterfall actually runs (drops
+// any flagged `enabled: false`).
+const SHARED_PHOTO_SOURCES_ACTIVE = SHARED_PHOTO_SOURCES.filter(s => s.enabled !== false);
+
 // Region Round-Up caption building blocks (singular/plural type labels, header
 // and intro templates per language). Identical in the popup preview and the
 // service-worker post path — shared here to keep them in lockstep.
@@ -209,6 +231,7 @@ if (typeof module !== "undefined" && module.exports) {
     SHARED_CITY_FROM_ADDRESS_RE,
     SHARED_RR_TYPE_LABELS, SHARED_RR_HEADER_TEMPLATES, SHARED_RR_INTRO_TEMPLATES,
     SHARED_ITUNES_CC,
+    SHARED_PHOTO_SOURCES, SHARED_PHOTO_SOURCES_ACTIVE,
     getInstallId, clearAlarmsByPrefix, pickRandomCity, computeAppealMetrics,
     formatOSMAddress,
   };

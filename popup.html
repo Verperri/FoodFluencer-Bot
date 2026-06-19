@@ -1436,109 +1436,45 @@
     <!-- Step 2: How photos work -->
     <div class="ob-step hidden" id="ob-step-2">
       <h2 class="ob-title">Finding the best photos</h2>
-      <p class="ob-desc">The bot tries 8 image sources in order, accumulating quality photos until it has enough:</p>
-      <div class="ob-sources">
-        <div class="ob-source">
-          <span class="ob-source-num free">1</span>
-          <div class="ob-source-info">
-            <strong>Google Maps</strong>
-            <span>Venue photos scraped from Google Maps listings</span>
-          </div>
-          <span class="ob-badge ob-badge--free">Free</span>
-        </div>
-        <div class="ob-source">
-          <span class="ob-source-num free">2</span>
-          <div class="ob-source-info">
-            <strong>Venue website</strong>
-            <span>Photos pulled straight from the venue's own site &amp; Facebook page</span>
-          </div>
-          <span class="ob-badge ob-badge--free">Free</span>
-        </div>
-        <div class="ob-source">
-          <span class="ob-source-num free">3</span>
-          <div class="ob-source-info">
-            <strong>DuckDuckGo</strong>
-            <span>Web image search filtered for food &amp; atmosphere</span>
-          </div>
-          <span class="ob-badge ob-badge--free">Free</span>
-        </div>
-        <div class="ob-source">
-          <span class="ob-source-num free">4</span>
-          <div class="ob-source-info">
-            <strong>Wikimedia Commons</strong>
-            <span>Openly-licensed photos geotagged near the venue</span>
-          </div>
-          <span class="ob-badge ob-badge--free">Free</span>
-        </div>
-        <div class="ob-source">
-          <span class="ob-source-num free">5</span>
-          <div class="ob-source-info">
-            <strong>Yelp</strong>
-            <span>Categorised food, interior &amp; exterior photos</span>
-          </div>
-          <span class="ob-badge ob-badge--free">Free</span>
-        </div>
-        <div class="ob-source">
-          <span class="ob-source-num free">6</span>
-          <div class="ob-source-info">
-            <strong>TripAdvisor</strong>
-            <span>Scraped from TripAdvisor listing photo pages</span>
-          </div>
-          <span class="ob-badge ob-badge--free">Free</span>
-        </div>
-        <div class="ob-source ob-source--api">
-          <span class="ob-source-num api">7</span>
-          <div class="ob-source-info">
-            <strong>Foursquare API</strong>
-            <span>Venue photos via Foursquare Places (950 free/day)</span>
-          </div>
-          <span class="ob-badge ob-badge--key">API key</span>
-        </div>
-        <div class="ob-source ob-source--api">
-          <span class="ob-source-num api">8</span>
-          <div class="ob-source-info">
-            <strong>Google Places API</strong>
-            <span>Official high-quality business photos</span>
-          </div>
-          <span class="ob-badge ob-badge--key">API key</span>
-        </div>
-      </div>
+      <p class="ob-desc">The bot tries <span id="obSourceCount">several</span> image sources in order, accumulating quality photos until it has enough:</p>
+      <!-- Rendered from SHARED_PHOTO_SOURCES (config.js) by renderObSources() -->
+      <div class="ob-sources" id="obSources"></div>
       <button class="btn btn--primary ob-btn-next" data-to="3">Next →</button>
     </div>
 
     <!-- Step 3: API Keys -->
     <div class="ob-step hidden" id="ob-step-3">
-      <h2 class="ob-title">API Keys <em style="font-size:.7em;font-weight:400">(optional)</em></h2>
+      <h2 class="ob-title">API Keys <em class="ob-title-note">(optional)</em></h2>
       <p class="ob-desc">Add API keys to unlock extra photo sources and automatic business discovery. You can skip and add them later in Settings.</p>
 
-      <div class="ob-api-how" style="margin-bottom:10px">
-        <p><strong>🔵 Google Places</strong> — business discovery + photo source #6</p>
+      <div class="ob-api-how">
+        <p><strong>🔵 Google Places</strong> — business discovery + an extra photo source</p>
         <ol>
           <li>Go to <strong>console.cloud.google.com</strong></li>
           <li>Create a project → Enable <strong>Places API (New)</strong></li>
           <li>Go to <strong>Credentials</strong> → Create an API key</li>
         </ol>
       </div>
-      <div class="input-row" style="margin:6px 0 4px">
+      <div class="input-row ob-key-row">
         <input id="obApiKeyInput" type="password" placeholder="AIza…" autocomplete="off" />
         <button id="obSaveKey" class="btn btn--primary">Save</button>
       </div>
       <div id="obKeyStatus" class="ob-key-status"></div>
 
-      <div class="ob-api-how" style="margin-top:14px;margin-bottom:10px">
-        <p><strong>🟡 Foursquare</strong> — photo source #5, 950 free calls/day</p>
+      <div class="ob-api-how ob-api-how--gap">
+        <p><strong>🟡 Foursquare</strong> — an extra photo source, 950 free calls/day</p>
         <ol>
           <li>Go to <strong>foursquare.com/developers</strong></li>
           <li>Create a project → copy the <strong>API Key</strong></li>
         </ol>
       </div>
-      <div class="input-row" style="margin:6px 0 4px">
+      <div class="input-row ob-key-row">
         <input id="obFsqKeyInput" type="password" placeholder="fsq3…" autocomplete="off" />
         <button id="obSaveFsqKey" class="btn btn--primary">Save</button>
       </div>
       <div id="obFsqKeyStatus" class="ob-key-status"></div>
 
-      <div style="display:flex;gap:8px;margin-top:14px">
+      <div class="ob-actions">
         <button class="btn btn--primary ob-btn-next" data-to="4" id="obKeyContinue">Continue →</button>
         <button class="btn btn--ghost ob-btn-skip" id="obSkipKey">Skip for now →</button>
       </div>
@@ -1549,7 +1485,7 @@
       <div class="ob-done-icon">🎉</div>
       <h2 class="ob-title">You're all set!</h2>
       <div id="obFeatureStatus" class="ob-feature-status"></div>
-      <p class="ob-desc" style="margin-top:10px;font-size:.78rem">You can change all settings at any time via the <strong>⚙</strong> icon.</p>
+      <p class="ob-desc ob-note">You can change all settings at any time via the <strong>⚙</strong> icon.</p>
       <button class="btn btn--primary" id="obFinishBtn">Start using FoodFluencer Bot</button>
     </div>
 

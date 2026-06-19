@@ -51,7 +51,9 @@ const PLATFORM_SWITCH_DELAY_MS = 4000;
 // tech_log: yelp_scrape_error on every run, in both search and photo waterfalls.
 // It never contributes a result and only adds latency + log noise, so it's
 // disabled at the waterfall level. Flip to true to re-enable if Yelp reopens.
-const YELP_ENABLED = false;
+// Derived from the shared source list (config.js) so the waterfall and the
+// user-facing source lists never disagree about whether Yelp runs.
+const YELP_ENABLED = (SHARED_PHOTO_SOURCES.find(s => s.id === 'yelp') || {}).enabled === true;
 
 // ── Post-failure failsafe ────────────────────────────────────────────────────
 // Classifies a failed post by inspecting the error message and a snippet of
