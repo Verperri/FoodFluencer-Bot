@@ -161,19 +161,37 @@ describe('commonsFilePathUrl', () => {
   });
 });
 
+describe('formatCommonsAttribution', () => {
+  test('strips HTML from the author and appends the licence + Commons suffix', () => {
+    expect(bg.formatCommonsAttribution({
+      Artist: { value: '<a href="/wiki/User:Jane">Jane Doe</a>' },
+      LicenseShortName: { value: 'CC BY-SA 4.0' },
+    })).toBe('Jane Doe (CC BY-SA 4.0) / Wikimedia Commons');
+  });
+
+  test('handles a missing author or licence gracefully', () => {
+    expect(bg.formatCommonsAttribution({ LicenseShortName: { value: 'CC0' } }))
+      .toBe('(CC0) / Wikimedia Commons');
+    expect(bg.formatCommonsAttribution({ Artist: { value: 'John' } }))
+      .toBe('John / Wikimedia Commons');
+    expect(bg.formatCommonsAttribution(null)).toBe('Wikimedia Commons');
+  });
+});
+
 describe('commonsPagesToImageUrls', () => {
-  test('keeps raster photos (prefers thumburl), drops SVG/PDF and non-photo titles', () => {
+  test('returns {url, attribution}, prefers thumburl, drops SVG/PDF and non-photo titles', () => {
     const pages = {
-      '1': { imageinfo: [{ url: 'https://upload.wikimedia.org/full/Cafe.jpg', thumburl: 'https://upload.wikimedia.org/thumb/Cafe.jpg', mime: 'image/jpeg', descriptionurl: 'https://commons.wikimedia.org/wiki/File:Cafe.jpg' }] },
+      '1': { imageinfo: [{ url: 'https://upload.wikimedia.org/full/Cafe.jpg', thumburl: 'https://upload.wikimedia.org/thumb/Cafe.jpg', mime: 'image/jpeg', descriptionurl: 'https://commons.wikimedia.org/wiki/File:Cafe.jpg', extmetadata: { Artist: { value: 'Jane' }, LicenseShortName: { value: 'CC BY 4.0' } } }] },
       '2': { imageinfo: [{ url: 'https://upload.wikimedia.org/Logo.svg', mime: 'image/svg+xml' }] },
       '3': { imageinfo: [{ url: 'https://upload.wikimedia.org/Map.png', mime: 'image/png', descriptionurl: 'https://commons.wikimedia.org/wiki/File:City_map.png' }] },
       '4': { imageinfo: [{ url: 'https://upload.wikimedia.org/Plate.webp', mime: 'image/webp' }] },
     };
-    const urls = bg.commonsPagesToImageUrls(pages, 10);
-    expect(urls).toContain('https://upload.wikimedia.org/thumb/Cafe.jpg'); // thumburl preferred
-    expect(urls).toContain('https://upload.wikimedia.org/Plate.webp');
-    expect(urls).not.toContain('https://upload.wikimedia.org/Logo.svg');   // svg mime dropped
-    expect(urls.some(u => /Map\.png/.test(u))).toBe(false);                // "map" title dropped
+    const out = bg.commonsPagesToImageUrls(pages, 10);
+    const byUrl = Object.fromEntries(out.map(x => [x.url, x.attribution]));
+    expect(byUrl['https://upload.wikimedia.org/thumb/Cafe.jpg']).toBe('Jane (CC BY 4.0) / Wikimedia Commons'); // thumburl preferred + attribution
+    expect(out.some(x => x.url === 'https://upload.wikimedia.org/Plate.webp')).toBe(true);
+    expect(out.some(x => /Logo\.svg/.test(x.url))).toBe(false); // svg mime dropped
+    expect(out.some(x => /Map\.png/.test(x.url))).toBe(false);  // "map" title dropped
   });
 
   test('respects the limit and tolerates a missing pages object', () => {
@@ -181,6 +199,34 @@ describe('commonsPagesToImageUrls', () => {
     for (let i = 0; i < 20; i++) pages[i] = { imageinfo: [{ url: `https://upload.wikimedia.org/p${i}.jpg`, mime: 'image/jpeg' }] };
     expect(bg.commonsPagesToImageUrls(pages, 5)).toHaveLength(5);
     expect(bg.commonsPagesToImageUrls(undefined, 5)).toEqual([]);
+  });
+});
+
+describe('resolveCommonsFile', () => {
+  afterEach(() => { delete global.fetch; });
+
+  test('resolves a File: title to its scaled url + attribution via the API', async () => {
+    global.fetch = jest.fn().mockResolvedValue({
+      ok: true, status: 200,
+      json: () => Promise.resolve({ query: { pages: { '-1': { imageinfo: [{
+        url: 'https://upload.wikimedia.org/full/Venue.jpg',
+        thumburl: 'https://upload.wikimedia.org/thumb/Venue.jpg',
+        mime: 'image/jpeg',
+        extmetadata: { Artist: { value: 'Bob' }, LicenseShortName: { value: 'CC BY-SA 3.0' } },
+      }] } } } }),
+    });
+    const out = await bg.resolveCommonsFile('File:Venue.jpg');
+    expect(out).toEqual({
+      url: 'https://upload.wikimedia.org/thumb/Venue.jpg',
+      attribution: 'Bob (CC BY-SA 3.0) / Wikimedia Commons',
+    });
+    expect(global.fetch.mock.calls[0][0]).toContain('titles=File%3AVenue.jpg');
+  });
+
+  test('returns null for a non-image title without fetching', async () => {
+    global.fetch = jest.fn();
+    await expect(bg.resolveCommonsFile('Category:Foo')).resolves.toBeNull();
+    expect(global.fetch).not.toHaveBeenCalled();
   });
 });
 
@@ -194,33 +240,47 @@ describe('fetchWikimediaPhotos', () => {
     expect(global.fetch).not.toHaveBeenCalled();
   });
 
-  test('seeds the venue Commons file then appends geosearch results', async () => {
+  test('geosearches the venue coordinates and returns the photo URLs', async () => {
     global.fetch = jest.fn().mockResolvedValue({
-      ok: true,
-      status: 200,
-      json: () => Promise.resolve({
-        query: { pages: {
-          '1': { imageinfo: [{ url: 'https://upload.wikimedia.org/near1.jpg', thumburl: 'https://upload.wikimedia.org/near1-2048.jpg', mime: 'image/jpeg' }] },
-        } },
-      }),
+      ok: true, status: 200,
+      json: () => Promise.resolve({ query: { pages: {
+        '1': { imageinfo: [{ url: 'https://upload.wikimedia.org/near1.jpg', thumburl: 'https://upload.wikimedia.org/near1-2048.jpg', mime: 'image/jpeg' }] },
+      } } }),
     });
-
-    const urls = await bg.fetchWikimediaPhotos({ lat: 50.85, lon: 4.35, commonsTitle: 'File:Venue.jpg' });
-    // Seed (the venue's own Commons file) comes first…
-    expect(urls[0]).toBe('https://commons.wikimedia.org/wiki/Special:FilePath/Venue.jpg?width=2048');
-    // …then the geotagged neighbour (scaled thumburl).
-    expect(urls).toContain('https://upload.wikimedia.org/near1-2048.jpg');
-
-    // The geosearch hits the keyless Commons API with the venue coordinates.
+    const urls = await bg.fetchWikimediaPhotos({ lat: 50.85, lon: 4.35 });
+    expect(urls).toEqual(['https://upload.wikimedia.org/near1-2048.jpg']);
     const calledUrl = global.fetch.mock.calls[0][0];
-    expect(calledUrl).toContain('commons.wikimedia.org/w/api.php');
     expect(calledUrl).toContain('generator=geosearch');
     expect(calledUrl).toContain('ggscoord=50.85|4.35');
+    expect(calledUrl).toContain('extmetadata');
   });
 
-  test('still returns the seed when the geosearch request fails', async () => {
+  test('returns [] when the geosearch request fails', async () => {
     global.fetch = jest.fn().mockResolvedValue({ ok: false, status: 500, json: () => Promise.resolve({}) });
-    const urls = await bg.fetchWikimediaPhotos({ lat: 1, lon: 2, commonsTitle: 'File:Seed.jpg' });
-    expect(urls).toEqual(['https://commons.wikimedia.org/wiki/Special:FilePath/Seed.jpg?width=2048']);
+    await expect(bg.fetchWikimediaPhotos({ lat: 1, lon: 2 })).resolves.toEqual([]);
+  });
+});
+
+describe('photo credits', () => {
+  test('collectPhotoCredits dedupes attributions across photo sets', () => {
+    const a = [{ attribution: 'Jane / Wikimedia Commons' }, { source: 'duckduckgo' }];
+    const b = [{ attribution: 'Jane / Wikimedia Commons' }, { attribution: 'Bob / Wikimedia Commons' }];
+    expect(bg.collectPhotoCredits(a, b)).toEqual(['Jane / Wikimedia Commons', 'Bob / Wikimedia Commons']);
+    expect(bg.collectPhotoCredits()).toEqual([]);
+  });
+
+  test('buildPhotoCreditLine formats one vs many and caps at three', () => {
+    expect(bg.buildPhotoCreditLine([])).toBe('');
+    expect(bg.buildPhotoCreditLine(['Jane (CC BY 4.0) / Wikimedia Commons']))
+      .toBe('📷 Photo: Jane (CC BY 4.0) / Wikimedia Commons');
+    expect(bg.buildPhotoCreditLine(['A', 'B', 'C', 'D'])).toBe('📷 Photos: A; B; C');
+  });
+
+  test('getAutoCaptionBG appends a credit line only when there are credits', () => {
+    const opts = { name: true, hashtags: false, song: false };
+    const withCredit = bg.getAutoCaptionBG('Bistro', 'Brussels', 'restaurant', 'en', opts, null, {}, ['Jane / Wikimedia Commons']);
+    expect(withCredit).toContain('📷 Photo: Jane / Wikimedia Commons');
+    const noCredit = bg.getAutoCaptionBG('Bistro', 'Brussels', 'restaurant', 'en', opts, null, {}, []);
+    expect(noCredit).not.toContain('📷');
   });
 });

@@ -1342,8 +1342,9 @@ async function scrapeDDGPhotos(businessName, city, entityType) {
 // behind the "Top N…" header. Keyless. Prefers an openly-licensed Wikimedia
 // Commons photo (clean rights for a published cover), falling back to a
 // DuckDuckGo image search. Prefers landscape, decent-resolution, non-stock
-// shots. Returns a downscaled data URL, or null so the caller can fall back to
-// the first entity's photo.
+// shots. Returns { dataUrl, attribution } (attribution non-null only for the
+// Commons path), or null so the caller can fall back to the first entity's
+// photo.
 async function fetchRegionCoverPhoto(location, country) {
   const place = (location || "").trim();
   if (!place) return null;
@@ -1353,16 +1354,16 @@ async function fetchRegionCoverPhoto(location, country) {
   // published cover image.
   try {
     const wiki = await fetchCommonsByText(`${place} ${country} cityscape`, 1600);
-    for (const url of wiki.slice(0, 6)) {
+    for (const cand of wiki.slice(0, 6)) {
       try {
-        const blob = await fetch(url).then(x => x.ok ? x.blob() : Promise.reject(new Error(`HTTP ${x.status}`)));
+        const blob = await fetch(cand.url).then(x => x.ok ? x.blob() : Promise.reject(new Error(`HTTP ${x.status}`)));
         const bmp  = await createImageBitmap(blob);
         const ok   = Math.min(bmp.width, bmp.height) >= MIN_SOURCE_DIM && bmp.width >= bmp.height;
         bmp.close();
         if (!ok) continue;
         const dataUrl = await blobToDataUrl(blob);
         bgLog("info", `RoundupCover: using an openly-licensed Commons image for "${place}"`);
-        return await downscaleDataUrl(dataUrl, 1280);
+        return { dataUrl: await downscaleDataUrl(dataUrl, 1280), attribution: cand.attribution };
       } catch (_) { /* try the next Commons candidate */ }
     }
   } catch (e) {
@@ -1395,7 +1396,7 @@ async function fetchRegionCoverPhoto(location, country) {
         if (!ok) continue;
         const dataUrl = await blobToDataUrl(blob);
         bgLog("info", `RoundupCover: using a cover image for "${place}"`);
-        return await downscaleDataUrl(dataUrl, 1280);
+        return { dataUrl: await downscaleDataUrl(dataUrl, 1280), attribution: null };
       } catch (_) { /* try the next candidate */ }
     }
     bgLog("warn", `RoundupCover: no suitable cover image for "${place}" — using first entity`);
@@ -1542,10 +1543,30 @@ async function lookupOSMVenue(businessName, city) {
   return out;
 }
 
+// Attribution for openly-licensed images that require credit (Wikimedia
+// Commons). Keyed by the exact image URL collectFromUrls will fetch, so the
+// waterfall can attach `.attribution` to each collected photo by sourceUrl.
+// Module-level because the URL-string pipeline can't carry per-image metadata;
+// keys are unique image URLs, so concurrent venue waterfalls don't collide.
+const _photoAttribution = new Map();
+function recordAttribution(url, text) { if (url && text) _photoAttribution.set(url, text); }
+
+// Turn a Commons `extmetadata` block into a compact, post-ready credit:
+// "Jane Doe (CC BY-SA 4.0) / Wikimedia Commons". HTML in the Artist field is
+// stripped; falls back to a bare Commons credit when author/license are absent.
+function formatCommonsAttribution(extmetadata) {
+  const strip = h => String(h == null ? '' : h).replace(/<[^>]+>/g, '').replace(/\s+/g, ' ').trim();
+  const artist  = strip(extmetadata && extmetadata.Artist && extmetadata.Artist.value);
+  const license = strip(extmetadata && extmetadata.LicenseShortName && extmetadata.LicenseShortName.value);
+  const head = [artist, license ? `(${license})` : ''].filter(Boolean).join(' ');
+  return head ? `${head} / Wikimedia Commons` : 'Wikimedia Commons';
+}
+
 // Build a keyless full-resolution URL for a Wikimedia Commons file. The
 // Special:FilePath endpoint 302-redirects to the actual upload.wikimedia.org
 // file (optionally scaled), so no API call is needed. Category tags and
-// non-image files return null.
+// non-image files return null. Used as a fallback when the API lookup fails —
+// note it yields no author/license, so callers credit it generically.
 function commonsFilePathUrl(commonsTag, width = 2048) {
   if (!commonsTag) return null;
   let title = String(commonsTag).trim();
@@ -1555,8 +1576,9 @@ function commonsFilePathUrl(commonsTag, width = 2048) {
   return `https://commons.wikimedia.org/wiki/Special:FilePath/${encodeURIComponent(title)}?width=${width}`;
 }
 
-// Map a Wikimedia Commons API `query.pages` object to scaled image URLs,
-// keeping only raster photos (no SVG/PDF) and dropping obvious non-photos.
+// Map a Wikimedia Commons API `query.pages` object to { url, attribution }
+// records, keeping only raster photos (no SVG/PDF) and dropping obvious
+// non-photos. Requesting `extmetadata` in iiprop populates the attribution.
 function commonsPagesToImageUrls(pages, limit) {
   const JUNK_RE = /\b(logo|icon|map|plan|diagram|sign|flag|coat|seal|svg|chart|graph)\b/i;
   // Commons filenames are underscore-joined (City_map.png) — normalise those to
@@ -1567,32 +1589,55 @@ function commonsPagesToImageUrls(pages, limit) {
     .map(p => p.imageinfo && p.imageinfo[0])
     .filter(ii => ii && /^image\/(jpe?g|png|webp)$/i.test(ii.mime || ''))
     .filter(ii => !isJunk(ii))
-    .map(ii => ii.thumburl || ii.url)
-    .filter(Boolean)
+    .map(ii => ({ url: ii.thumburl || ii.url, attribution: formatCommonsAttribution(ii.extmetadata) }))
+    .filter(x => x.url)
     .slice(0, limit);
+}
+
+// Resolve a single Commons file title (e.g. an OSM `wikimedia_commons` tag) to
+// its scaled URL + attribution via the API. Returns null for non-images or on
+// failure (caller may fall back to commonsFilePathUrl).
+async function resolveCommonsFile(title, width = 2048) {
+  const t = String(title || '').replace(/^file:/i, '');
+  if (!/\.(jpe?g|png|webp)$/i.test(t)) return null;
+  try {
+    const api = `https://commons.wikimedia.org/w/api.php?action=query&format=json&origin=*`
+      + `&prop=imageinfo&iiprop=url|mime|extmetadata&iiurlwidth=${width}`
+      + `&titles=${encodeURIComponent('File:' + t)}`;
+    const res = await fetch(api, { headers: { Accept: 'application/json' } });
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    const data = await res.json();
+    const page = Object.values((data && data.query && data.query.pages) || {})[0];
+    const ii = page && page.imageinfo && page.imageinfo[0];
+    if (!ii || !/^image\/(jpe?g|png|webp)$/i.test(ii.mime || '')) return null;
+    return { url: ii.thumburl || ii.url, attribution: formatCommonsAttribution(ii.extmetadata) };
+  } catch (e) {
+    bgLog('warn', `Commons file resolve failed: ${e.message}`);
+    return null;
+  }
 }
 
 // ── Source 2.5: Wikimedia Commons (openly licensed, keyless) ─────────────────
 // Geosearch around the venue's coordinates for photos contributors have
-// geotagged nearby. Images are CC / Public Domain (attribution may apply) — no
+// geotagged nearby. Images are CC / Public Domain (attribution required) — no
 // fee, key, or signup. Lower priority than venue-confirmed sources because
 // "nearby" can include neighbouring buildings, so it only runs when the pool is
-// still short.
+// still short. Records each photo's attribution for the caption credit line.
 async function fetchWikimediaPhotos(osm) {
   if (!osm || osm.lat == null || osm.lon == null) return [];
   bgLog('info', 'PhotoScrape[Wikimedia] geosearch', { lat: osm.lat, lon: osm.lon });
   const urls = [];
-  // Seed with the venue's own Commons file (from OSM tags) when present.
-  const seed = commonsFilePathUrl(osm.commonsTitle);
-  if (seed) urls.push(seed);
   try {
     const api = `https://commons.wikimedia.org/w/api.php?action=query&format=json&origin=*`
       + `&generator=geosearch&ggscoord=${osm.lat}|${osm.lon}&ggsradius=300&ggslimit=20&ggsnamespace=6`
-      + `&prop=imageinfo&iiprop=url|mime&iiurlwidth=2048`;
+      + `&prop=imageinfo&iiprop=url|mime|extmetadata&iiurlwidth=2048`;
     const res = await fetch(api, { headers: { Accept: 'application/json' } });
     if (!res.ok) throw new Error(`HTTP ${res.status}`);
     const data = await res.json();
-    urls.push(...commonsPagesToImageUrls(data?.query?.pages, 12));
+    for (const { url, attribution } of commonsPagesToImageUrls(data?.query?.pages, 12)) {
+      recordAttribution(url, attribution);
+      urls.push(url);
+    }
     bgLog('info', `PhotoScrape[Wikimedia] ${urls.length} candidate photos`);
     TechLog.info('PHOTO', 'wikimedia_scrape', { lat: osm.lat, lon: osm.lon, count: urls.length });
   } catch (e) {
@@ -1604,11 +1649,12 @@ async function fetchWikimediaPhotos(osm) {
 
 // Free-text Wikimedia Commons image search — used for the Region Round-Up cover
 // photo, where an openly-licensed cityscape beats a rights-murky web image.
+// Returns { url, attribution } records.
 async function fetchCommonsByText(query, width = 1600) {
   try {
     const api = `https://commons.wikimedia.org/w/api.php?action=query&format=json&origin=*`
       + `&generator=search&gsrsearch=${encodeURIComponent(query)}&gsrnamespace=6&gsrlimit=20`
-      + `&prop=imageinfo&iiprop=url|mime&iiurlwidth=${width}`;
+      + `&prop=imageinfo&iiprop=url|mime|extmetadata&iiurlwidth=${width}`;
     const res = await fetch(api, { headers: { Accept: 'application/json' } });
     if (!res.ok) throw new Error(`HTTP ${res.status}`);
     const data = await res.json();
@@ -1617,6 +1663,24 @@ async function fetchCommonsByText(query, width = 1600) {
     bgLog('warn', `Commons text search failed: ${e.message}`);
     return [];
   }
+}
+
+// Collect the distinct attribution credits from a set of collected photos —
+// used to append a photo-credit line to auto-generated captions.
+function collectPhotoCredits(...photoSets) {
+  const seen = new Set();
+  for (const set of photoSets)
+    for (const p of set || [])
+      if (p && p.attribution) seen.add(p.attribution);
+  return [...seen];
+}
+
+// Format the photo-credit caption line (e.g. "📷 Photo: Jane Doe (CC BY-SA
+// 4.0) / Wikimedia Commons"). Returns "" when there's nothing to credit.
+function buildPhotoCreditLine(credits) {
+  const uniq = [...new Set((credits || []).filter(Boolean))];
+  if (!uniq.length) return '';
+  return `📷 ${uniq.length > 1 ? 'Photos' : 'Photo'}: ${uniq.slice(0, 3).join('; ')}`;
 }
 
 // ── Source 1.5: venue-owned photos (website + OSM tags + Facebook page) ───────
@@ -1642,11 +1706,22 @@ async function scrapeVenueOwnedPhotos(businessName, city, hintWebsite = null, os
   const bigEnough = r => Math.min(r.width || 0, r.height || 0) >= MIN_SOURCE_DIM
     && (r.width / r.height) < 3 && (r.height / r.width) < 3;
 
-  // b) venue-attached OSM photos (synchronous — just URL building, no fetch).
+  // b) venue-attached OSM photos: the `image` tag (a direct URL, unknown
+  //    licence → no credit) and the `wikimedia_commons` tag, resolved via the
+  //    API for its author/licence (falling back to a keyless Special:FilePath
+  //    URL credited generically if the lookup fails).
   const osmImages = [];
   if (osm?.image && /^https?:\/\//i.test(osm.image)) osmImages.push(osm.image);
-  const commonsUrl = commonsFilePathUrl(osm?.commonsTitle);
-  if (commonsUrl) osmImages.push(commonsUrl);
+  if (osm?.commonsTitle) {
+    const resolved = await resolveCommonsFile(osm.commonsTitle);
+    if (resolved) {
+      recordAttribution(resolved.url, resolved.attribution);
+      osmImages.push(resolved.url);
+    } else {
+      const fb = commonsFilePathUrl(osm.commonsTitle);
+      if (fb) { recordAttribution(fb, 'Wikimedia Commons'); osmImages.push(fb); }
+    }
+  }
   if (osmImages.length) bgLog('info', `PhotoScrape[VenueOwned] ${osmImages.length} OSM-attached photo(s)`);
 
   // The channels are independent (different endpoints), so they run in
@@ -2116,6 +2191,14 @@ async function fetchPhotosWaterfall(businessName, address, entityType, minPics, 
     await collectFromUrls(ddgUrls, 'duckduckgo_lowres', { ignoreResolution: true });
   }
 
+  // ── Attach attribution to openly-licensed photos ──────────────────────────
+  // The URL-string pipeline can't carry per-image metadata, so credits captured
+  // by the Commons sources are looked up here by the photo's sourceUrl.
+  for (const p of collected) {
+    const attr = _photoAttribution.get(p.sourceUrl);
+    if (attr) p.attribution = attr;
+  }
+
   // ── Rank by content appeal, split into post photos + spares ────────────────
   // The pool may hold up to `poolTarget` quality-passing photos. Rank the whole
   // pool by rankScore (quality + content appeal blend), keep the top `target`
@@ -2230,7 +2313,7 @@ async function getAutoSongBG(genre, country) {
   return song;
 }
 
-function getAutoCaptionBG(name, address, type, language, captionOpts, songInfo, entityMeta = {}) {
+function getAutoCaptionBG(name, address, type, language, captionOpts, songInfo, entityMeta = {}, photoCredits = []) {
   // entityMeta: { createdYear, lastVisitYear, province }
   const cityM  = address.match(CITY_FROM_ADDRESS_RE_BG);
   const city   = (cityM?.[1] || address.split(",")[0] || "").trim();
@@ -2505,6 +2588,8 @@ function getAutoCaptionBG(name, address, type, language, captionOpts, songInfo, 
   if (captionOpts.address && address) parts.push(`📌 ${address}`);
   if ((captionOpts.name||captionOpts.address) && (captionOpts.song||captionOpts.hashtags)) parts.push("");
   if (captionOpts.song && songInfo)   parts.push(`🎵 ${songInfo.name} – ${songInfo.artist}`);
+  const creditLine = buildPhotoCreditLine(photoCredits);
+  if (creditLine) { parts.push(""); parts.push(creditLine); }
   if (captionOpts.hashtags) {
     const tc = tLabel.charAt(0).toUpperCase() + tLabel.slice(1);
     const extras = pickExtraHashtags(2).map(h => `#${h}`).join(" ");
@@ -2523,7 +2608,7 @@ const RR_TYPE_LABELS_BG      = SHARED_RR_TYPE_LABELS;
 const RR_HEADER_TEMPLATES_BG = SHARED_RR_HEADER_TEMPLATES;
 const RR_INTRO_TEMPLATES_BG  = SHARED_RR_INTRO_TEMPLATES;
 
-function getAutoCaptionRoundupBG(places, type, region, language, captionOpts, songInfo) {
+function getAutoCaptionRoundupBG(places, type, region, language, captionOpts, songInfo, photoCredits = []) {
   const lang   = RR_TYPE_LABELS_BG[language] ? language : "en";
   const labels = RR_TYPE_LABELS_BG[lang][type] || RR_TYPE_LABELS_BG[lang].restaurant;
   const n      = places.length;
@@ -2548,6 +2633,9 @@ function getAutoCaptionRoundupBG(places, type, region, language, captionOpts, so
     parts.push("");
     parts.push(`🎵 ${songInfo.name} – ${songInfo.artist}`);
   }
+
+  const creditLine = buildPhotoCreditLine(photoCredits);
+  if (creditLine) { parts.push(""); parts.push(creditLine); }
 
   if (captionOpts.hashtags) {
     const regionTag = region.replace(/[\s,]+/g, "");
@@ -2737,8 +2825,9 @@ async function autoPostNow(postIndex) {
     // 4 ── Build caption ──────────────────────────────────────────────────────
     const captionOpts = { catchy: config.capCatchy ?? true, name: config.capName ?? true,
       address: config.capAddr ?? true, hashtags: config.capHash ?? true, song: config.capSong ?? true };
+    const photoCredits = collectPhotoCredits(photoResult.photoLog);
     const caption = getAutoCaptionBG(name, address, config.type||"restaurant",
-                                      config.language||"nl", captionOpts, songInfo);
+                                      config.language||"nl", captionOpts, songInfo, {}, photoCredits);
     TechLog.info("CAPTION", "caption_built", { run_id: runId, run_type: "auto",
       language: config.language, length: caption.length });
 
@@ -2889,13 +2978,22 @@ async function autoPostRoundupNow(postIndex) {
         return null;
       }
       // Burn the venue name into the photo so each slide is self-identifying.
-      return { place, dataUrl: await applyEntityNameLabel(photoResult.dataUrls[0], name) };
+      return {
+        place,
+        dataUrl: await applyEntityNameLabel(photoResult.dataUrls[0], name),
+        attribution: (photoResult.photoLog && photoResult.photoLog[0] && photoResult.photoLog[0].attribution) || null,
+      };
     });
 
-    const photoDataUrls = [];
-    const keptPlaces    = [];
+    const photoDataUrls   = [];
+    const keptPlaces      = [];
+    const entityCredits   = [];
     for (const r of resolved) {
-      if (r.ok && r.value) { photoDataUrls.push(r.value.dataUrl); keptPlaces.push(r.value.place); }
+      if (r.ok && r.value) {
+        photoDataUrls.push(r.value.dataUrl);
+        keptPlaces.push(r.value.place);
+        if (r.value.attribution) entityCredits.push(r.value.attribution);
+      }
     }
 
     if (photoDataUrls.length === 0) {
@@ -2914,7 +3012,9 @@ async function autoPostRoundupNow(postIndex) {
     // the injector then overlays it with the "Top N…" header. Falls back to the
     // first entity photo when no suitable city image is found.
     const countryName  = AB_COUNTRY_NAMES_BG[config.country] || "Belgium";
-    const coverDataUrl  = await fetchRegionCoverPhoto(region, countryName).catch(() => null);
+    const cover         = await fetchRegionCoverPhoto(region, countryName).catch(() => null);
+    const coverDataUrl  = cover?.dataUrl || null;
+    if (cover?.attribution) entityCredits.push(cover.attribution);
     const postPhotos    = coverDataUrl ? [coverDataUrl, ...photoDataUrls] : photoDataUrls;
     TechLog.info("MEDIA", "cover_slide", { run_id: runId, run_type: "roundup", has_cover: !!coverDataUrl });
 
@@ -2932,7 +3032,7 @@ async function autoPostRoundupNow(postIndex) {
       song:            config.capSong ?? true,
     };
     const caption = getAutoCaptionRoundupBG(keptPlaces, config.type||"restaurant", region,
-                                             config.language||"nl", captionOpts, songInfo);
+                                             config.language||"nl", captionOpts, songInfo, entityCredits);
     const header  = caption.split("\n")[0];
     TechLog.info("CAPTION", "caption_built", { run_id: runId, run_type: "roundup",
       language: config.language, length: caption.length });
@@ -6903,6 +7003,8 @@ if (typeof module !== 'undefined' && module.exports) {
     computePhash, phashDistance, downscaleDataUrl,
     scrapeWebsiteImages, extractWebsiteFromHtml,
     commonsFilePathUrl, commonsPagesToImageUrls, fetchWikimediaPhotos, fetchCommonsByText,
+    resolveCommonsFile, formatCommonsAttribution, collectPhotoCredits, buildPhotoCreditLine,
+    getAutoCaptionBG,
     searchAutoPlacesCollectionBG, getAutoCaptionRoundupBG,
     roundupEntityKey, recordRoundupPostedEntities, getRoundupRecentKeys,
     mapLimit, appendAppLog,
