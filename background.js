@@ -29,6 +29,19 @@ async function mapLimit(items, limit, fn) {
   return results;
 }
 
+// Rejects with Error('timeout') if `promise` doesn't settle within `ms`. Used to
+// bound the discovery/scrape network calls so one slow source can't stall the
+// whole waterfall. NOTE: distinct from raceTimeout() (defined in the scraping
+// section) which RESOLVES to [] on timeout for the photo-pool steps that treat a
+// timed-out source as simply "no photos"; this one PROPAGATES the timeout as an
+// error so the caller's try/catch falls through to the next source.
+function withTimeout(promise, ms) {
+  return Promise.race([
+    promise,
+    new Promise((_, rej) => setTimeout(() => rej(new Error('timeout')), ms)),
+  ]);
+}
+
 // Pause between posting to consecutive platforms in a single run (spotlight or
 // roundup). Jittered by sleep() so the cadence isn't robotic — a fixed, uniform
 // gap between platform posts is a common automation fingerprint.
@@ -93,15 +106,7 @@ async function recordFailure(postIndex, platform, result) {
   return entry;
 }
 
-// Clears only the alarms belonging to one campaign (identified by its alarm
-// name prefix) — leaves the other campaign's alarms untouched. Each campaign
-// (single-spotlight "ffbot-auto-" vs region-roundup "ffbot-roundup-") runs on
-// its own independent schedule, so pausing/deactivating one must not wipe the
-// other's pending alarms.
-async function clearAlarmsByPrefix(prefix) {
-  const all = await chrome.alarms.getAll();
-  await Promise.all(all.filter(a => a.name.startsWith(prefix)).map(a => chrome.alarms.clear(a.name)));
-}
+// clearAlarmsByPrefix() is shared via config.js (single source of truth).
 
 // Pauses a campaign: clears its own pending alarms and stores the reason so the
 // popup can surface it and offer a "Resume" action once the user has dealt
@@ -313,13 +318,8 @@ const AB_BOUNDS_BG = {
 // config.js — single source of truth). Cycling through cities gives genuine
 // variety — the Places API always returns the same top-20 national results for a
 // country-wide query, so we anchor each search to a different city.
-const AB_CITY_POOL_BG = SHARED_CITY_POOL;
-
-function pickRandomCity(countryCode) {
-  const pool = AB_CITY_POOL_BG[countryCode] || AB_CITY_POOL_BG.BE;
-  return pool[Math.floor(Math.random() * pool.length)];
-}
-const AB_ITUNES_CC_BG = { BE:"be", FR:"fr", DE:"de", LU:"be", NL:"nl" };
+// pickRandomCity() is shared via config.js (reads SHARED_CITY_POOL directly).
+const AB_ITUNES_CC_BG = SHARED_ITUNES_CC;
 
 async function getApiKey() {
   return new Promise(res => chrome.storage.local.get({ googleApiKey:"" }, d => res(d.googleApiKey)));
@@ -342,12 +342,11 @@ const OSM_TAG_BG = {
 async function fetchFoursquareCandidatesBG(type, city, country, foursquareApiKey) {
   const category = FSQ_CATEGORY_BG[type] || FSQ_CATEGORY_BG.restaurant;
   const near = `${city}, ${country}`;
-  const res = await Promise.race([
+  const res = await withTimeout(
     fetch(`https://api.foursquare.com/v3/places/search?near=${encodeURIComponent(near)}&categories=${category}&sort=RATING&limit=20`, {
       headers: { Authorization: foursquareApiKey, Accept: 'application/json' },
     }).then(r => { if (!r.ok) throw new Error(`HTTP ${r.status}`); return r.json(); }),
-    new Promise((_, rej) => setTimeout(() => rej(new Error('timeout')), 10000)),
-  ]);
+    10000);
   const results = res.results || [];
   return results.map(v => ({
     displayName:      { text: v.name || "Unknown" },
@@ -359,47 +358,35 @@ async function fetchFoursquareCandidatesBG(type, city, country, foursquareApiKey
   }));
 }
 
-function formatOSMAddressBG(tags = {}, fallbackCity, country) {
-  const parts = [];
-  if (tags['addr:street']) {
-    parts.push(tags['addr:housenumber'] ? `${tags['addr:street']} ${tags['addr:housenumber']}` : tags['addr:street']);
-  }
-  const city = tags['addr:city'] || fallbackCity;
-  const cityLine = `${tags['addr:postcode'] || ''} ${city || ''}`.trim();
-  if (cityLine) parts.push(cityLine);
-  parts.push(country);
-  return parts.filter(Boolean).join(', ');
-}
+// formatOSMAddress() is shared via config.js (single source of truth).
 
 // Returns candidates via OpenStreetMap — geocodes the city with Nominatim,
 // then queries Overpass for nearby POIs of the right type. Free, keyless.
 // OSM has no ratings, so rating/userRatingCount are always 0.
 async function fetchOSMCandidatesBG(type, city, country) {
-  const geoRes = await Promise.race([
+  const geoRes = await withTimeout(
     fetch(`https://nominatim.openstreetmap.org/search?q=${encodeURIComponent(`${city}, ${country}`)}&format=jsonv2&limit=1`,
       { headers: { Accept: 'application/json' } })
       .then(r => { if (!r.ok) throw new Error(`HTTP ${r.status}`); return r.json(); }),
-    new Promise((_, rej) => setTimeout(() => rej(new Error('timeout')), 10000)),
-  ]);
+    10000);
   const geo = geoRes[0];
   if (!geo) return [];
 
   const tag = OSM_TAG_BG[type] || OSM_TAG_BG.restaurant;
   const query = `[out:json][timeout:25];nwr[${tag}](around:5000,${geo.lat},${geo.lon});out center 50;`;
-  const data = await Promise.race([
+  const data = await withTimeout(
     fetch('https://overpass-api.de/api/interpreter', {
       method: 'POST',
       headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
       body: 'data=' + encodeURIComponent(query),
     }).then(r => { if (!r.ok) throw new Error(`HTTP ${r.status}`); return r.json(); }),
-    new Promise((_, rej) => setTimeout(() => rej(new Error('timeout')), 20000)),
-  ]);
+    20000);
 
   return (data.elements || [])
     .filter(e => e.tags?.name)
     .map(e => ({
       displayName:      { text: e.tags.name },
-      formattedAddress: formatOSMAddressBG(e.tags, city, country),
+      formattedAddress: formatOSMAddress(e.tags, city, country),
       rating:           0,
       userRatingCount:  0,
       photos:           [],
@@ -432,12 +419,11 @@ async function searchAutoPlaceBG(config, apiKey, foursquareApiKey) {
   // ── 1. Google Maps search HTML ─────────────────────────────────────────────
   try {
     const query = `${typeQ} in ${city} ${country}`;
-    const html  = await Promise.race([
+    const html  = await withTimeout(
       fetch(`https://www.google.com/maps/search/${encodeURIComponent(query)}`,
         { headers: { 'User-Agent': SCRAPE_UA, 'Accept-Language': 'en-US,en;q=0.9' } })
         .then(r => { if (!r.ok) throw new Error(`HTTP ${r.status}`); return r.text(); }),
-      new Promise((_, rej) => setTimeout(() => rej(new Error('timeout')), 10000)),
-    ]);
+      10000);
 
     // Google Maps embeds business data using the same field names as the Places
     // API — extract them directly with regex.
@@ -472,13 +458,12 @@ async function searchAutoPlaceBG(config, apiKey, foursquareApiKey) {
 
   // ── 2. Yelp search page (disabled — Yelp returns HTTP 403 to scrapers) ──────
   if (YELP_ENABLED) try {
-    const html = await Promise.race([
+    const html = await withTimeout(
       fetch(
         `https://www.yelp.com/search?find_desc=${encodeURIComponent(typeQ)}&find_loc=${encodeURIComponent(`${city}, ${country}`)}`,
         { headers: { 'User-Agent': SCRAPE_UA, 'Accept-Language': 'en-US,en;q=0.9' } })
         .then(r => { if (!r.ok) throw new Error(`HTTP ${r.status}`); return r.text(); }),
-      new Promise((_, rej) => setTimeout(() => rej(new Error('timeout')), 10000)),
-    ]);
+      10000);
 
     if (/datadome|are you a robot/i.test(html)) throw new Error('DataDome block');
 
@@ -559,7 +544,7 @@ async function searchAutoPlaceBG(config, apiKey, foursquareApiKey) {
       bgLog('info', `AutoSearch[Places API] fallback for ${typeQ} in ${city}`);
       const bounds  = AB_BOUNDS_BG[config.country] || AB_BOUNDS_BG.BE;
       const locPart = `${city}, ${country}`;
-      const res = await Promise.race([
+      const res = await withTimeout(
         fetch(AB_PLACES_SEARCH, {
           method: 'POST',
           headers: {
@@ -574,8 +559,7 @@ async function searchAutoPlaceBG(config, apiKey, foursquareApiKey) {
             locationRestriction: { rectangle: bounds },
           }),
         }).then(r => { if (!r.ok) throw new Error(`HTTP ${r.status}`); return r.json(); }),
-        new Promise((_, rej) => setTimeout(() => rej(new Error('timeout')), 10000)),
-      ]);
+        10000);
 
       if (res.places?.length) {
         const filtered = res.places.filter(p =>
@@ -665,12 +649,11 @@ async function searchAutoPlacesCollectionBG(config, apiKey, foursquareApiKey, ex
   // ── 1. Google Maps search HTML ─────────────────────────────────────────────
   try {
     const query = `${typeQ} in ${city} ${country}`;
-    const html  = await Promise.race([
+    const html  = await withTimeout(
       fetch(`https://www.google.com/maps/search/${encodeURIComponent(query)}`,
         { headers: { 'User-Agent': SCRAPE_UA, 'Accept-Language': 'en-US,en;q=0.9' } })
         .then(r => { if (!r.ok) throw new Error(`HTTP ${r.status}`); return r.text(); }),
-      new Promise((_, rej) => setTimeout(() => rej(new Error('timeout')), 10000)),
-    ]);
+      10000);
 
     const names     = [...html.matchAll(/"displayName":\{"text":"([^"]{3,80})"/g)].map(m => m[1]);
     const addrs     = [...html.matchAll(/"formattedAddress":"([^"]{10,150})"/g)].map(m => m[1]);
@@ -702,13 +685,12 @@ async function searchAutoPlacesCollectionBG(config, apiKey, foursquareApiKey, ex
 
   // ── 2. Yelp search page (disabled — Yelp returns HTTP 403 to scrapers) ──────
   if (YELP_ENABLED) try {
-    const html = await Promise.race([
+    const html = await withTimeout(
       fetch(
         `https://www.yelp.com/search?find_desc=${encodeURIComponent(typeQ)}&find_loc=${encodeURIComponent(`${city}, ${country}`)}`,
         { headers: { 'User-Agent': SCRAPE_UA, 'Accept-Language': 'en-US,en;q=0.9' } })
         .then(r => { if (!r.ok) throw new Error(`HTTP ${r.status}`); return r.text(); }),
-      new Promise((_, rej) => setTimeout(() => rej(new Error('timeout')), 10000)),
-    ]);
+      10000);
 
     if (/datadome|are you a robot/i.test(html)) throw new Error('DataDome block');
 
@@ -785,7 +767,7 @@ async function searchAutoPlacesCollectionBG(config, apiKey, foursquareApiKey, ex
       bgLog('info', `RoundupSearch[Places API] fallback for ${typeQ} in ${city}`);
       const bounds  = AB_BOUNDS_BG[config.country] || AB_BOUNDS_BG.BE;
       const locPart = `${city}, ${country}`;
-      const res = await Promise.race([
+      const res = await withTimeout(
         fetch(AB_PLACES_SEARCH, {
           method: 'POST',
           headers: {
@@ -800,8 +782,7 @@ async function searchAutoPlacesCollectionBG(config, apiKey, foursquareApiKey, ex
             locationRestriction: { rectangle: bounds },
           }),
         }).then(r => { if (!r.ok) throw new Error(`HTTP ${r.status}`); return r.json(); }),
-        new Promise((_, rej) => setTimeout(() => rej(new Error('timeout')), 10000)),
-      ]);
+        10000);
 
       if (res.places?.length) {
         const filtered = res.places.filter(p => (p.userRatingCount || 0) >= minRatings);
@@ -1027,67 +1008,9 @@ async function recordRoundupPostedEntities(places, city, cap = ROUNDUP_RECENT_CA
 // upscaled, so we reject it here regardless of how sharp it looks downscaled.
 const MIN_SOURCE_DIM = 720;
 
-// ── Content appeal heuristics ─────────────────────────────────────────────────
-// On top of the technical pass/fail gate, candidate photos are ranked by an
-// "appeal" score meant to proxy how engaging the content looks for a food/venue
-// post — favouring vibrant, warm-toned shots with a clear central subject over
-// flat, cold, or cluttered ones.
-//
-//   colorfulness  Hasler–Süsstrunk metric over the rg/yb opponent channels.
-//                 Vibrant, colourful shots (food close-ups) score high; drab
-//                 or monochrome scenes score low.
-//
-//   warmth        Mean (R - B) across pixels. Positive = warm tones (reds/
-//                 oranges/browns typical of appetising food shots).
-//
-//   centerFocus   Ratio of edge energy (Laplacian²) in the center 50% of the
-//                 frame vs. the surrounding border. >1 means the center is
-//                 more "in focus"/detailed than the edges — suggests a clear
-//                 subject rather than a busy or empty background.
-//
-// Returns { colorfulness, warmth, centerFocus, appeal } where `appeal` is a
-// 0-100 weighted blend of the normalised sub-scores.
-function computeAppealMetrics(data, gray, W, H) {
-  const total = W * H;
-
-  let rgSum = 0, ybSum = 0, rgSumSq = 0, ybSumSq = 0, rbSum = 0;
-  for (let i = 0; i < total; i++) {
-    const r = data[i * 4], g = data[i * 4 + 1], b = data[i * 4 + 2];
-    const rg = r - g;
-    const yb = 0.5 * (r + g) - b;
-    rgSum += rg; ybSum += yb;
-    rgSumSq += rg * rg; ybSumSq += yb * yb;
-    rbSum += (r - b);
-  }
-  const rgMean = rgSum / total, ybMean = ybSum / total;
-  const rgStd = Math.sqrt(Math.max(0, rgSumSq / total - rgMean * rgMean));
-  const ybStd = Math.sqrt(Math.max(0, ybSumSq / total - ybMean * ybMean));
-  const colorfulness = Math.sqrt(rgStd * rgStd + ybStd * ybStd) + 0.3 * Math.sqrt(rgMean * rgMean + ybMean * ybMean);
-  const warmth = rbSum / total;
-
-  const x0 = Math.floor(W * 0.25), x1 = Math.floor(W * 0.75);
-  const y0 = Math.floor(H * 0.25), y1 = Math.floor(H * 0.75);
-  let centerE = 0, centerN = 0, outerE = 0, outerN = 0;
-  for (let y = 1; y < H - 1; y++) {
-    for (let x = 1; x < W - 1; x++) {
-      const idx = y * W + x;
-      const lap = gray[idx - W] + gray[idx + W] + gray[idx - 1] + gray[idx + 1] - 4 * gray[idx];
-      const e = lap * lap;
-      if (x >= x0 && x < x1 && y >= y0 && y < y1) { centerE += e; centerN++; }
-      else { outerE += e; outerN++; }
-    }
-  }
-  const centerDensity = centerN ? centerE / centerN : 0;
-  const outerDensity  = outerN  ? outerE  / outerN  : 0;
-  const centerFocus = outerDensity > 0 ? centerDensity / outerDensity : 1;
-
-  const colorfulnessNorm = Math.max(0, Math.min(100, colorfulness * 1.2));
-  const warmthNorm       = Math.max(0, Math.min(100, ((warmth + 60) / 120) * 100));
-  const centerFocusNorm  = Math.max(0, Math.min(100, (centerFocus / 2) * 100));
-
-  const appeal = colorfulnessNorm * 0.4 + warmthNorm * 0.3 + centerFocusNorm * 0.3;
-  return { colorfulness, warmth, centerFocus, appeal };
-}
+// computeAppealMetrics() — the content-appeal heuristic (colorfulness / warmth /
+// centerFocus → 0-100 appeal blend) is shared via config.js (single source of
+// truth). See that file for the rationale behind each metric.
 
 // ── Perceptual hash (8×8 average-hash over a square luminance grid) ──────────
 // Catches the same photo republished at a different size/compression (venue
@@ -2827,14 +2750,8 @@ async function autoPostRoundupNow(postIndex) {
 // UUID. Disabled unless the user enables "Diagnostics & Sharing" in Settings
 // AND CONFIG.TELEMETRY_ENDPOINT is configured. Best-effort — never blocks or
 // throws on failure.
-async function getInstallId() {
-  const { installId } = await chrome.storage.local.get({ installId: null });
-  if (installId) return installId;
-  const id = crypto.randomUUID();
-  await chrome.storage.local.set({ installId: id });
-  return id;
-}
-
+// getInstallId() is shared via config.js (single source of truth). sendTelemetry
+// stays here (and in popup.js) because it reads CONFIG lexically — see config.js.
 async function sendTelemetry(kind, payload) {
   const endpoint = (typeof CONFIG !== 'undefined' && CONFIG.TELEMETRY_ENDPOINT) || '';
   if (!endpoint) return;

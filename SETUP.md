@@ -133,7 +133,7 @@ FoodFluencer-Bot/
 │   └── setup/           # Jest environment mocks (Chrome API, WebCodecs)
 ├── jest.config.js       # Jest configuration
 ├── package.json         # npm scripts and dev dependencies
-├── .env.example         # API key template
+├── legacy/              # Deprecated Flask prototype (reference only — see legacy/README.md)
 └── SETUP.md             # This file
 ```
 
@@ -146,5 +146,5 @@ FoodFluencer-Bot/
 | `npm: command not found` | Install Node.js from [nodejs.org](https://nodejs.org), then reopen your terminal |
 | `npm install` fails | Delete `node_modules/` and `package-lock.json`, then re-run `npm install` |
 | Extension not updating | Click the refresh icon on `chrome://extensions` |
-| API key errors | Confirm `Places API (New)` is enabled in Google Cloud Console and the key is in `.env` |
+| API key errors | Confirm `Places API (New)` is enabled in Google Cloud Console and the key is saved in the extension's Settings panel (gear icon) |
 | Tests blocked by hook | Run `npm test` locally, fix all failures, then retry the merge/PR |

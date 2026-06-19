@@ -380,12 +380,14 @@ function renderTechLog() {
     container.innerHTML = filtered.map(e => {
       const time = (e.ts || '').slice(11, 19);
       const lvlCls = e.level === 'warn' ? 'stl-lvl-warn' : e.level === 'error' ? 'stl-lvl-error' : 'stl-lvl-info';
-      const msg = e.action + (e.name ? ` · ${e.name}` : '') + (e.error ? ` · ${e.error}` : '');
+      // `e.name` / `e.error` can carry externally-sourced text (scraped business
+      // names, raw page snippets), so escape before inserting into innerHTML.
+      const msg = escapeHtml(e.action + (e.name ? ` · ${e.name}` : '') + (e.error ? ` · ${e.error}` : ''));
       return `<div class="stl-row">
-        <span class="stl-ts">${time}</span>
-        <span class="stl-lvl ${lvlCls}">${e.level || 'info'}</span>
-        <span class="stl-cat">${e.category || ''}</span>
-        <span class="stl-msg" title="${msg.replace(/"/g,'&quot;')}">${msg}</span>
+        <span class="stl-ts">${escapeHtml(time)}</span>
+        <span class="stl-lvl ${lvlCls}">${escapeHtml(e.level || 'info')}</span>
+        <span class="stl-cat">${escapeHtml(e.category || '')}</span>
+        <span class="stl-msg" title="${msg}">${msg}</span>
       </div>`;
     }).join('') || '';
   });
@@ -761,14 +763,8 @@ const WARN_HARD        = 20;
 // Sends technical-log batches to the developer-run Cloudflare Worker, tagged
 // with an anonymous per-install UUID, only when the user has enabled
 // "Diagnostics & Sharing" in Settings and CONFIG.TELEMETRY_ENDPOINT is set.
-async function getInstallId() {
-  const { installId } = await chrome.storage.local.get({ installId: null });
-  if (installId) return installId;
-  const id = crypto.randomUUID();
-  await chrome.storage.local.set({ installId: id });
-  return id;
-}
-
+// getInstallId() is shared via config.js (single source of truth). sendTelemetry
+// stays here (and in background.js) because it reads CONFIG lexically — see config.js.
 async function sendTelemetry(kind, payload) {
   const endpoint = (typeof CONFIG !== 'undefined' && CONFIG.TELEMETRY_ENDPOINT) || '';
   if (!endpoint) return;
@@ -942,50 +938,8 @@ const IG_MAX_RATIO    = 1.91; // Instagram maximum aspect ratio (~landscape)
 const QUALITY_SCAN_DIM = 2048;
 
 // ── Content appeal heuristics ─────────────────────────────────────────────────
-// Mirrors computeAppealMetrics() in background.js — see that file for the
-// rationale behind each metric. Kept as a duplicate here since popup.js and
-// the service worker run in separate execution contexts with no shared module.
-function computeAppealMetrics(data, gray, W, H) {
-  const total = W * H;
-
-  let rgSum = 0, ybSum = 0, rgSumSq = 0, ybSumSq = 0, rbSum = 0;
-  for (let i = 0; i < total; i++) {
-    const r = data[i * 4], g = data[i * 4 + 1], b = data[i * 4 + 2];
-    const rg = r - g;
-    const yb = 0.5 * (r + g) - b;
-    rgSum += rg; ybSum += yb;
-    rgSumSq += rg * rg; ybSumSq += yb * yb;
-    rbSum += (r - b);
-  }
-  const rgMean = rgSum / total, ybMean = ybSum / total;
-  const rgStd = Math.sqrt(Math.max(0, rgSumSq / total - rgMean * rgMean));
-  const ybStd = Math.sqrt(Math.max(0, ybSumSq / total - ybMean * ybMean));
-  const colorfulness = Math.sqrt(rgStd * rgStd + ybStd * ybStd) + 0.3 * Math.sqrt(rgMean * rgMean + ybMean * ybMean);
-  const warmth = rbSum / total;
-
-  const x0 = Math.floor(W * 0.25), x1 = Math.floor(W * 0.75);
-  const y0 = Math.floor(H * 0.25), y1 = Math.floor(H * 0.75);
-  let centerE = 0, centerN = 0, outerE = 0, outerN = 0;
-  for (let y = 1; y < H - 1; y++) {
-    for (let x = 1; x < W - 1; x++) {
-      const idx = y * W + x;
-      const lap = gray[idx - W] + gray[idx + W] + gray[idx - 1] + gray[idx + 1] - 4 * gray[idx];
-      const e = lap * lap;
-      if (x >= x0 && x < x1 && y >= y0 && y < y1) { centerE += e; centerN++; }
-      else { outerE += e; outerN++; }
-    }
-  }
-  const centerDensity = centerN ? centerE / centerN : 0;
-  const outerDensity  = outerN  ? outerE  / outerN  : 0;
-  const centerFocus = outerDensity > 0 ? centerDensity / outerDensity : 1;
-
-  const colorfulnessNorm = Math.max(0, Math.min(100, colorfulness * 1.2));
-  const warmthNorm       = Math.max(0, Math.min(100, ((warmth + 60) / 120) * 100));
-  const centerFocusNorm  = Math.max(0, Math.min(100, (centerFocus / 2) * 100));
-
-  const appeal = colorfulnessNorm * 0.4 + warmthNorm * 0.3 + centerFocusNorm * 0.3;
-  return { colorfulness, warmth, centerFocus, appeal };
-}
+// computeAppealMetrics() is shared via config.js (single source of truth) — see
+// that file for the rationale behind each metric.
 
 // Returns { score, blurScore, meetsResolution, width, height }
 // score         — combined quality signal (higher = better)
@@ -2021,9 +1975,11 @@ function renderSearchResultsDropdown(places) {
 
     const div = document.createElement("div");
     div.className = "search-result-item";
+    // name / formattedAddress come from third-party place APIs (Google, Foursquare,
+    // OSM) — escape before inserting into innerHTML. `meta` is built from numbers.
     div.innerHTML = `
-      <div class="search-result-name">${name}</div>
-      <div class="search-result-address">${place.formattedAddress || ""}</div>
+      <div class="search-result-name">${escapeHtml(name)}</div>
+      <div class="search-result-address">${escapeHtml(place.formattedAddress || "")}</div>
       ${meta ? `<div class="search-result-meta">${meta}</div>` : ""}`;
     div.addEventListener("click", async () => {
       $("query").value = name;
@@ -2430,185 +2386,6 @@ async function exportPhotos() {
   $("exportBtn").disabled = false;
 }
 
-// ── TikTok MP4 builder (runs in popup context — has WebCodecs + full Web APIs) ─
-
-async function createTikTokMP4(photoDataUrls, onProgress) {
-  const W = 720, H = 1280; // 9:16 portrait
-  const FPS = 25, BITRATE = 2_000_000, SEC_PER_SLIDE = 1.2;
-
-  // Load images
-  const images = [];
-  for (const src of photoDataUrls) {
-    const img = new Image();
-    await new Promise((res, rej) => { img.onload = res; img.onerror = () => res(); img.src = src; });
-    if (img.naturalWidth > 0) images.push(img);
-  }
-  if (!images.length) throw new Error('No images loaded');
-
-  const canvas = document.createElement('canvas');
-  canvas.width = W; canvas.height = H;
-  const ctx = canvas.getContext('2d');
-
-  function drawSlide(img) {
-    ctx.fillStyle = '#000'; ctx.fillRect(0, 0, W, H);
-    const s = Math.min(W / img.naturalWidth, H / img.naturalHeight);
-    ctx.drawImage(img, (W - img.naturalWidth * s) / 2, (H - img.naturalHeight * s) / 2, img.naturalWidth * s, img.naturalHeight * s);
-  }
-
-  // ── WebCodecs path ────────────────────────────────────────────────────────
-  if (window.VideoEncoder) {
-    // Try codecs from most to least capable, picking the first supported one
-    const CODECS = [
-      'avc1.4d0028', // H.264 Main Level 4.0
-      'avc1.42001f', // H.264 Baseline Level 3.1
-      'avc1.42001e', // H.264 Baseline Level 3.0
-      'avc1.420014', // H.264 Baseline Level 2.0
-    ];
-
-    let chosenCodec = null;
-    for (const codec of CODECS) {
-      try {
-        const support = await VideoEncoder.isConfigSupported({
-          codec, width: W, height: H, bitrate: BITRATE, framerate: FPS,
-        });
-        if (support.supported) { chosenCodec = codec; break; }
-      } catch (_) {}
-    }
-
-    if (!chosenCodec) {
-      AppLog.warn('No H.264 codec supported by WebCodecs — falling back to WebM');
-    } else {
-      AppLog.info(`WebCodecs encoding with ${chosenCodec}`);
-      const TIMESCALE = 90000;
-      const SAMPLE_DUR = Math.round(TIMESCALE / FPS);
-      const framesPerSlide = Math.ceil(SEC_PER_SLIDE * FPS);
-      const totalFrames = images.length * framesPerSlide;
-
-      const chunks = []; let decoderConfig = null; let encodeError = null;
-      const encoder = new VideoEncoder({
-        output: (chunk, meta) => {
-          if (meta?.decoderConfig) decoderConfig = meta.decoderConfig;
-          const buf = new ArrayBuffer(chunk.byteLength);
-          chunk.copyTo(buf);
-          chunks.push({ data: new Uint8Array(buf), isKey: chunk.type === 'key' });
-        },
-        error: e => { encodeError = e; },
-      });
-
-      encoder.configure({ codec: chosenCodec, width: W, height: H, bitrate: BITRATE, framerate: FPS, avc: { format: 'avc' } });
-
-      let fi = 0;
-      for (let i = 0; i < images.length; i++) {
-        drawSlide(images[i]);
-        for (let f = 0; f < framesPerSlide; f++) {
-          if (encodeError) throw new Error(`Encoder error: ${encodeError.message}`);
-          const ts = Math.round(fi * 1_000_000 / FPS);
-          const frame = new VideoFrame(canvas, { timestamp: ts, duration: Math.round(1_000_000 / FPS) });
-          encoder.encode(frame, { keyFrame: fi === 0 || f === 0 });
-          frame.close(); fi++;
-        }
-        if (onProgress) onProgress(i + 1, images.length);
-        await new Promise(r => setTimeout(r, 0)); // yield
-      }
-      await encoder.flush();
-      encoder.close();
-      if (encodeError) throw new Error(`Encoder error: ${encodeError.message}`);
-      AppLog.info(`WebCodecs encoded ${chunks.length} chunks, ${(chunks.reduce((a,c)=>a+c.data.length,0)/1024).toFixed(0)}KB`);
-      return buildMP4Blob(chunks, decoderConfig, W, H, FPS, TIMESCALE, SAMPLE_DUR, totalFrames);
-    }
-  } else {
-    AppLog.warn('VideoEncoder (WebCodecs) not available — using MediaRecorder fallback');
-  }
-
-  // ── MediaRecorder fallback ────────────────────────────────────────────────
-  // Note: produces WebM, not MP4 — TikTok might still reject it.
-  // If WebCodecs was unavailable on this browser, WebM is the only option.
-  const mimeType = ['video/webm;codecs=vp9', 'video/webm;codecs=vp8', 'video/webm']
-    .find(t => MediaRecorder.isTypeSupported(t)) || 'video/webm';
-  AppLog.info(`MediaRecorder fallback using ${mimeType}`);
-  const stream = canvas.captureStream(FPS);
-  const rec = new MediaRecorder(stream, { mimeType, videoBitsPerSecond: BITRATE });
-  const ch = [];
-  rec.ondataavailable = e => { if (e.data.size > 0) ch.push(e.data); };
-  rec.start(100);
-  for (let i = 0; i < images.length; i++) {
-    drawSlide(images[i]);
-    if (onProgress) onProgress(i + 1, images.length);
-    await new Promise(r => setTimeout(r, SEC_PER_SLIDE * 1000));
-  }
-  rec.stop();
-  return new Promise(res => { rec.onstop = () => res(new Blob(ch, { type: mimeType })); });
-}
-
-function buildMP4Blob(chunks, dcfg, W, H, fps, ts, sampleDur, totalFrames) {
-  const u8  = v => [v & 0xFF];
-  const u16 = v => [(v >> 8) & 0xFF, v & 0xFF];
-  const u32 = v => [(v >>> 24) & 0xFF, (v >>> 16) & 0xFF, (v >>> 8) & 0xFF, v & 0xFF];
-  const s4  = s => [...new TextEncoder().encode(s).slice(0, 4)];
-  const z   = n => Array(n).fill(0);
-  function box(t, ...c) { const d = c.flat(Infinity); return [...u32(8 + d.length), ...s4(t.padEnd(4,' ')), ...d]; }
-  function fb(t, v, f, ...c) { return box(t, u8(v), [(f>>16)&0xFF,(f>>8)&0xFF,f&0xFF], ...c); }
-
-  // SPS/PPS from encoder's decoderConfig
-  let sps = new Uint8Array([0x67,0x4d,0x00,0x28,0xda,0x01,0xe0,0x08,0x9f,0x96,0x60,0x00,0x00,0x03,0x00,0x40,0x00,0x00,0x0c,0x83,0xc5,0x0a,0x44,0x80]);
-  let pps = new Uint8Array([0x68,0xee,0x31,0xb2,0x8b]);
-  if (dcfg?.description) {
-    const d = new Uint8Array(dcfg.description); let i = 5;
-    const ns = d[i++] & 0x1F;
-    for (let j=0;j<ns;j++) { const l=(d[i]<<8)|d[i+1];i+=2; sps=d.slice(i,i+l);i+=l; }
-    const np = d[i++];
-    for (let j=0;j<np;j++) { const l=(d[i]<<8)|d[i+1];i+=2; pps=d.slice(i,i+l);i+=l; }
-  }
-
-  const avcC = box('avcC', u8(1),[sps[1],sps[2],sps[3]],[0xFF],[0xE1],u16(sps.length),[...sps],u8(1),u16(pps.length),[...pps]);
-  const avc1 = box('avc1', z(6),u16(1),z(16),u16(W),u16(H),[0,72,0,0,0,72,0,0],u32(0),u16(1),z(32),u16(0x18),u16(0xFFFF),avcC);
-
-  const dur  = totalFrames * sampleDur;
-  const mat  = [0x00,0x01,0x00,0x00,0,0,0,0,0,0,0,0, 0,0,0,0,0x00,0x01,0x00,0x00,0,0,0,0,0,0,0,0, 0,0,0,0,0x40,0x00,0x00,0x00];
-
-  const stsd = fb('stsd',0,0, u32(1), avc1);
-  const stts = fb('stts',0,0, u32(1),u32(chunks.length),u32(sampleDur));
-  const keys = chunks.map((c,i)=>c.isKey?i+1:null).filter(Boolean);
-  const stss = fb('stss',0,0, u32(keys.length),...keys.flatMap(i=>u32(i)));
-  const stsz = fb('stsz',0,0, u32(0),u32(chunks.length),...chunks.flatMap(c=>u32(c.data.length)));
-  const stsc = fb('stsc',0,0, u32(1),u32(1),u32(1),u32(1));
-  const stco_ph = fb('stco',0,0, u32(chunks.length),...chunks.flatMap(()=>u32(0)));
-  const stbl_ph = box('stbl',stsd,stts,stss,stsc,stsz,stco_ph);
-  const vmhd = fb('vmhd',0,1, u16(0),z(6));
-  const dinf = box('dinf',fb('dref',0,0,u32(1),fb('url ',0,1)));
-  const minf_ph = box('minf',vmhd,dinf,stbl_ph);
-  const mdhd = fb('mdhd',0,0, u32(0),u32(0),u32(ts),u32(dur),u16(0x55C4),u16(0));
-  const hdlr = fb('hdlr',0,0, u32(0),s4('vide'),z(12),[...s4('Vide'),0]);
-  const mdia_ph = box('mdia',mdhd,hdlr,minf_ph);
-  const tkhd = fb('tkhd',0,3, u32(0),u32(0),u32(1),u32(0),u32(dur),z(8),u16(0),u16(0),u16(0),u16(0),mat,u32(W<<16),u32(H<<16));
-  const trak_ph = box('trak',tkhd,mdia_ph);
-  const mvhd = fb('mvhd',0,0, u32(0),u32(0),u32(ts),u32(dur),u32(0x10000),u16(0x100),z(10),mat,z(24),u32(2));
-  const moov_ph = box('moov',mvhd,trak_ph);
-  const ftyp = box('ftyp',s4('isom'),u32(0x200),s4('isom'),s4('iso2'),s4('avc1'),s4('mp41'));
-
-  // Compute real chunk offsets (moov first → fast-start)
-  const mdatStart = ftyp.length + moov_ph.length + 8;
-  let off = mdatStart;
-  const realOff = chunks.map(c => { const o=off; off+=c.data.length; return o; });
-
-  const stco_r  = fb('stco',0,0, u32(chunks.length),...realOff.flatMap(o=>u32(o)));
-  const stbl_r  = box('stbl',stsd,stts,stss,stsc,stsz,stco_r);
-  const minf_r  = box('minf',vmhd,dinf,stbl_r);
-  const mdia_r  = box('mdia',mdhd,hdlr,minf_r);
-  const trak_r  = box('trak',tkhd,mdia_r);
-  const moov_r  = box('moov',mvhd,trak_r);
-
-  const mdatSize = chunks.reduce((a,c)=>a+c.data.length,0);
-  const mdatHdr  = new Uint8Array([...u32(mdatSize+8),...s4('mdat')]);
-  const total    = ftyp.length + moov_r.length + mdatHdr.length + mdatSize;
-  const out      = new Uint8Array(total);
-  let p = 0;
-  for (const part of [new Uint8Array(ftyp), new Uint8Array(moov_r), mdatHdr, ...chunks.map(c=>c.data)]) {
-    out.set(part, p); p += part.length;
-  }
-  return new Blob([out], { type: 'video/mp4' });
-}
-
 // ── Auto Bot: language caption templates ─────────────────────────────────────
 
 const CAPTION_LANG = {
@@ -2666,8 +2443,8 @@ const CAPTION_LANG = {
   },
 };
 
-// iTunes country codes for Top 100 RSS feed
-const ITUNES_CC = { BE: "be", FR: "fr", DE: "de", LU: "be", NL: "nl" };
+// iTunes country codes for Top 100 RSS feed — shared via config.js.
+const ITUNES_CC = SHARED_ITUNES_CC;
 
 // Fetch a song based on the selected genre and country
 async function getAutoSong(genre, country) {
@@ -2759,10 +2536,7 @@ const OSM_COUNTRY_CODES = {
 // return the same top-20 nationally popular places from the Places API).
 const AB_CITY_POOL = SHARED_CITY_POOL;
 
-function pickRandomCity(cc) {
-  const pool = AB_CITY_POOL[cc] || AB_CITY_POOL.BE;
-  return pool[Math.floor(Math.random() * pool.length)];
-}
+// pickRandomCity() is shared via config.js (reads SHARED_CITY_POOL directly).
 
 // Bounding boxes used as locationRestriction for each country
 const AB_COUNTRY_BOUNDS = {
@@ -3012,17 +2786,7 @@ async function searchAutoPlaceOSM(type, country, region, minRatings = 0, minStar
 }
 
 // Builds a best-effort address string from OSM `addr:*` tags.
-function formatOSMAddress(tags = {}, fallbackCity, countryName) {
-  const parts = [];
-  if (tags["addr:street"]) {
-    parts.push(tags["addr:housenumber"] ? `${tags["addr:street"]} ${tags["addr:housenumber"]}` : tags["addr:street"]);
-  }
-  const city = tags["addr:city"] || fallbackCity;
-  const cityLine = `${tags["addr:postcode"] || ""} ${city || ""}`.trim();
-  if (cityLine) parts.push(cityLine);
-  parts.push(countryName);
-  return parts.filter(Boolean).join(", ");
-}
+// formatOSMAddress() is shared via config.js (single source of truth).
 
 // ── Auto Bot caption generator ────────────────────────────────────────────────
 // Builds a multilingual caption. Catchy opener + Name + Address use the selected
@@ -3869,10 +3633,7 @@ function updateBotUI(active) {
 // ── Chrome Alarms ─────────────────────────────────────────────────────────────
 // Clear only alarms belonging to one campaign (by name prefix) so activating or
 // deactivating one campaign (spotlight vs. roundup) never clobbers the other's.
-async function clearAlarmsByPrefix(prefix) {
-  const all = await chrome.alarms.getAll();
-  await Promise.all(all.filter(a => a.name.startsWith(prefix)).map(a => chrome.alarms.clear(a.name)));
-}
+// clearAlarmsByPrefix() is shared via config.js (single source of truth).
 
 function setupScheduleAlarms(schedule) {
   clearAlarmsByPrefix("ffbot-auto-").then(() => {
