@@ -19,15 +19,23 @@ fetch('version.json').then(r => r.json()).then(v => {
 // SETTINGS PANEL
 // ════════════════════════════════════════════════════════════════════════════
 
+// Resolve a shared photo-source definition to its current on/off state + note,
+// given which API keys are present. Keyless sources are always on; keyed ones
+// switch on when their key is configured.
+function photoSourceState(src, hasKey, hasFsqKey) {
+  if (src.requiresKey === 'foursquare') return { on: hasFsqKey, note: hasFsqKey ? '' : ' — add Foursquare key to enable' };
+  if (src.requiresKey === 'google')     return { on: hasKey,    note: hasKey    ? '' : ' — add Google key to enable' };
+  return { on: true, note: '' };
+}
+
 function buildFeatureStatus(hasKey, hasFsqKey = false) {
   return [
-    // Photo sources
-    { label: 'Photo source 1 — Google Maps scraping',     on: true },
-    { label: 'Photo source 2 — DuckDuckGo image search',  on: true },
-    { label: 'Photo source 3 — Yelp scraping',            on: true },
-    { label: 'Photo source 4 — TripAdvisor scraping',     on: true },
-    { label: 'Photo source 5 — Foursquare API',           on: hasFsqKey, note: hasFsqKey ? '' : ' — add Foursquare key to enable' },
-    { label: 'Photo source 6 — Google Places API',        on: hasKey,    note: hasKey    ? '' : ' — add Google key to enable' },
+    // Photo sources — derived from the shared list so this never drifts from
+    // the onboarding list or the waterfall (config.js SHARED_PHOTO_SOURCES).
+    ...SHARED_PHOTO_SOURCES_ACTIVE.map((src, i) => {
+      const { on, note } = photoSourceState(src, hasKey, hasFsqKey);
+      return { label: `Photo source ${i + 1} — ${src.name}`, on, note };
+    }),
     // Posting
     { label: 'Manual business search',        on: true, note: (hasKey || hasFsqKey) ? '' : ' — using free OpenStreetMap fallback (add a key for better results)' },
     { label: 'Random/automatic business discovery', on: true, note: (hasKey || hasFsqKey) ? '' : ' — using free OpenStreetMap fallback (no rating filters)' },
@@ -46,7 +54,7 @@ function renderFeatureStatus(containerId, hasKey, hasFsqKey = false) {
   el.innerHTML = buildFeatureStatus(hasKey, hasFsqKey).map(f => `
     <div class="settings-feature ${f.on ? '' : 'disabled'}">
       <span class="feat-icon">${f.on ? '✅' : '⚠️'}</span>
-      <span>${f.label}${f.note ? `<em style="font-size:.68rem;color:var(--muted)">${f.note}</em>` : ''}</span>
+      <span>${f.label}${f.note ? `<em class="feat-note">${f.note}</em>` : ''}</span>
     </div>`).join('');
 }
 
@@ -638,11 +646,33 @@ document.getElementById('runDiagnosticBtn')?.addEventListener('click', () => {
 // ONBOARDING
 // ════════════════════════════════════════════════════════════════════════════
 
+// Render the "how photos work" list from the shared source list (config.js) so
+// the onboarding, the Settings feature status, and the waterfall can't drift.
+function renderObSources() {
+  const grid = document.getElementById('obSources');
+  if (!grid || typeof SHARED_PHOTO_SOURCES_ACTIVE === 'undefined') return;
+  const esc = s => String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+  const count = document.getElementById('obSourceCount');
+  if (count) count.textContent = String(SHARED_PHOTO_SOURCES_ACTIVE.length);
+  grid.innerHTML = SHARED_PHOTO_SOURCES_ACTIVE.map((s, i) => {
+    const isKey = s.badge === 'key';
+    return `
+      <div class="ob-source${isKey ? ' ob-source--api' : ''}">
+        <span class="ob-source-num ${isKey ? 'api' : 'free'}">${i + 1}</span>
+        <div class="ob-source-info">
+          <strong>${esc(s.name)}</strong>
+          <span>${esc(s.blurb)}</span>
+        </div>
+        <span class="ob-badge ob-badge--${isKey ? 'key' : 'free'}">${isKey ? 'API key' : 'Free'}</span>
+      </div>`;
+  }).join('');
+}
+
 function showOnboarding() {
   const ob = document.getElementById('onboarding');
   if (!ob) return;
-  // Reset to step 1
-  goObStep(1);
+  renderObSources();
+  goObStep(1); // reset to step 1
   ob.classList.remove('hidden');
 }
 
@@ -651,10 +681,14 @@ function hideOnboarding() {
   chrome.storage.local.set({ hasSeenOnboarding: true });
 }
 
+// Show step `n` (1-based) and sync the progress dots — derived from the DOM so
+// adding/removing an .ob-step needs no code change here.
 function goObStep(n) {
-  [1,2,3,4].forEach(i => {
-    document.getElementById(`ob-step-${i}`)?.classList.toggle('hidden', i !== n);
-    document.querySelector(`.ob-dot[data-step="${i}"]`)?.classList.toggle('active', i === n);
+  document.querySelectorAll('#onboarding .ob-step').forEach((el, i) => {
+    el.classList.toggle('hidden', (i + 1) !== n);
+  });
+  document.querySelectorAll('.ob-dot').forEach(dot => {
+    dot.classList.toggle('active', parseInt(dot.dataset.step, 10) === n);
   });
 }
 
@@ -672,30 +706,29 @@ document.getElementById('obKeyContinue')?.addEventListener('click', () => {
   showObComplete(!!API_KEY);
 });
 
-// Save Google API key in onboarding
-document.getElementById('obSaveKey')?.addEventListener('click', () => {
-  const input  = document.getElementById('obApiKeyInput');
-  const status = document.getElementById('obKeyStatus');
-  const val = (input?.value || '').trim();
-  if (!val) { if (status) { status.className='ob-key-status err'; status.textContent='Please enter an API key.'; } return; }
-  if (status) { status.className='ob-key-status'; status.textContent='Saving…'; }
-  chrome.storage.local.set({ googleApiKey: val }, () => {
-    API_KEY = val;
-    if (status) { status.className='ob-key-status ok'; status.textContent='✓ Google key saved!'; }
+// Wire an onboarding "Save API key" button: validate the input, persist it, and
+// reflect the result in the adjacent status line. Shared by the Google and
+// Foursquare key fields (identical flow, different storage key + label).
+function wireObKeySave({ btnId, inputId, statusId, storageKey, label, onSaved }) {
+  const setStatus = (cls, text) => {
+    const status = document.getElementById(statusId);
+    if (status) { status.className = `ob-key-status ${cls}`.trim(); status.textContent = text; }
+  };
+  document.getElementById(btnId)?.addEventListener('click', () => {
+    const val = (document.getElementById(inputId)?.value || '').trim();
+    if (!val) { setStatus('err', 'Please enter an API key.'); return; }
+    setStatus('', 'Saving…');
+    chrome.storage.local.set({ [storageKey]: val }, () => {
+      onSaved?.(val);
+      setStatus('ok', `✓ ${label} key saved!`);
+    });
   });
-});
+}
 
-// Save Foursquare API key in onboarding
-document.getElementById('obSaveFsqKey')?.addEventListener('click', () => {
-  const input  = document.getElementById('obFsqKeyInput');
-  const status = document.getElementById('obFsqKeyStatus');
-  const val = (input?.value || '').trim();
-  if (!val) { if (status) { status.className='ob-key-status err'; status.textContent='Please enter an API key.'; } return; }
-  if (status) { status.className='ob-key-status'; status.textContent='Saving…'; }
-  chrome.storage.local.set({ foursquareApiKey: val }, () => {
-    if (status) { status.className='ob-key-status ok'; status.textContent='✓ Foursquare key saved!'; }
-  });
-});
+wireObKeySave({ btnId: 'obSaveKey',    inputId: 'obApiKeyInput', statusId: 'obKeyStatus',
+                storageKey: 'googleApiKey',     label: 'Google',     onSaved: val => { API_KEY = val; } });
+wireObKeySave({ btnId: 'obSaveFsqKey', inputId: 'obFsqKeyInput',  statusId: 'obFsqKeyStatus',
+                storageKey: 'foursquareApiKey', label: 'Foursquare' });
 
 function showObComplete(hasKey) {
   const el = document.getElementById('obFeatureStatus');
@@ -704,7 +737,7 @@ function showObComplete(hasKey) {
     const features = buildFeatureStatus(hasKey, !!foursquareApiKey);
     el.innerHTML = features.map(f => `
       <div class="ob-feat ${f.on ? 'enabled' : 'disabled'}">
-        ${f.on ? '✅' : '⚠️'} ${f.label}${f.note ? ` <em style="font-size:.67rem">${f.note}</em>` : ''}
+        ${f.on ? '✅' : '⚠️'} ${f.label}${f.note ? ` <em class="feat-note">${f.note}</em>` : ''}
       </div>`).join('');
   });
 }
@@ -5594,6 +5627,9 @@ checkUsageWarning();
 // ── Test hooks (no-op in the extension; used by the Jest suite) ──────────────
 if (typeof module !== 'undefined' && module.exports) {
   module.exports = {
+    buildFeatureStatus,
+    renderObSources,
+    showOnboarding,
     doSearch,
     searchRestaurantMulti,
     searchAutoPlace,

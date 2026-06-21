@@ -51,7 +51,9 @@ const PLATFORM_SWITCH_DELAY_MS = 4000;
 // tech_log: yelp_scrape_error on every run, in both search and photo waterfalls.
 // It never contributes a result and only adds latency + log noise, so it's
 // disabled at the waterfall level. Flip to true to re-enable if Yelp reopens.
-const YELP_ENABLED = false;
+// Derived from the shared source list (config.js) so the waterfall and the
+// user-facing source lists never disagree about whether Yelp runs.
+const YELP_ENABLED = (SHARED_PHOTO_SOURCES.find(s => s.id === 'yelp') || {}).enabled === true;
 
 // ── Post-failure failsafe ────────────────────────────────────────────────────
 // Classifies a failed post by inspecting the error message and a snippet of
@@ -1148,12 +1150,16 @@ async function scoreImageQuality(dataUrl) {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
-// Photo Waterfall — 4 sources tried in order, each with quality threshold
+// Photo Waterfall — sources tried in order, each with a quality threshold
 //
-//  1. Google Maps embedded JSON   (venue-specific, highest quality)
-//  2. DuckDuckGo image search     (broadest coverage, no slug needed)
-//  3. Yelp photo pages            (categorised food/interior photos)
-//  4. Google Places API           (existing fallback — uses API quota)
+//  1.   Google Maps embedded JSON  (venue-specific, highest quality)
+//  1.5  Venue-owned                (homepage scrape + OSM tags + Facebook page)
+//  2.   DuckDuckGo image search    (broadest coverage, no slug needed)
+//  2.5  Wikimedia Commons          (openly-licensed geotagged photos, keyless)
+//  3.   Yelp photo pages           (categorised food/interior photos)
+//  3.5  TripAdvisor photo pages
+//  3.8  Foursquare API             (quota-tracked, key required)
+//  4.   Google Places API          (existing fallback — uses API quota)
 //
 // Each scraped photo is tagged with its source for TechLog tracing.
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -1162,14 +1168,37 @@ const SCRAPE_UA  = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36
 const CITY_FROM_ADDRESS_RE_BG = SHARED_CITY_FROM_ADDRESS_RE; // shared via config.js
 const SCRAPE_MIN = 3;   // minimum usable photos before accepting a source
 
-function raceTimeout(promise, ms) {
-  return Promise.race([promise, new Promise(res => setTimeout(() => res([]), ms))]);
+function raceTimeout(promise, ms, fallback = []) {
+  return Promise.race([promise, new Promise(res => setTimeout(() => res(fallback), ms))]);
+}
+
+// Heuristic: pull the venue's own website out of an already-fetched HTML blob
+// (e.g. the Google Maps search page). There is no stable labelled field, so we
+// tally every external URL, drop Google/CDN/social/aggregator hosts, and return
+// the most frequently linked remaining domain's root. Best-effort by design —
+// a wrong guess simply yields no usable images when the site is scraped, and
+// the venue-owned source falls back to OSM / DDG discovery.
+const WEBSITE_EXCLUDE_RE = /(?:^|\.)(?:google|gstatic|ggpht|googleusercontent|googleapis|goo\.gl|schema|w3|youtube|youtu\.be|ytimg|facebook|fbcdn|instagram|cdninstagram|twitter|x|t\.co|tiktok|pinterest|linkedin|tripadvisor|yelp|booking|ubereats|deliveroo|just-?eat|takeaway|thefork|opentable|resengo|zomato|wikipedia|wikimedia|gravatar|gstatic)\b/i;
+
+function extractWebsiteFromHtml(html) {
+  const counts = new Map();
+  for (const m of html.matchAll(/https?:\/\/([a-z0-9.-]+\.[a-z]{2,})(?:[/?#][^\s"'\\<>]*)?/gi)) {
+    const host = m[1].toLowerCase().replace(/^www\./, '');
+    if (host.length < 4 || WEBSITE_EXCLUDE_RE.test(host)) continue;
+    counts.set(host, (counts.get(host) || 0) + 1);
+  }
+  let best = null, bestN = 0;
+  for (const [host, n] of counts) if (n > bestN) { best = host; bestN = n; }
+  return best ? `https://${best}/` : null;
 }
 
 // ── Source 1: Google Maps embedded JSON ──────────────────────────────────────
 // Fetches the Maps search page and extracts lh3.googleusercontent.com photo
 // URLs from the server-rendered JSON blobs. Photos are ordered by engagement
 // (views / quality score) in the embedded data.
+// Returns { photos, website }: `website` is a best-effort guess at the venue's
+// own domain harvested from the same HTML, reused by the venue-owned source for
+// a direct homepage scrape (no extra request).
 async function scrapeGoogleMapsPhotos(businessName, city) {
   const query = `${businessName} ${city}`;
   bgLog('info', 'PhotoScrape[GoogleMaps] start', { query });
@@ -1203,13 +1232,14 @@ async function scrapeGoogleMapsPhotos(businessName, city) {
       urls.add(`https://lh3.ggpht.com/gps-cs-s/${m[1]}=s2048`);
 
     const result = [...urls].slice(0, 12);
-    bgLog('info', `PhotoScrape[GoogleMaps] found ${result.length} URLs`);
-    TechLog.info('PHOTO', 'google_maps_scrape', { business: businessName, city, count: result.length });
-    return result;
+    const website = extractWebsiteFromHtml(html);
+    bgLog('info', `PhotoScrape[GoogleMaps] found ${result.length} URLs${website ? `, website ${website}` : ''}`);
+    TechLog.info('PHOTO', 'google_maps_scrape', { business: businessName, city, count: result.length, website: website || null });
+    return { photos: result, website };
   } catch(e) {
     bgLog('warn', `PhotoScrape[GoogleMaps] failed: ${e.message}`);
     TechLog.warn('PHOTO', 'google_maps_scrape_error', { error: e.message });
-    return [];
+    return { photos: [], website: null };
   }
 }
 
@@ -1311,15 +1341,38 @@ async function scrapeDDGPhotos(businessName, city, entityType) {
 
 // Fetches a representative cover photo of the round-up's LOCATION (e.g. a nice
 // shot of Brussels for "Top 5 restaurants in Brussels"), used as the first slide
-// behind the "Top N…" header. Keyless — reuses the already-permitted DuckDuckGo
-// image search + proxy. Prefers landscape, decent-resolution, non-stock shots.
-// Returns a downscaled data URL, or null so the caller can fall back to the
-// first entity's photo.
+// behind the "Top N…" header. Keyless. Prefers an openly-licensed Wikimedia
+// Commons photo (clean rights for a published cover), falling back to a
+// DuckDuckGo image search. Prefers landscape, decent-resolution, non-stock
+// shots. Returns { dataUrl, attribution } (attribution non-null only for the
+// Commons path), or null so the caller can fall back to the first entity's
+// photo.
 async function fetchRegionCoverPhoto(location, country) {
   const place = (location || "").trim();
   if (!place) return null;
-  const query = `${place} ${country} cityscape skyline`;
   bgLog("info", `RoundupCover: searching a cover image for "${place}"`);
+
+  // Prefer an openly-licensed Commons cityscape — no rights ambiguity for a
+  // published cover image.
+  try {
+    const wiki = await fetchCommonsByText(`${place} ${country} cityscape`, 1600);
+    for (const cand of wiki.slice(0, 6)) {
+      try {
+        const blob = await fetch(cand.url).then(x => x.ok ? x.blob() : Promise.reject(new Error(`HTTP ${x.status}`)));
+        const bmp  = await createImageBitmap(blob);
+        const ok   = Math.min(bmp.width, bmp.height) >= MIN_SOURCE_DIM && bmp.width >= bmp.height;
+        bmp.close();
+        if (!ok) continue;
+        const dataUrl = await blobToDataUrl(blob);
+        bgLog("info", `RoundupCover: using an openly-licensed Commons image for "${place}"`);
+        return { dataUrl: await downscaleDataUrl(dataUrl, 1280), attribution: cand.attribution };
+      } catch (_) { /* try the next Commons candidate */ }
+    }
+  } catch (e) {
+    bgLog("warn", `RoundupCover Commons search failed: ${e.message} — falling back to DDG`);
+  }
+
+  const query = `${place} ${country} cityscape skyline`;
   try {
     const results = await ddgImageSearch(query);
     const STOCK_RE = /shutterstock|getty|istock|alamy|dreamstime|depositphotos|fotolia|123rf|bigstock/i;
@@ -1345,7 +1398,7 @@ async function fetchRegionCoverPhoto(location, country) {
         if (!ok) continue;
         const dataUrl = await blobToDataUrl(blob);
         bgLog("info", `RoundupCover: using a cover image for "${place}"`);
-        return await downscaleDataUrl(dataUrl, 1280);
+        return { dataUrl: await downscaleDataUrl(dataUrl, 1280), attribution: null };
       } catch (_) { /* try the next candidate */ }
     }
     bgLog("warn", `RoundupCover: no suitable cover image for "${place}" — using first entity`);
@@ -1355,61 +1408,342 @@ async function fetchRegionCoverPhoto(location, country) {
   return null;
 }
 
-// ── Source 1.5: venue-owned photos (website + Facebook page) ─────────────────
-// The most trustworthy keyless source: photos published by the venue itself.
-// Two channels, both using only already-permitted endpoints:
-//   a) OSM Nominatim `extratags` exposes the venue's own website → a DDG image
-//      search restricted to `site:<that domain>` returns the venue's own
-//      (typically professional, high-res) photos.
-//   b) A DDG image search restricted to `site:facebook.com` surfaces the
+// Discover the venue's own domain via a keyless DuckDuckGo web search.
+// The DDG HTML endpoint wraps each result's real URL in a `uddg=` param; we
+// return the first result whose host is not a social network or aggregator.
+// Used as the last-resort website source when Maps and OSM both come up empty.
+async function discoverWebsiteViaDDG(businessName, city) {
+  try {
+    const res = await fetch('https://html.duckduckgo.com/html/', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/x-www-form-urlencoded', 'User-Agent': SCRAPE_UA },
+      body: new URLSearchParams({ q: `${businessName} ${city} official website` }).toString(),
+    });
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    const html = await res.text();
+    for (const m of html.matchAll(/uddg=([^&"']+)/g)) {
+      let host;
+      try { host = new URL(decodeURIComponent(m[1])).hostname.replace(/^www\./, ''); }
+      catch { continue; }
+      if (host.length >= 4 && !WEBSITE_EXCLUDE_RE.test(host)) {
+        bgLog('info', `PhotoScrape[VenueOwned] DDG discovered website ${host}`);
+        return `https://${host}/`;
+      }
+    }
+  } catch (e) {
+    bgLog('warn', `PhotoScrape[VenueOwned] DDG website discovery failed: ${e.message}`);
+  }
+  return null;
+}
+
+// Directly fetch the venue's own homepage and extract image URLs from its HTML.
+// Reads (in priority order) og:image / twitter:image meta tags, schema.org
+// JSON-LD `image` fields, and <img> src/srcset — resolved to absolute URLs.
+// Requires the broad `https://*/*` host permission to read arbitrary HTML; the
+// extracted image bytes are then fetched through the already-permitted DDG
+// image proxy (ddgProxyUrl), so no per-domain CORS handling is needed.
+async function scrapeWebsiteImages(website) {
+  let base;
+  try { base = new URL(website); } catch { return []; }
+  bgLog('info', 'PhotoScrape[Website] start', { website: base.href });
+  try {
+    const res = await fetch(base.href, {
+      headers: { 'User-Agent': SCRAPE_UA, 'Accept-Language': 'en-US,en;q=0.9' },
+    });
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    const html = await res.text();
+
+    const urls = new Set();
+    const add = u => { try { urls.add(new URL(u, base).href); } catch {} };
+
+    // 1. og:image / twitter:image — the venue's chosen hero shot (either
+    //    meta-tag attribute ordering: content-after-property or the reverse).
+    const META_RE = /(?:og:image(?::secure_url)?|twitter:image(?::src)?)/i;
+    for (const m of html.matchAll(/<meta\b[^>]*>/gi)) {
+      const tag = m[0];
+      if (!META_RE.test(tag)) continue;
+      const c = tag.match(/content=["']([^"']+)["']/i);
+      if (c) add(c[1]);
+    }
+
+    // 2. schema.org JSON-LD `image` (string, array, or ImageObject.url),
+    //    including nested @graph nodes.
+    for (const m of html.matchAll(/<script\b[^>]*type=["']application\/ld\+json["'][^>]*>([\s\S]*?)<\/script>/gi)) {
+      try {
+        const collect = node => {
+          if (!node) return;
+          if (Array.isArray(node)) return node.forEach(collect);
+          if (typeof node === 'string') return add(node);
+          if (typeof node === 'object') {
+            if (node['@type'] === 'ImageObject' && node.url) add(node.url);
+            if (node.image) collect(node.image);
+            if (node['@graph']) collect(node['@graph']);
+          }
+        };
+        collect(JSON.parse(m[1].trim()));
+      } catch {}
+    }
+
+    // 3. <img> src + srcset (hero / gallery images). For srcset, take the last
+    //    (largest) candidate.
+    for (const m of html.matchAll(/<img\b[^>]*\bsrc=["']([^"']+\.(?:jpe?g|png|webp)(?:\?[^"']*)?)["']/gi))
+      add(m[1]);
+    for (const m of html.matchAll(/<img\b[^>]*\bsrcset=["']([^"']+)["']/gi)) {
+      const cands = m[1].split(',').map(s => s.trim().split(/\s+/)[0]).filter(Boolean);
+      if (cands.length) add(cands[cands.length - 1]);
+    }
+
+    // Drop logos, icons, sprites, tracking pixels, and vector assets — they
+    // pass the technical gate but make poor post photos.
+    const JUNK_RE = /\b(logo|icon|favicon|sprite|pixel|placeholder|avatar|banner|menu|menukaart|map)\b|\.svg(?:$|[?#])/i;
+    const result = [...urls]
+      .filter(u => !JUNK_RE.test(u))
+      .slice(0, 15)
+      .map(ddgProxyUrl);
+    bgLog('info', `PhotoScrape[Website] found ${result.length} candidate images on ${base.hostname}`);
+    TechLog.info('PHOTO', 'website_scrape', { website: base.href, count: result.length });
+    return result;
+  } catch (e) {
+    bgLog('warn', `PhotoScrape[Website] failed: ${e.message}`);
+    TechLog.warn('PHOTO', 'website_scrape_error', { website: base.href, error: e.message });
+    return [];
+  }
+}
+
+// Single OpenStreetMap (Nominatim) lookup for a venue, shared by the photo
+// waterfall. Returns the venue's contributor-maintained metadata in one
+// request: `website` (for the direct homepage scrape), `image` /
+// `commonsTitle` (venue-attached photos), and `lat`/`lon` (for the Wikimedia
+// Commons geosearch). Resolves to a stable empty shape on any failure so
+// callers can read fields without guards.
+async function lookupOSMVenue(businessName, city) {
+  const out = { website: null, image: null, commonsTitle: null, lat: null, lon: null };
+  try {
+    const res = await fetch(
+      `https://nominatim.openstreetmap.org/search?q=${encodeURIComponent(`${businessName} ${city}`)}&format=jsonv2&extratags=1&limit=3`,
+      { headers: { Accept: 'application/json' } }
+    );
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    const places = await res.json();
+    if (Array.isArray(places) && places.length) {
+      // Prefer the first result with usable extratags; fall back to the top hit
+      // (still the best source of coordinates).
+      const tagged = places.find(p => p.extratags && (
+        p.extratags.website || p.extratags['contact:website'] ||
+        p.extratags.image || p.extratags.wikimedia_commons
+      )) || places[0];
+      const t = tagged.extratags || {};
+      out.website      = t.website || t['contact:website'] || null;
+      out.image        = t.image || null;
+      out.commonsTitle = t.wikimedia_commons || null;
+      if (tagged.lat) out.lat = parseFloat(tagged.lat);
+      if (tagged.lon) out.lon = parseFloat(tagged.lon);
+    }
+  } catch (e) {
+    bgLog('warn', `OSM venue lookup failed: ${e.message}`);
+  }
+  return out;
+}
+
+// Attribution for openly-licensed images that require credit (Wikimedia
+// Commons). Keyed by the exact image URL collectFromUrls will fetch, so the
+// waterfall can attach `.attribution` to each collected photo by sourceUrl.
+// Module-level because the URL-string pipeline can't carry per-image metadata;
+// keys are unique image URLs, so concurrent venue waterfalls don't collide.
+const _photoAttribution = new Map();
+function recordAttribution(url, text) { if (url && text) _photoAttribution.set(url, text); }
+
+// Turn a Commons `extmetadata` block into a compact, post-ready credit:
+// "Jane Doe (CC BY-SA 4.0) / Wikimedia Commons". HTML in the Artist field is
+// stripped; falls back to a bare Commons credit when author/license are absent.
+function formatCommonsAttribution(extmetadata) {
+  const strip = h => String(h == null ? '' : h).replace(/<[^>]+>/g, '').replace(/\s+/g, ' ').trim();
+  const artist  = strip(extmetadata && extmetadata.Artist && extmetadata.Artist.value);
+  const license = strip(extmetadata && extmetadata.LicenseShortName && extmetadata.LicenseShortName.value);
+  const head = [artist, license ? `(${license})` : ''].filter(Boolean).join(' ');
+  return head ? `${head} / Wikimedia Commons` : 'Wikimedia Commons';
+}
+
+// Build a keyless full-resolution URL for a Wikimedia Commons file. The
+// Special:FilePath endpoint 302-redirects to the actual upload.wikimedia.org
+// file (optionally scaled), so no API call is needed. Category tags and
+// non-image files return null. Used as a fallback when the API lookup fails —
+// note it yields no author/license, so callers credit it generically.
+function commonsFilePathUrl(commonsTag, width = 2048) {
+  if (!commonsTag) return null;
+  let title = String(commonsTag).trim();
+  if (/^category:/i.test(title)) return null;
+  title = title.replace(/^file:/i, '');
+  if (!/\.(jpe?g|png|webp)$/i.test(title)) return null;
+  return `https://commons.wikimedia.org/wiki/Special:FilePath/${encodeURIComponent(title)}?width=${width}`;
+}
+
+// Map a Wikimedia Commons API `query.pages` object to { url, attribution }
+// records, keeping only raster photos (no SVG/PDF) and dropping obvious
+// non-photos. Requesting `extmetadata` in iiprop populates the attribution.
+function commonsPagesToImageUrls(pages, limit) {
+  const JUNK_RE = /\b(logo|icon|map|plan|diagram|sign|flag|coat|seal|svg|chart|graph)\b/i;
+  // Commons filenames are underscore-joined (City_map.png) — normalise those to
+  // spaces so word-boundary matches fire, and test both the file page and the
+  // image URL.
+  const isJunk = ii => JUNK_RE.test(`${ii.descriptionurl || ''} ${ii.url || ''}`.replace(/[_+]/g, ' '));
+  return Object.values(pages || {})
+    .map(p => p.imageinfo && p.imageinfo[0])
+    .filter(ii => ii && /^image\/(jpe?g|png|webp)$/i.test(ii.mime || ''))
+    .filter(ii => !isJunk(ii))
+    .map(ii => ({ url: ii.thumburl || ii.url, attribution: formatCommonsAttribution(ii.extmetadata) }))
+    .filter(x => x.url)
+    .slice(0, limit);
+}
+
+// Resolve a single Commons file title (e.g. an OSM `wikimedia_commons` tag) to
+// its scaled URL + attribution via the API. Returns null for non-images or on
+// failure (caller may fall back to commonsFilePathUrl).
+async function resolveCommonsFile(title, width = 2048) {
+  const t = String(title || '').replace(/^file:/i, '');
+  if (!/\.(jpe?g|png|webp)$/i.test(t)) return null;
+  try {
+    const api = `https://commons.wikimedia.org/w/api.php?action=query&format=json&origin=*`
+      + `&prop=imageinfo&iiprop=url|mime|extmetadata&iiurlwidth=${width}`
+      + `&titles=${encodeURIComponent('File:' + t)}`;
+    const res = await fetch(api, { headers: { Accept: 'application/json' } });
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    const data = await res.json();
+    const page = Object.values((data && data.query && data.query.pages) || {})[0];
+    const ii = page && page.imageinfo && page.imageinfo[0];
+    if (!ii || !/^image\/(jpe?g|png|webp)$/i.test(ii.mime || '')) return null;
+    return { url: ii.thumburl || ii.url, attribution: formatCommonsAttribution(ii.extmetadata) };
+  } catch (e) {
+    bgLog('warn', `Commons file resolve failed: ${e.message}`);
+    return null;
+  }
+}
+
+// ── Source 2.5: Wikimedia Commons (openly licensed, keyless) ─────────────────
+// Geosearch around the venue's coordinates for photos contributors have
+// geotagged nearby. Images are CC / Public Domain (attribution required) — no
+// fee, key, or signup. Lower priority than venue-confirmed sources because
+// "nearby" can include neighbouring buildings, so it only runs when the pool is
+// still short. Records each photo's attribution for the caption credit line.
+async function fetchWikimediaPhotos(osm) {
+  if (!osm || osm.lat == null || osm.lon == null) return [];
+  bgLog('info', 'PhotoScrape[Wikimedia] geosearch', { lat: osm.lat, lon: osm.lon });
+  const urls = [];
+  try {
+    const api = `https://commons.wikimedia.org/w/api.php?action=query&format=json&origin=*`
+      + `&generator=geosearch&ggscoord=${osm.lat}|${osm.lon}&ggsradius=300&ggslimit=20&ggsnamespace=6`
+      + `&prop=imageinfo&iiprop=url|mime|extmetadata&iiurlwidth=2048`;
+    const res = await fetch(api, { headers: { Accept: 'application/json' } });
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    const data = await res.json();
+    for (const { url, attribution } of commonsPagesToImageUrls(data?.query?.pages, 12)) {
+      recordAttribution(url, attribution);
+      urls.push(url);
+    }
+    bgLog('info', `PhotoScrape[Wikimedia] ${urls.length} candidate photos`);
+    TechLog.info('PHOTO', 'wikimedia_scrape', { lat: osm.lat, lon: osm.lon, count: urls.length });
+  } catch (e) {
+    bgLog('warn', `PhotoScrape[Wikimedia] failed: ${e.message}`);
+    TechLog.warn('PHOTO', 'wikimedia_scrape_error', { error: e.message });
+  }
+  return urls;
+}
+
+// Free-text Wikimedia Commons image search — used for the Region Round-Up cover
+// photo, where an openly-licensed cityscape beats a rights-murky web image.
+// Returns { url, attribution } records.
+async function fetchCommonsByText(query, width = 1600) {
+  try {
+    const api = `https://commons.wikimedia.org/w/api.php?action=query&format=json&origin=*`
+      + `&generator=search&gsrsearch=${encodeURIComponent(query)}&gsrnamespace=6&gsrlimit=20`
+      + `&prop=imageinfo&iiprop=url|mime|extmetadata&iiurlwidth=${width}`;
+    const res = await fetch(api, { headers: { Accept: 'application/json' } });
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    const data = await res.json();
+    return commonsPagesToImageUrls(data?.query?.pages, 12);
+  } catch (e) {
+    bgLog('warn', `Commons text search failed: ${e.message}`);
+    return [];
+  }
+}
+
+// Collect the distinct attribution credits from a set of collected photos —
+// used to append a photo-credit line to auto-generated captions.
+function collectPhotoCredits(...photoSets) {
+  const seen = new Set();
+  for (const set of photoSets)
+    for (const p of set || [])
+      if (p && p.attribution) seen.add(p.attribution);
+  return [...seen];
+}
+
+// Format the photo-credit caption line (e.g. "📷 Photo: Jane Doe (CC BY-SA
+// 4.0) / Wikimedia Commons"). Returns "" when there's nothing to credit.
+function buildPhotoCreditLine(credits) {
+  const uniq = [...new Set((credits || []).filter(Boolean))];
+  if (!uniq.length) return '';
+  return `📷 ${uniq.length > 1 ? 'Photos' : 'Photo'}: ${uniq.slice(0, 3).join('; ')}`;
+}
+
+// ── Source 1.5: venue-owned photos (website + OSM tags + Facebook page) ───────
+// The most trustworthy keyless source: photos published by, or attached to, the
+// venue itself. Three contributions:
+//   a) Discover the venue's own domain (Maps-HTML hint → OSM `extratags` →
+//      DDG web search), then fetch that homepage directly and extract its
+//      og:image / JSON-LD / <img> photos — typically professional, high-res.
+//   b) Photos a contributor attached to the venue's OSM node: the `image` tag
+//      (a direct URL) and `wikimedia_commons` tag (resolved keyless via
+//      Special:FilePath). Both come free from the shared `osm` lookup.
+//   c) A DDG image search restricted to `site:facebook.com` surfaces the
 //      venue's Facebook page photos via Bing's crawler cache
 //      (lookaside.fbsbx.com) at full resolution — no FB login required.
-// Results are venue-confirmed by construction (a) or filtered to require all
-// business-name tokens (b), so no further relevance ranking is needed.
-async function scrapeVenueOwnedPhotos(businessName, city) {
-  bgLog('info', 'PhotoScrape[VenueOwned] start', { businessName, city });
+// Results are venue-confirmed by construction (a/b) or filtered to require all
+// business-name tokens (c), so no further relevance ranking is needed.
+// `hintWebsite` is the best-effort domain harvested from the Google Maps HTML;
+// `osm` is the shared lookupOSMVenue() result (website + image tags).
+async function scrapeVenueOwnedPhotos(businessName, city, hintWebsite = null, osm = null) {
+  bgLog('info', 'PhotoScrape[VenueOwned] start', { businessName, city, hintWebsite: hintWebsite || null });
   const urls = [];
   const JUNK_RE = /\b(logo|menu|menukaart|plattegrond|map|icon|banner)\b/i;
   const bigEnough = r => Math.min(r.width || 0, r.height || 0) >= MIN_SOURCE_DIM
     && (r.width / r.height) < 3 && (r.height / r.width) < 3;
 
-  // The two channels are independent (different endpoints), so they run in
+  // b) venue-attached OSM photos: the `image` tag (a direct URL, unknown
+  //    licence → no credit) and the `wikimedia_commons` tag, resolved via the
+  //    API for its author/licence (falling back to a keyless Special:FilePath
+  //    URL credited generically if the lookup fails).
+  const osmImages = [];
+  if (osm?.image && /^https?:\/\//i.test(osm.image)) osmImages.push(osm.image);
+  if (osm?.commonsTitle) {
+    const resolved = await resolveCommonsFile(osm.commonsTitle);
+    if (resolved) {
+      recordAttribution(resolved.url, resolved.attribution);
+      osmImages.push(resolved.url);
+    } else {
+      const fb = commonsFilePathUrl(osm.commonsTitle);
+      if (fb) { recordAttribution(fb, 'Wikimedia Commons'); osmImages.push(fb); }
+    }
+  }
+  if (osmImages.length) bgLog('info', `PhotoScrape[VenueOwned] ${osmImages.length} OSM-attached photo(s)`);
+
+  // The channels are independent (different endpoints), so they run in
   // parallel — venue-owned latency is the slower channel, not the sum.
   let website = null;
 
-  // a) venue website via Nominatim extratags → site-restricted image search
+  // a) resolve the venue's domain, then fetch its homepage directly.
+  //    Discovery order: Maps-HTML hint (free) → shared OSM lookup → DDG search.
   const websiteChannel = (async () => {
-    try {
-      const nomRes = await fetch(
-        `https://nominatim.openstreetmap.org/search?q=${encodeURIComponent(`${businessName} ${city}`)}&format=jsonv2&extratags=1&limit=3`,
-        { headers: { Accept: 'application/json' } }
-      );
-      if (nomRes.ok) {
-        const places = await nomRes.json();
-        const tags = places.find(p => p.extratags?.website || p.extratags?.['contact:website'])?.extratags;
-        website = tags?.website || tags?.['contact:website'] || null;
-      }
-    } catch (e) {
-      bgLog('warn', `PhotoScrape[VenueOwned] Nominatim lookup failed: ${e.message}`);
-    }
+    website = hintWebsite || osm?.website || null;
+
+    if (!website) website = await discoverWebsiteViaDDG(businessName, city);
 
     if (!website) {
-      bgLog('info', 'PhotoScrape[VenueOwned] no website found in OSM tags');
+      bgLog('info', 'PhotoScrape[VenueOwned] no website found (Maps/OSM/DDG)');
       return [];
     }
-    try {
-      const domain = new URL(website).hostname.replace(/^www\./, '');
-      const results = await ddgImageSearch(`site:${domain}`);
-      const own = results
-        .filter(bigEnough)
-        .filter(r => !JUNK_RE.test(`${r.title || ''} ${r.image || ''}`))
-        .sort((a, b) => (b.width * b.height) - (a.width * a.height));
-      bgLog('info', `PhotoScrape[VenueOwned] website ${domain}: ${own.length} candidates`);
-      return own.map(r => r.image).filter(Boolean).map(ddgProxyUrl).slice(0, 10);
-    } catch (e) {
-      bgLog('warn', `PhotoScrape[VenueOwned] website search failed: ${e.message}`);
-      return [];
-    }
+    // Direct homepage scrape — visits the site itself rather than relying on a
+    // search engine having indexed its images.
+    return await scrapeWebsiteImages(website);
   })();
 
   // b) venue's Facebook page photos via Bing crawler cache
@@ -1436,10 +1770,12 @@ async function scrapeVenueOwnedPhotos(businessName, city) {
   })();
 
   const [siteUrls, fbUrls] = await Promise.all([websiteChannel, facebookChannel]);
-  urls.push(...siteUrls, ...fbUrls);
+  // OSM-attached photos first (venue-confirmed), then homepage, then Facebook.
+  urls.push(...osmImages, ...siteUrls, ...fbUrls);
 
   TechLog.info('PHOTO', 'venue_owned_scrape', {
-    business: businessName, city, website: website || null, count: urls.length,
+    business: businessName, city, website: website || null,
+    osm: osmImages.length, count: urls.length,
   });
   return urls;
 }
@@ -1753,38 +2089,47 @@ async function fetchPhotosWaterfall(businessName, address, entityType, minPics, 
   }
 
   // ── 1/1.5/2: Google Maps, venue-owned, DuckDuckGo ──────────────────────────
-  // The three primary scrapers only fetch URL *lists* (a few KB each), so they
-  // are kicked off in parallel — total scrape latency becomes the slowest of
-  // the three instead of their sum. Collection (the heavy image downloads)
-  // still runs in strict priority order: venue-confirmed photos claim pool
-  // slots before generic web-search results.
+  // Google Maps runs first (short 4s leash): besides its own photo URLs, its
+  // HTML usually embeds the venue's official website, which the venue-owned
+  // source reuses for a direct homepage scrape — no extra discovery request.
+  // Venue-owned and DuckDuckGo then run in parallel (both only fetch URL lists,
+  // a few KB each). Collection (the heavy image downloads) still runs in strict
+  // priority order: venue-confirmed photos claim pool slots before generic
+  // web-search results.
   // A fresh cache entry skips the scrapes entirely — re-searches and the
   // popup's dismiss-driven top-ups are then near-instant.
   const cacheKey = `${businessName}|${city}`.toLowerCase();
   const cachedScrape = _scrapeCacheBG.get(cacheKey);
-  let gmUrls, voUrls, ddgUrls;
+  let gmUrls, voUrls, ddgUrls, osm;
   if (cachedScrape && cachedScrape.expiresAt > Date.now()) {
     bgLog('info', 'PhotoWaterfall: using cached scrape URL lists');
-    ({ gm: gmUrls, vo: voUrls, ddg: ddgUrls } = cachedScrape);
+    ({ gm: gmUrls, vo: voUrls, ddg: ddgUrls, osm } = cachedScrape);
   } else {
     // Google Maps gets a short leash: its photo URLs are JS-loaded, so the
     // static scrape almost always yields nothing — don't let a slow Google
-    // response hold up stage-1 collection.
-    [gmUrls, voUrls, ddgUrls] = await Promise.all([
-      raceTimeout(scrapeGoogleMapsPhotos(businessName, city), 4000),
-      raceTimeout(scrapeVenueOwnedPhotos(businessName, city), 20000),
+    // response hold up stage-1 collection. We still harvest its `website` hint.
+    // The OSM lookup runs alongside it (one Nominatim request, shared by the
+    // venue-owned and Wikimedia sources for website / image tags / coords).
+    const [gm, osmRes] = await Promise.all([
+      raceTimeout(scrapeGoogleMapsPhotos(businessName, city), 4000, { photos: [], website: null }),
+      raceTimeout(lookupOSMVenue(businessName, city), 8000, {}),
+    ]);
+    osm = osmRes;
+    gmUrls = gm.photos || [];
+    [voUrls, ddgUrls] = await Promise.all([
+      raceTimeout(scrapeVenueOwnedPhotos(businessName, city, gm.website, osm), 20000),
       raceTimeout(scrapeDDGPhotos(businessName, city, entityType), 14000),
     ]);
-    _scrapeCacheBG.set(cacheKey, { gm: gmUrls, vo: voUrls, ddg: ddgUrls, expiresAt: Date.now() + SCRAPE_CACHE_TTL_MS });
+    _scrapeCacheBG.set(cacheKey, { gm: gmUrls, vo: voUrls, ddg: ddgUrls, osm, expiresAt: Date.now() + SCRAPE_CACHE_TTL_MS });
   }
 
   // 1. Google Maps (highest-res when it works)
   if (gmUrls.length > 0) await collectFromUrls(gmUrls, 'google_maps');
 
-  // 1.5 Venue-owned (website + Facebook page) — most trustworthy keyless
-  // source: the venue's own published photos, discovered via OSM website tags
-  // and Bing's Facebook crawler cache. Collected before the generic web search
-  // so venue-confirmed shots fill the pool first.
+  // 1.5 Venue-owned (website + Facebook page) — most trustworthy source: the
+  // venue's own published photos, scraped directly from its homepage and from
+  // Bing's Facebook crawler cache. Collected before the generic web search so
+  // venue-confirmed shots fill the pool first.
   if (collected.length < poolTarget && voUrls.length > 0) {
     await collectFromUrls(voUrls, 'venue_owned');
   }
@@ -1793,6 +2138,15 @@ async function fetchPhotosWaterfall(businessName, address, entityType, minPics, 
   if (collected.length < poolTarget && ddgUrls.length > 0) {
     bgLog('info', `PhotoWaterfall: need ${poolTarget - collected.length} more — trying DuckDuckGo`);
     await collectFromUrls(ddgUrls, 'duckduckgo');
+  }
+
+  // ── 2.5 Wikimedia Commons — openly-licensed geotagged photos near the venue.
+  // Keyless and free; lower priority than venue-confirmed/web sources because
+  // "nearby" relevance is looser. Reuses the shared OSM coordinates.
+  if (collected.length < poolTarget && osm && osm.lat != null) {
+    bgLog('info', `PhotoWaterfall: need ${poolTarget - collected.length} more — trying Wikimedia Commons`);
+    const wikiUrls = await raceTimeout(fetchWikimediaPhotos(osm), 12000);
+    if (wikiUrls.length > 0) await collectFromUrls(wikiUrls, 'wikimedia');
   }
 
   // ── 3. Yelp — only if still short of pool (disabled: Yelp 403s every run) ───
@@ -1837,6 +2191,14 @@ async function fetchPhotosWaterfall(businessName, address, entityType, minPics, 
   if (collected.length === 0 && ddgUrls.length > 0) {
     bgLog('info', 'PhotoWaterfall: nothing passed quality yet — retrying DuckDuckGo thumbnails without the resolution gate');
     await collectFromUrls(ddgUrls, 'duckduckgo_lowres', { ignoreResolution: true });
+  }
+
+  // ── Attach attribution to openly-licensed photos ──────────────────────────
+  // The URL-string pipeline can't carry per-image metadata, so credits captured
+  // by the Commons sources are looked up here by the photo's sourceUrl.
+  for (const p of collected) {
+    const attr = _photoAttribution.get(p.sourceUrl);
+    if (attr) p.attribution = attr;
   }
 
   // ── Rank by content appeal, split into post photos + spares ────────────────
@@ -1953,7 +2315,7 @@ async function getAutoSongBG(genre, country) {
   return song;
 }
 
-function getAutoCaptionBG(name, address, type, language, captionOpts, songInfo, entityMeta = {}) {
+function getAutoCaptionBG(name, address, type, language, captionOpts, songInfo, entityMeta = {}, photoCredits = []) {
   // entityMeta: { createdYear, lastVisitYear, province }
   const cityM  = address.match(CITY_FROM_ADDRESS_RE_BG);
   const city   = (cityM?.[1] || address.split(",")[0] || "").trim();
@@ -2228,6 +2590,8 @@ function getAutoCaptionBG(name, address, type, language, captionOpts, songInfo, 
   if (captionOpts.address && address) parts.push(`📌 ${address}`);
   if ((captionOpts.name||captionOpts.address) && (captionOpts.song||captionOpts.hashtags)) parts.push("");
   if (captionOpts.song && songInfo)   parts.push(`🎵 ${songInfo.name} – ${songInfo.artist}`);
+  const creditLine = buildPhotoCreditLine(photoCredits);
+  if (creditLine) { parts.push(""); parts.push(creditLine); }
   if (captionOpts.hashtags) {
     const tc = tLabel.charAt(0).toUpperCase() + tLabel.slice(1);
     const extras = pickExtraHashtags(2).map(h => `#${h}`).join(" ");
@@ -2246,7 +2610,7 @@ const RR_TYPE_LABELS_BG      = SHARED_RR_TYPE_LABELS;
 const RR_HEADER_TEMPLATES_BG = SHARED_RR_HEADER_TEMPLATES;
 const RR_INTRO_TEMPLATES_BG  = SHARED_RR_INTRO_TEMPLATES;
 
-function getAutoCaptionRoundupBG(places, type, region, language, captionOpts, songInfo) {
+function getAutoCaptionRoundupBG(places, type, region, language, captionOpts, songInfo, photoCredits = []) {
   const lang   = RR_TYPE_LABELS_BG[language] ? language : "en";
   const labels = RR_TYPE_LABELS_BG[lang][type] || RR_TYPE_LABELS_BG[lang].restaurant;
   const n      = places.length;
@@ -2271,6 +2635,9 @@ function getAutoCaptionRoundupBG(places, type, region, language, captionOpts, so
     parts.push("");
     parts.push(`🎵 ${songInfo.name} – ${songInfo.artist}`);
   }
+
+  const creditLine = buildPhotoCreditLine(photoCredits);
+  if (creditLine) { parts.push(""); parts.push(creditLine); }
 
   if (captionOpts.hashtags) {
     const regionTag = region.replace(/[\s,]+/g, "");
@@ -2460,8 +2827,9 @@ async function autoPostNow(postIndex) {
     // 4 ── Build caption ──────────────────────────────────────────────────────
     const captionOpts = { catchy: config.capCatchy ?? true, name: config.capName ?? true,
       address: config.capAddr ?? true, hashtags: config.capHash ?? true, song: config.capSong ?? true };
+    const photoCredits = collectPhotoCredits(photoResult.photoLog);
     const caption = getAutoCaptionBG(name, address, config.type||"restaurant",
-                                      config.language||"nl", captionOpts, songInfo);
+                                      config.language||"nl", captionOpts, songInfo, {}, photoCredits);
     TechLog.info("CAPTION", "caption_built", { run_id: runId, run_type: "auto",
       language: config.language, length: caption.length });
 
@@ -2612,13 +2980,22 @@ async function autoPostRoundupNow(postIndex) {
         return null;
       }
       // Burn the venue name into the photo so each slide is self-identifying.
-      return { place, dataUrl: await applyEntityNameLabel(photoResult.dataUrls[0], name) };
+      return {
+        place,
+        dataUrl: await applyEntityNameLabel(photoResult.dataUrls[0], name),
+        attribution: (photoResult.photoLog && photoResult.photoLog[0] && photoResult.photoLog[0].attribution) || null,
+      };
     });
 
-    const photoDataUrls = [];
-    const keptPlaces    = [];
+    const photoDataUrls   = [];
+    const keptPlaces      = [];
+    const entityCredits   = [];
     for (const r of resolved) {
-      if (r.ok && r.value) { photoDataUrls.push(r.value.dataUrl); keptPlaces.push(r.value.place); }
+      if (r.ok && r.value) {
+        photoDataUrls.push(r.value.dataUrl);
+        keptPlaces.push(r.value.place);
+        if (r.value.attribution) entityCredits.push(r.value.attribution);
+      }
     }
 
     if (photoDataUrls.length === 0) {
@@ -2637,7 +3014,9 @@ async function autoPostRoundupNow(postIndex) {
     // the injector then overlays it with the "Top N…" header. Falls back to the
     // first entity photo when no suitable city image is found.
     const countryName  = AB_COUNTRY_NAMES_BG[config.country] || "Belgium";
-    const coverDataUrl  = await fetchRegionCoverPhoto(region, countryName).catch(() => null);
+    const cover         = await fetchRegionCoverPhoto(region, countryName).catch(() => null);
+    const coverDataUrl  = cover?.dataUrl || null;
+    if (cover?.attribution) entityCredits.push(cover.attribution);
     const postPhotos    = coverDataUrl ? [coverDataUrl, ...photoDataUrls] : photoDataUrls;
     TechLog.info("MEDIA", "cover_slide", { run_id: runId, run_type: "roundup", has_cover: !!coverDataUrl });
 
@@ -2655,7 +3034,7 @@ async function autoPostRoundupNow(postIndex) {
       song:            config.capSong ?? true,
     };
     const caption = getAutoCaptionRoundupBG(keptPlaces, config.type||"restaurant", region,
-                                             config.language||"nl", captionOpts, songInfo);
+                                             config.language||"nl", captionOpts, songInfo, entityCredits);
     const header  = caption.split("\n")[0];
     TechLog.info("CAPTION", "caption_built", { run_id: runId, run_type: "roundup",
       language: config.language, length: caption.length });
@@ -6624,6 +7003,10 @@ if (typeof module !== 'undefined' && module.exports) {
     injectFacebook, injectInstagram, injectTikTok, INJECTORS,
     sendTelemetry, getInstallId, TechLog, computeAppealMetrics, scoreImageQuality,
     computePhash, phashDistance, downscaleDataUrl,
+    scrapeWebsiteImages, extractWebsiteFromHtml,
+    commonsFilePathUrl, commonsPagesToImageUrls, fetchWikimediaPhotos, fetchCommonsByText,
+    resolveCommonsFile, formatCommonsAttribution, collectPhotoCredits, buildPhotoCreditLine,
+    getAutoCaptionBG,
     searchAutoPlacesCollectionBG, getAutoCaptionRoundupBG,
     roundupEntityKey, recordRoundupPostedEntities, getRoundupRecentKeys,
     mapLimit, appendAppLog,
